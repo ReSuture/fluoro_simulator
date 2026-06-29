@@ -1,0 +1,7 @@
+# Self-signed TLS material for the web control panel — never commit the private key
+cert.pem
+key.pem
+
+# Python bytecode cache
+__pycache__/
+*.pyc
