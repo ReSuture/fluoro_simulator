@@ -238,14 +238,14 @@ if __name__ == '__main__':
 
         # ── Overlay compositing ───────────────────────────────────────────────
         if overlay_mode:
-            # White areas (bg_mask == 0): 5% video, 95% overlay (background shows through)
-            # Non-white areas (vasculature, bg_mask > 0): 70% video, 30% overlay
+            # White areas (bg_mask == 0): 30% video, 70% overlay (background shows through)
+            # Non-white areas (vasculature, bg_mask > 0): 60% video, 40% overlay
             ov = overlay.astype(np.float32)
             fr = gray.astype(np.float32)
             result = ov.copy()
             white = bg_mask == 0
-            result[white]        = 0.05 * fr[white]        + 0.95 * ov[white]
-            result[~white]       = 0.70 * fr[~white]       + 0.30 * ov[~white]
+            result[white]        = 0.30 * fr[white]        + 0.70 * ov[white]
+            result[~white]       = 0.60 * fr[~white]       + 0.40 * ov[~white]
             gray = np.clip(result, 0, 255).astype(np.uint8)
 
         # ── Histogram equalisation ────────────────────────────────────────────
