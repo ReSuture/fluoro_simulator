@@ -17,7 +17,7 @@ Keyboard shortcuts:
    2 - Toggle Subtraction
    3 - Fullscreen
    4 - Windowed mode
-   5 - Retake background image used in subtraction
+   5 - Toggle background overlay off/on (off = full raw video)
    6 - Equalize histogram
    7 - Toggle HUD (On screen text display)
 '''
@@ -197,12 +197,13 @@ if __name__ == '__main__':
     #overlay = cv.flip(overlay, 0)  # vertical flip
 
     # ── Per-frame processing function (runs inside the thread pool) ───────────
-    def process_frame(frame, t0, subtract_mode, overlay_mode, equalize_mode):
+    def process_frame(frame, raw, t0, subtract_mode, overlay_mode, equalize_mode):
         '''Apply fluoroscopy-style image processing to a single grayscale frame.
 
         Parameters
         ----------
         frame         : uint8 grayscale numpy array — the (possibly subtracted) camera frame
+        raw           : uint8 grayscale numpy array — the untouched camera frame (no subtraction/inversion)
         t0            : float — timestamp when the frame was captured (passed through for latency calc)
         subtract_mode : bool  — whether background subtraction has already been applied upstream
         overlay_mode  : bool  — whether to composite the anatomy overlay onto the frame
@@ -216,9 +217,11 @@ if __name__ == '__main__':
         # Brightness threshold above which a pixel is considered "white background".
         # Pixels at or above this value are the bright surface the vasculature rests on.
         # Lowering this value catches more of the surface; raising it is more conservative.
-        # Overlay off — return the frame completely unmodified (no masking, no CLAHE).
+        # Overlay off — show the full raw video. `raw` is the untouched grayscale camera
+        # frame (no subtraction, inversion, masking, or CLAHE), so nothing is removed and
+        # the brightest/whitest areas stay white.
         if not overlay_mode:
-            return frame, t0
+            return raw, t0
 
         mask_threshold = 220
 
@@ -312,7 +315,7 @@ if __name__ == '__main__':
                 # Draw current mode states in the top-left corner of the frame.
                 # Lines are spaced 20px apart so they don't overlap.
                 draw_str(res, (20, 20), "(1)Toggle Subtraction : " + str(subtract_mode) + "  (3)Fullscreen (4)Windowed")
-                draw_str(res, (20, 40), "(2)Toggle Overlay     : " + str(overlay_mode)  + "   (5)Take Background (6)EqualizeHist")
+                draw_str(res, (20, 40), "(2)Toggle Overlay     : " + str(overlay_mode)  + "   (5)Toggle Background (6)EqualizeHist")
                 draw_str(res, (20, 60), "(Space) Toggle Peddle : " + str(peddle_mode)   + "  (7)Toggle HUD")
                 # Uncomment below to show timing diagnostics in the HUD:
                 #draw_str(res, (20, 80), "latency        :  %.1f ms" % (latency.value*1000))
@@ -341,6 +344,11 @@ if __name__ == '__main__':
                 # Convert the colour frame to grayscale.
                 # All subsequent processing is single-channel for simplicity and speed.
                 frame_gray = cv.cvtColor(frame, cv.COLOR_RGB2GRAY)
+
+                # Keep an untouched copy of the raw grayscale frame BEFORE any subtraction
+                # or inversion. This is what gets displayed when the overlay is toggled off,
+                # so the full video shows with its bright/white areas intact.
+                frame_raw = frame_gray.copy()
 
                 # Resize the overlay to exactly match the current frame dimensions.
                 # Done every frame because the first frame establishes the true resolution.
@@ -381,11 +389,11 @@ if __name__ == '__main__':
                 if threaded_mode:
                     # Send a copy of the frame to avoid a race condition: the main loop
                     # may modify frame_gray before the thread reads it without the copy.
-                    task = pool.apply_async(process_frame, (frame_gray.copy(), t, subtract_mode, overlay_mode, equalize_mode))
+                    task = pool.apply_async(process_frame, (frame_gray.copy(), frame_raw.copy(), t, subtract_mode, overlay_mode, equalize_mode))
                 else:
                     # Wrap the synchronous result in DummyTask so the drain loop above
                     # can call .ready() and .get() on it without any special casing.
-                    task = DummyTask(process_frame(frame_gray, t, subtract_mode, overlay_mode, equalize_mode))
+                    task = DummyTask(process_frame(frame_gray, frame_raw, t, subtract_mode, overlay_mode, equalize_mode))
 
                 pending.append(task)
 
@@ -413,8 +421,8 @@ if __name__ == '__main__':
         if ch == 52:   # '4' — return display window to normal (windowed) mode
             cv.setWindowProperty("FLUORO", cv.WND_PROP_FULLSCREEN, cv.WINDOW_NORMAL)
 
-        if ch == 53:   # '5' — retake the background from the last displayed frame
-            background = res.astype("float")
+        if ch == 53:   # '5' — toggle the background overlay off/on (off = full raw video)
+            overlay_mode = not overlay_mode
 
         if ch == 54:   # '6' — toggle histogram equalisation on/off
             equalize_mode = not equalize_mode
