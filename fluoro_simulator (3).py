@@ -216,6 +216,10 @@ if __name__ == '__main__':
         # Brightness threshold above which a pixel is considered "white background".
         # Pixels at or above this value are the bright surface the vasculature rests on.
         # Lowering this value catches more of the surface; raising it is more conservative.
+        # Overlay off — return the frame completely unmodified (no masking, no CLAHE).
+        if not overlay_mode:
+            return frame, t0
+
         mask_threshold = 220
 
         gray = frame  # Work on a local reference; frame is already grayscale from the main loop
@@ -231,13 +235,15 @@ if __name__ == '__main__':
 
         # ── Overlay compositing ───────────────────────────────────────────────
         if overlay_mode:
-            # Strategy: use the overlay as the base image (background), then paste
-            # the live video feed on top only where pixels are NOT white.
-            # This makes very white areas (the bright surface) "transparent" —
-            # the overlay shows through in those regions instead.
-            result = overlay.copy()                   # Start with pure overlay everywhere
-            result[bg_mask > 0] = gray[bg_mask > 0]  # Paste vasculature/dark pixels from video feed
-            gray = result
+            # White areas (bg_mask == 0): 5% video, 95% overlay (background shows through)
+            # Non-white areas (vasculature, bg_mask > 0): 70% video, 30% overlay
+            ov = overlay.astype(np.float32)
+            fr = gray.astype(np.float32)
+            result = ov.copy()
+            white = bg_mask == 0
+            result[white]        = 0.05 * fr[white]        + 0.95 * ov[white]
+            result[~white]       = 0.70 * fr[~white]       + 0.30 * ov[~white]
+            gray = np.clip(result, 0, 255).astype(np.uint8)
 
         # ── Histogram equalisation ────────────────────────────────────────────
         if equalize_mode:
@@ -408,10 +414,7 @@ if __name__ == '__main__':
             cv.setWindowProperty("FLUORO", cv.WND_PROP_FULLSCREEN, cv.WINDOW_NORMAL)
 
         if ch == 53:   # '5' — retake the background from the last displayed frame
-            # Uses `res` (the most recently dequeued result) as the new background.
-            # Converts back to grayscale in case it was colourised by a previous step.
-            background = res
-            background = cv.cvtColor(background, cv.COLOR_RGB2GRAY)
+            background = res.astype("float")
 
         if ch == 54:   # '6' — toggle histogram equalisation on/off
             equalize_mode = not equalize_mode
