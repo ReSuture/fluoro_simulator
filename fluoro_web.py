@@ -32,6 +32,13 @@ import sys
 import time
 import threading
 
+# Force OpenCV's Qt GUI onto the X11/XWayland backend. Under the native Wayland
+# Qt backend, cv.setWindowProperty(FULLSCREEN) is a no-op (it logs
+# "qt.qpa.wayland: Wayland does not support QWindow::requestActivate()") so the
+# Fullscreen/Windowed controls can't change the FLUORO window. Set before cv2 is
+# imported; respect an explicit override if the user already set one.
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
 import numpy as np
 import cv2 as cv
 from flask import Flask, Response, jsonify, render_template_string
@@ -95,12 +102,14 @@ PAGE = """
   .preview { width: 100%; background: #000; border-radius: 12px; overflow: hidden;
              border: 1px solid #1d2733; aspect-ratio: 4 / 3; display: flex; }
   .preview img { width: 100%; height: 100%; object-fit: contain; }
+  .preview:fullscreen, .preview:-webkit-full-screen {
+      width: 100vw; height: 100vh; border: 0; border-radius: 0; aspect-ratio: auto; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
   button { font-size: 16px; padding: 16px 12px; border-radius: 12px; border: 1px solid #26323f;
            background: #131a22; color: #e7edf3; cursor: pointer; font-weight: 600;
            transition: background .12s, border-color .12s; }
   button:active { transform: translateY(1px); }
-  button.toggle.on { background: #103b2a; border-color: #12b76a; color: #7af0b6; }
+  button.on { background: #103b2a; border-color: #12b76a; color: #7af0b6; }
   button.toggle .st { display: block; font-size: 12px; font-weight: 500; opacity: .7; margin-top: 2px; }
   .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
   button.quit { grid-column: 1 / -1; background: #2a1416; border-color: #5b2327; color: #ff9a9a; }
@@ -125,8 +134,8 @@ PAGE = """
   </div>
 
   <div class="actions">
-    <button data-action="fullscreen">Fullscreen</button>
-    <button data-action="windowed">Windowed</button>
+    <button class="fsbtn" data-action="fullscreen" data-fs="1">Fullscreen</button>
+    <button class="fsbtn" data-action="windowed" data-fs="0">Windowed</button>
     <button class="quit" data-action="quit">Quit simulator</button>
   </div>
 
@@ -140,6 +149,9 @@ function applyState(s) {
     b.classList.toggle('on', on);
     b.querySelector('.st').textContent = on ? 'ON' : 'OFF';
   });
+  document.querySelectorAll('.fsbtn').forEach(function (b) {
+    b.classList.toggle('on', (b.dataset.fs === '1') === !!s.fullscreen);
+  });
 }
 function refresh() {
   fetch('/api/state').then(function (r) { return r.json(); }).then(applyState).catch(function () {});
@@ -150,9 +162,26 @@ document.querySelectorAll('[data-toggle]').forEach(function (b) {
       .then(function (r) { return r.json(); }).then(applyState);
   });
 });
+function browserFullscreen(on) {
+  // Fullscreen the live preview in THIS browser (must run inside a click handler).
+  var el = document.querySelector('.preview');
+  try {
+    if (on) {
+      var req = el.requestFullscreen || el.webkitRequestFullscreen;
+      if (req) req.call(el);
+    } else {
+      var exit = document.exitFullscreen || document.webkitExitFullscreen;
+      if (exit && (document.fullscreenElement || document.webkitFullscreenElement)) exit.call(document);
+    }
+  } catch (e) {}
+}
 document.querySelectorAll('[data-action]').forEach(function (b) {
   b.addEventListener('click', function () {
     if (b.dataset.action === 'quit' && !confirm('Stop the simulator?')) return;
+    // Fullscreen/Windowed also control this browser's preview, not just the
+    // popup window on the computer running the simulator.
+    if (b.dataset.action === 'fullscreen') browserFullscreen(true);
+    if (b.dataset.action === 'windowed') browserFullscreen(false);
     fetch('/api/action/' + b.dataset.action, { method: 'POST' })
       .then(function (r) { return r.json(); }).then(applyState);
   });
