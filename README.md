@@ -26,7 +26,7 @@ The simulator captures frames from a webcam and, in real time:
 - **Linux** is assumed for full functionality:
   - Camera capture uses the V4L2 backend (`cv.CAP_V4L2`).
   - The foot pedal path is a Linux input device (`/dev/input/by-id/usb-PCsensor-FootSwitch-event-kbd`).
-- An overlay image named **`skel.jpg`** placed in the same directory as the script.
+- An overlay image named **`skel.jpg`** placed in the same directory as the script. This file is included in the repository root (`fluoro_simulator/skel.jpg`) — an AP lumbar spine X-ray used as the anatomical background overlay.
 
 Install dependencies:
 
