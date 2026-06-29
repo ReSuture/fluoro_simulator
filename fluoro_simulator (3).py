@@ -241,9 +241,10 @@ if __name__ == '__main__':
 
         # ── Histogram equalisation ────────────────────────────────────────────
         if equalize_mode:
-            # Spreads pixel intensities across the full 0-255 range, boosting
-            # contrast in low-contrast frames (similar to auto-window/level on a real fluoroscope).
-            gray = cv.equalizeHist(gray)
+            # CLAHE boosts contrast locally so vasculature in low-contrast regions
+            # is enhanced without blowing out areas that are already high-contrast.
+            clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
 
         return gray, t0
 
@@ -355,8 +356,10 @@ if __name__ == '__main__':
                     # absdiff produces a difference image: pixels that match the
                     # background are near 0; pixels that differ (vasculature) are brighter.
                     frame_gray = cv.absdiff(frame_gray, bg_uint8)
-                    # Invert the difference: vasculature (bright diff) → dark,
-                    # empty background (zero diff) → white — mimicking X-ray appearance.
+                    # Stretch small vasculature differences to the full 0-255 range so
+                    # they remain visibly dark after inversion instead of washing out.
+                    cv.normalize(frame_gray, frame_gray, 0, 255, cv.NORM_MINMAX)
+                    # Invert: vasculature (bright diff) → dark, background (zero diff) → white.
                     frame_gray = cv.bitwise_not(frame_gray)
 
                 # Slowly update the background model so it adapts to gradual lighting
