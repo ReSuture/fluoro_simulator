@@ -15,14 +15,29 @@ The web panel exposes the on/off toggles only (no numeric tuning sliders):
     Subtraction, Overlay, Equalize, Pedal mode, Pedal press, HUD,
     plus Fullscreen / Windowed / Quit actions and a live preview.
 
-The capture + processing loop and the OpenCV window run on the main thread
-(OpenCV's GUI must run on the main thread). Flask runs in a background daemon
-thread and only reads/writes a small shared-state dict guarded by a lock.
+Architecture
+------------
+The capture + processing loop and the OpenCV ``FLUORO`` window run on the main
+thread (OpenCV's GUI must run on the main thread). Flask runs in a background
+daemon thread. The two communicate only through a small ``state`` dict guarded
+by ``state_lock`` (the toggle flags) and the JPEG buffer ``_latest_jpeg`` guarded
+by ``_latest_lock`` (the latest frame for the preview). The web handlers never
+touch OpenCV directly — they just flip flags that the main loop reads each frame.
+
+HTTPS
+-----
+If ``cert.pem`` and ``key.pem`` are present next to this script, the panel is
+served over HTTPS (so browsers that force secure connections can reach it). Pass
+``--http`` to force plain HTTP. Generate a self-signed cert (valid ~2 years) with:
+
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \\
+        -days 825 -subj "/CN=FluoroSim" \\
+        -addext "subjectAltName=IP:<your-lan-ip>,DNS:localhost,IP:127.0.0.1"
 
 Usage:
-    python fluoro_web.py [<video device number>] [--port 5000] [--no-window]
+    python fluoro_web.py [<video device number>] [--port 5000] [--no-window] [--http]
 
-Then open  http://<this-machine-ip>:<port>/  in a browser.
+Then open  https://<this-machine-ip>:<port>/  in a browser (http:// without a cert).
 '''
 
 from __future__ import print_function
@@ -74,6 +89,11 @@ _latest_lock = threading.Lock()
 
 
 def get_state_snapshot():
+    '''Return a thread-safe shallow copy of the shared state dict.
+
+    The processing loop reads a snapshot once per frame so the flags can't change
+    underneath it mid-frame, and so it doesn't hold the lock during heavy work.
+    '''
     with state_lock:
         return dict(state)
 
@@ -199,16 +219,23 @@ setInterval(refresh, 1500);
 
 @app.route("/")
 def index():
+    '''Serve the single-page control panel.'''
     return render_template_string(PAGE)
 
 
 @app.route("/api/state")
 def api_state():
+    '''Return the current toggle states as JSON (polled by the page to stay in sync).'''
     return jsonify(get_state_snapshot())
 
 
 @app.route("/api/toggle/<name>", methods=["POST"])
 def api_toggle(name):
+    '''Flip one boolean toggle and return the full updated state.
+
+    Only the known toggle names are accepted; anything else is ignored so an
+    arbitrary key can't be injected into the state dict.
+    '''
     with state_lock:
         if name in ("subtract", "overlay", "equalize", "pedal_mode", "pedal_pressed", "hud"):
             state[name] = not state[name]
@@ -218,6 +245,7 @@ def api_toggle(name):
 
 @app.route("/api/action/<action>", methods=["POST"])
 def api_action(action):
+    '''Apply a one-shot action (fullscreen / windowed / quit) and return the state.'''
     with state_lock:
         if action == "fullscreen":
             state["fullscreen"] = True
@@ -271,18 +299,31 @@ def composite_overlay(gray, overlay, equalize):
 
 
 def draw_str(dst, target, s):
+    '''Draw white text with a black drop-shadow so it stays legible over any frame.'''
     x, y = target
     cv.putText(dst, s, (x + 1, y + 1), cv.FONT_HERSHEY_PLAIN, 1.0, (0, 0, 0), thickness=2, lineType=cv.LINE_AA)
     cv.putText(dst, s, (x, y), cv.FONT_HERSHEY_PLAIN, 1.0, (255, 255, 255), lineType=cv.LINE_AA)
 
 
 def run_simulation(cam_index, show_window):
+    '''Main capture/process/display loop — runs on the main thread until quit.
+
+    Each iteration: read a frame, apply background subtraction (optional) and the
+    overlay composite (optional), draw the HUD, then both show it in the FLUORO
+    window and JPEG-encode it into ``_latest_jpeg`` for the web preview. The loop
+    reads the shared toggle state once per frame via get_state_snapshot(), so the
+    web buttons and the keyboard shortcuts drive exactly the same behaviour.
+
+    cam_index   : int  — V4L2 camera device index
+    show_window : bool — open the on-screen FLUORO window (False = web preview only)
+    '''
     global _latest_jpeg
 
     cap = cv.VideoCapture(cam_index, cv.CAP_V4L2)
     if not cap.isOpened():
         print("Warning: unable to open video source:", cam_index)
 
+    # Anatomy overlay (skel.jpg), converted to grayscale to match the live feed.
     overlay = cv.imread(OVERLAY_IMAGE)
     if overlay is None:
         raise FileNotFoundError("Cannot load image: %s" % OVERLAY_IMAGE)
@@ -292,9 +333,9 @@ def run_simulation(cam_index, show_window):
         cv.namedWindow("FLUORO", cv.WND_PROP_FULLSCREEN)
         cv.setWindowProperty("FLUORO", cv.WND_PROP_ASPECT_RATIO, cv.WINDOW_KEEPRATIO)
 
-    background = None
-    applied_fullscreen = None
-    res = None
+    background = None          # float32 running-average background model
+    applied_fullscreen = None  # last fullscreen state pushed to the window (avoids redundant calls)
+    res = None                 # last processed frame (shown + streamed)
 
     while True:
         s = get_state_snapshot()
@@ -318,6 +359,8 @@ def run_simulation(cam_index, show_window):
                 state["quit"] = True
             break
 
+        # In pedal mode, only grab a frame while the pedal/'b' is held; otherwise
+        # capture continuously.
         pedal_down = s["pedal_pressed"] or key_pedal
         capture_now = pedal_down or not s["pedal_mode"]
 
@@ -328,18 +371,22 @@ def run_simulation(cam_index, show_window):
                 continue
 
             frame_gray = cv.cvtColor(frame, cv.COLOR_RGB2GRAY)
-            frame_raw = frame_gray.copy()
+            frame_raw = frame_gray.copy()  # untouched copy shown when the overlay is off
             overlay = cv.resize(overlay, (frame_gray.shape[1], frame_gray.shape[0]))
 
+            # Seed / read the running-background model used for subtraction.
             if background is None:
                 background = frame_gray.astype("float")
             bg_uint8 = cv.convertScaleAbs(background)
 
             if s["subtract"]:
+                # Difference vs. background, stretch to full range, then invert so
+                # static background reads white and moving structures read dark.
                 frame_gray = cv.absdiff(frame_gray, bg_uint8)
                 cv.normalize(frame_gray, frame_gray, 0, 255, cv.NORM_MINMAX)
                 frame_gray = cv.bitwise_not(frame_gray)
 
+            # Slowly adapt the background model to gradual lighting changes.
             cv.accumulateWeighted(frame_gray, background, ALPHA)
 
             # Overlay off => show the full raw video (bright/white areas intact).

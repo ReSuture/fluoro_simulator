@@ -54,15 +54,62 @@ Make sure `skel.jpg` is in the same folder as the script before running, or it w
 | `2`       | Toggle anatomy overlay                              |
 | `3`       | Fullscreen                                          |
 | `4`       | Windowed mode                                       |
-| `5`       | Retake the background image used in subtraction     |
+| `5`       | Toggle the anatomy overlay (off = full raw video)   |
 | `6`       | Toggle histogram equalization                       |
 | `7`       | Toggle the HUD (on-screen text display)             |
 | `b`       | Acts as the pedal press (keyboard stand-in)         |
 
 > When **pedal mode** is on, frames are only captured while the pedal is held (or the `b` key is pressed). When it's off, the simulator captures continuously.
+>
+> Keys `2` and `5` both toggle the overlay. With the overlay **off**, the simulator shows the full raw video with the bright/white areas intact (nothing removed).
+
+## Web control panel (`fluoro_web.py`)
+
+`fluoro_web.py` runs the same simulation (the fullscreen `FLUORO` window and the keyboard shortcuts above) **and** serves a small web page so the simulation can be controlled from a phone, tablet, or any browser on the same network — handy for operating the demo from a tablet while the monitor shows the fluoro view.
+
+### What it provides
+
+- A **live preview** (MJPEG stream) of the processed feed.
+- On/off **toggle buttons** mirroring the keyboard shortcuts: Subtraction, Overlay, Equalize, Pedal mode, Pedal press, and HUD. Toggles stay in sync whether you use the web buttons or the keyboard.
+- **Fullscreen / Windowed** buttons that control both the `FLUORO` popup window on the computer **and** the live preview in your browser, plus a **Quit** button.
+
+### Requirements
+
+In addition to the base requirements, install Flask:
+
+```bash
+pip install flask
+```
+
+### Usage
+
+```bash
+python fluoro_web.py [<video device number>] [--port 5000] [--no-window] [--http]
+```
+
+- `<video device number>` — camera index (default `0`).
+- `--port` — web server port (default `5000`).
+- `--no-window` — run web-only, without the on-screen `FLUORO` window.
+- `--http` — force plain HTTP even if a TLS cert is present.
+
+Then open `https://<this-machine-ip>:<port>/` in a browser (or `http://…` if running without a cert).
+
+### HTTPS (self-signed cert)
+
+Some browsers force `https://`. If `cert.pem` and `key.pem` are present next to the script, the panel is served over HTTPS automatically. Generate a self-signed cert (valid ~2 years) with:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \
+    -days 825 -subj "/CN=FluoroSim" \
+    -addext "subjectAltName=IP:<your-lan-ip>,DNS:localhost,IP:127.0.0.1"
+```
+
+The browser will show a one-time "not private" warning for the self-signed cert — click through to proceed. `cert.pem` and `key.pem` are git-ignored, so the private key is never committed; each machine generates its own.
+
+> **Fullscreen note:** the panel forces OpenCV's X11/XWayland Qt backend (`QT_QPA_PLATFORM=xcb`) so the Fullscreen/Windowed controls can actually toggle the `FLUORO` window — the native Wayland backend ignores those calls.
 
 ## Notes
 
-- Tuning knobs live near the top of the main loop: `mask_threshold` (background mask cutoff) and `alpha` (running-background accumulation weight).
+- Tuning knobs live near the top of the processing code: the background mask cutoff (`MASK_THRESHOLD` / `mask_threshold`), the running-background accumulation weight (`ALPHA` / `alpha`), and the overlay blend weights (bright areas 30% video / 70% overlay; vasculature 60% video / 40% overlay).
 - The `FLUORO` window opens full-screen by default; use `4` to drop into a normal window.
 - This is a demonstration/training tool and is **not** a medical device.
