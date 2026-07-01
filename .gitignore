@@ -8,3 +8,6 @@ __pycache__/
 
 # Runtime log from the desktop launcher
 launch.log
+
+# Runtime log from the headless server launch
+server.log

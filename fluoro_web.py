@@ -56,7 +56,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import numpy as np
 import cv2 as cv
-from flask import Flask, Response, jsonify, render_template_string
+from flask import Flask, Response, jsonify, render_template_string, request
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,6 +68,36 @@ LOGO_IMAGE = os.path.join(BASE_DIR, "static", "logosign_white.png")
 MASK_THRESHOLD = 220
 # Background-model learning rate for cv.accumulateWeighted.
 ALPHA = 0.05
+
+# ── Camera-position → viewport calibration ────────────────────────────────────
+# The full-resolution "master" background: a plain (NO-CONTRAST) radiograph of the
+# torso, roughly brachiocephalic → femoral. The live camera feed superimposes the
+# real vasculature on top, so the master must NOT show opacified vessels. As the
+# camera moves, we crop a viewport out of this master at the camera's (x, y)
+# position and scale it to the frame, so the anatomy pans like a C-arm.
+#
+# The camera position arrives as an (x_cm, y_cm) location measured in centimetres
+# from an origin point. How it's produced (a separate engineer's motion
+# controller) is not this module's concern — it's pushed in via POST /api/position
+# and lives in state["pos_x_cm"] / state["pos_y_cm"].
+#
+# ALL FOUR VALUES BELOW ARE PLACEHOLDERS — recalibrate when the real (high-res
+# adult) master image is dropped in. master_body.jpg is a low-res stand-in.
+MASTER_IMAGE = os.path.join(BASE_DIR, "master_body.jpg")
+# Master-image pixels per real centimetre of anatomy.
+PX_PER_CM = 6.0
+# The master pixel that camera coordinate (0, 0) maps to (viewport centre at origin).
+ORIGIN_PX = (285, 463)          # centre of the 570×926 placeholder
+# Physical area the detector sees at once, (width_cm, height_cm). Keep 4:3 to match
+# the camera frame. This is the ZOOM knob: larger = zoomed out (more anatomy shown),
+# smaller = zoomed in. With the placeholder master it's tuned so one frame shows most
+# of the body width (like skel.jpg filled the frame) while leaving room to pan.
+FOV_CM = (80.0, 60.0)
+# Flip a sign if increasing X (or Y) should pan the viewport the opposite way.
+FLIP_X = 1.0
+FLIP_Y = 1.0
+# How far each on-screen nudge button / WASD keypress moves the camera position (cm).
+PAN_STEP_CM = 5.0
 
 # ── Shared state ────────────────────────────────────────────────────────────────
 # All values touched by both the processing loop and the web handlers live here,
@@ -82,6 +112,8 @@ state = {
     "hud": True,            # (7) on-screen text HUD
     "fullscreen": True,     # (3/4) FLUORO window fullscreen vs. windowed
     "quit": False,          # set by the web Quit button to stop the loop
+    "pos_x_cm": 0.0,        # camera X position (cm from origin) — drives the viewport
+    "pos_y_cm": 0.0,        # camera Y position (cm from origin) — drives the viewport
 }
 
 # Latest processed frame, JPEG-encoded, for the MJPEG preview stream.
@@ -155,6 +187,11 @@ PAGE = """
   .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
   button.quit { grid-column: 1 / -1; background: #2a1416; border-color: #5b2327; color: #ff9a9a; }
   .hint { color: #7d8a99; font-size: 12px; margin: 14px 2px 0; }
+  .posctl { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+  .posctl label { display: flex; align-items: center; gap: 6px; color: #7d8a99; font-size: 14px; }
+  .posctl input { width: 90px; font-size: 16px; padding: 12px 10px; border-radius: 10px;
+                  border: 1px solid #26323f; background: #131a22; color: #e7edf3; }
+  .posctl button { padding: 12px 18px; }
 </style>
 </head>
 <body>
@@ -187,6 +224,12 @@ PAGE = """
     </div>
   </div>
 
+  <div class="posctl">
+    <label>X <input id="xin" type="number" step="0.5" value="0"> cm</label>
+    <label>Y <input id="yin" type="number" step="0.5" value="0"> cm</label>
+    <button id="gopos" type="button">Pan</button>
+  </div>
+  <p class="hint" id="pos">Camera: —</p>
   <p class="hint">Overlay off shows the full raw video. Pedal press only matters when Pedal mode is on.</p>
 </main>
 
@@ -200,6 +243,9 @@ function applyState(s) {
   document.querySelectorAll('.fsbtn').forEach(function (b) {
     b.classList.toggle('on', (b.dataset.fs === '1') === !!s.fullscreen);
   });
+  var pos = document.getElementById('pos');
+  if (pos) pos.textContent = 'Camera: x=' + (+s.pos_x_cm || 0).toFixed(1) +
+                             '  y=' + (+s.pos_y_cm || 0).toFixed(1) + ' cm';
 }
 function refresh() {
   fetch('/api/state').then(function (r) { return r.json(); }).then(applyState).catch(function () {});
@@ -234,6 +280,19 @@ document.querySelectorAll('[data-action]').forEach(function (b) {
     fetch('/api/action/' + b.dataset.action, { method: 'POST' })
       .then(function (r) { return r.json(); }).then(applyState);
   });
+});
+function sendPos() {
+  var x = parseFloat(document.getElementById('xin').value) || 0;
+  var y = parseFloat(document.getElementById('yin').value) || 0;
+  fetch('/api/position', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ x: x, y: y }) })
+    .then(function (r) { return r.json(); }).then(applyState).catch(function () {});
+}
+document.getElementById('gopos').addEventListener('click', sendPos);
+['xin', 'yin'].forEach(function (id) {
+  var el = document.getElementById(id);
+  el.addEventListener('change', sendPos);                 // fires on blur / stepper arrows
+  el.addEventListener('keydown', function (e) { if (e.key === 'Enter') sendPos(); });
 });
 var feed = document.getElementById('feed');
 feed.addEventListener('load', function () { document.getElementById('dot').classList.add('live'); });
@@ -286,6 +345,29 @@ def api_action(action):
     return jsonify(snap)
 
 
+@app.route("/api/position", methods=["POST"])
+def api_position():
+    '''Set the current camera position, in centimetres from the origin.
+
+    This is the single input hook for the motion source: the position provider
+    POSTs the camera's (x, y) here and the processing loop pans the anatomy
+    viewport to match. Accepts JSON ``{"x": <cm>, "y": <cm>}`` or plain form/query
+    params ``x`` and ``y``. Returns the full updated state.
+    '''
+    data = request.get_json(silent=True) or {}
+    x = data.get("x", request.values.get("x"))
+    y = data.get("y", request.values.get("y"))
+    try:
+        x, y = float(x), float(y)
+    except (TypeError, ValueError):
+        return jsonify({"error": "provide numeric x and y (cm)"}), 400
+    with state_lock:
+        state["pos_x_cm"] = x
+        state["pos_y_cm"] = y
+        snap = dict(state)
+    return jsonify(snap)
+
+
 def mjpeg_generator():
     '''Yield the latest processed frame as a multipart MJPEG stream.'''
     boundary = b"--frame"
@@ -304,6 +386,27 @@ def video_feed():
 
 
 # ── Image processing ────────────────────────────────────────────────────────────
+def compute_viewport(master, x_cm, y_cm):
+    '''Crop the anatomy viewport out of the full-res master at a camera position.
+
+    Maps the camera's (x_cm, y_cm) — centimetres from the origin — to a pixel
+    window in ``master`` using the calibration constants, centred on that point.
+    The window is clamped to lie fully inside the image, so reaching the edge of
+    travel pans up against the border instead of returning a truncated crop (which
+    would otherwise distort when resized to the frame).
+
+    Returns a view into ``master`` (no copy); the caller resizes it to the frame.
+    '''
+    mh, mw = master.shape[:2]
+    w = max(1, min(int(round(FOV_CM[0] * PX_PER_CM)), mw))
+    h = max(1, min(int(round(FOV_CM[1] * PX_PER_CM)), mh))
+    cx = ORIGIN_PX[0] + FLIP_X * x_cm * PX_PER_CM
+    cy = ORIGIN_PX[1] + FLIP_Y * y_cm * PX_PER_CM
+    x0 = max(0, min(int(round(cx - w / 2.0)), mw - w))
+    y0 = max(0, min(int(round(cy - h / 2.0)), mh - h))
+    return master[y0:y0 + h, x0:x0 + w]
+
+
 def composite_overlay(gray, overlay, equalize):
     '''Composite the anatomy overlay onto a (subtracted) grayscale frame.
 
@@ -426,11 +529,14 @@ def render_controls(s, logo, live):
     `s` is a state snapshot.
     '''
     W, m, gap, top_pad = 380, 16, 10, 18
-    bt, ba = 56, 52
+    bt, ba, cap_h = 56, 52, 22
 
     lw = W - 2 * m
     lh = int(logo.shape[0] * (lw / float(logo.shape[1]))) if logo is not None else 0
-    H = top_pad + lh + 14 + 26 + 14 + bt * 3 + gap * 3 + ba + gap + ba + 16
+    # rows: 3 toggle rows, then a location caption + nudge row, then Fullscreen/
+    # Windowed, then Quit.
+    H = (top_pad + lh + 14 + 26 + 14 + bt * 3 + gap * 3
+         + cap_h + gap + ba + gap + ba + gap + ba + 16)
 
     img = np.full((H, W, 3), C_BG, np.uint8)
     buttons = []
@@ -461,6 +567,18 @@ def render_controls(s, logo, live):
         buttons.append((bx, by, cw, bt, "toggle", key))
     y += 3 * (bt + gap)
 
+    # Background-location readout + nudge buttons (X−/X+/Y−/Y+).
+    cap = "Background   X %.0f   Y %.0f cm" % (s["pos_x_cm"], s["pos_y_cm"])
+    (capw, caph), _ = cv.getTextSize(cap, font, 0.5, 1)
+    cv.putText(img, cap, ((W - capw) // 2, y + caph + 2), font, 0.5, C_SUBTEXT, 1, cv.LINE_AA)
+    y += cap_h + gap
+    pw = (W - 2 * m - 3 * gap) // 4
+    for i, (label, name) in enumerate([("X-", "xm"), ("X+", "xp"), ("Y-", "ym"), ("Y+", "yp")]):
+        bx = m + i * (pw + gap)
+        draw_button(img, bx, y, pw, ba, label, None, False)
+        buttons.append((bx, y, pw, ba, "pan", name))
+    y += ba + gap
+
     draw_button(img, m, y, cw, ba, "Fullscreen", None, s["fullscreen"])
     buttons.append((m, y, cw, ba, "action", "fullscreen"))
     draw_button(img, m + cw + gap, y, cw, ba, "Windowed", None, not s["fullscreen"])
@@ -478,7 +596,7 @@ def render_control_bar(s, width, live):
     Returns (image, buttons) with hit-boxes relative to the bar's top-left.
     '''
     pad, gap, bh = 6, 6, 34
-    bar_h = pad + bh + gap + bh + pad
+    bar_h = pad + bh + gap + bh + gap + bh + pad   # 3 rows: toggles, actions, location
     img = np.full((bar_h, width, 3), C_BG, np.uint8)
     cv.line(img, (0, 0), (width, 0), C_BTN_BD, 1, cv.LINE_AA)
     buttons = []
@@ -501,6 +619,19 @@ def render_control_bar(s, width, live):
     buttons.append((pad + aw + gap, y, aw, bh, "action", "windowed"))
     draw_button(img, pad + 2 * (aw + gap), y, aw, bh, "Quit simulator", None, False, "quit")
     buttons.append((pad + 2 * (aw + gap), y, aw, bh, "action", "quit"))
+
+    # Row 3: background-location readout + nudge buttons (X−/X+/Y−/Y+).
+    y += bh + gap
+    cap = "Bg  X %.0f  Y %.0f cm" % (s["pos_x_cm"], s["pos_y_cm"])
+    cap_w = 190
+    (_, caph), _ = cv.getTextSize(cap, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    cv.putText(img, cap, (pad, y + (bh + caph) // 2), cv.FONT_HERSHEY_SIMPLEX, 0.5, C_SUBTEXT, 1, cv.LINE_AA)
+    pw = (width - 2 * pad - cap_w - 3 * gap) // 4
+    x = pad + cap_w
+    for (label, name) in [("X-", "xm"), ("X+", "xp"), ("Y-", "ym"), ("Y+", "yp")]:
+        draw_button(img, x, y, pw, bh, label, None, False)
+        buttons.append((x, y, pw, bh, "pan", name))
+        x += pw + gap
     return img, buttons
 
 
@@ -509,6 +640,15 @@ def apply_button(kind, name):
     with state_lock:
         if kind == "toggle":
             state[name] = not state[name]
+        elif kind == "pan":
+            if name == "xm":
+                state["pos_x_cm"] -= PAN_STEP_CM
+            elif name == "xp":
+                state["pos_x_cm"] += PAN_STEP_CM
+            elif name == "ym":
+                state["pos_y_cm"] -= PAN_STEP_CM
+            elif name == "yp":
+                state["pos_y_cm"] += PAN_STEP_CM
         elif name == "fullscreen":
             state["fullscreen"] = True
         elif name == "windowed":
@@ -559,11 +699,17 @@ def run_simulation(cam_index, show_window):
     if not cap.isOpened():
         print("Warning: unable to open video source:", cam_index)
 
-    # Anatomy overlay (skel.jpg), converted to grayscale to match the live feed.
-    overlay = cv.imread(OVERLAY_IMAGE)
-    if overlay is None:
-        raise FileNotFoundError("Cannot load image: %s" % OVERLAY_IMAGE)
-    overlay = cv.cvtColor(overlay, cv.COLOR_RGB2GRAY)
+    # Full-resolution "master" anatomy background, kept untouched at full res so we
+    # can crop a fresh viewport out of it every frame (see compute_viewport). Falls
+    # back to the static skel.jpg (shown whole, no panning) if the master is absent.
+    master = cv.imread(MASTER_IMAGE)
+    if master is None:
+        print("Master image not found at %s — falling back to %s (no panning)"
+              % (MASTER_IMAGE, OVERLAY_IMAGE))
+        master = cv.imread(OVERLAY_IMAGE)
+        if master is None:
+            raise FileNotFoundError("Cannot load image: %s" % OVERLAY_IMAGE)
+    master = cv.cvtColor(master, cv.COLOR_BGR2GRAY)
 
     # On-screen control panel: the logo image and a helper to (re)open the
     # separate CONTROLS window used in windowed mode.
@@ -632,7 +778,10 @@ def run_simulation(cam_index, show_window):
 
             frame_gray = cv.cvtColor(frame, cv.COLOR_RGB2GRAY)
             frame_raw = frame_gray.copy()  # untouched copy shown when the overlay is off
-            overlay = cv.resize(overlay, (frame_gray.shape[1], frame_gray.shape[0]))
+            # Pan the anatomy: crop the viewport at the current camera position and
+            # scale it to the frame. This is the background the vasculature sits on.
+            crop = compute_viewport(master, s["pos_x_cm"], s["pos_y_cm"])
+            overlay_frame = cv.resize(crop, (frame_gray.shape[1], frame_gray.shape[0]))
 
             # Seed / read the running-background model used for subtraction.
             if background is None:
@@ -651,7 +800,7 @@ def run_simulation(cam_index, show_window):
 
             # Overlay off => show the full raw video (bright/white areas intact).
             if s["overlay"]:
-                res = composite_overlay(frame_gray, overlay, s["equalize"])
+                res = composite_overlay(frame_gray, overlay_frame, s["equalize"])
             else:
                 res = frame_raw
 
@@ -659,6 +808,7 @@ def run_simulation(cam_index, show_window):
                 draw_str(res, (20, 20), "Subtraction:%s  Overlay:%s  Equalize:%s" %
                          (s["subtract"], s["overlay"], s["equalize"]))
                 draw_str(res, (20, 40), "Pedal mode:%s  HUD:%s" % (s["pedal_mode"], s["hud"]))
+                draw_str(res, (20, 60), "Cam: x=%.1f  y=%.1f cm" % (s["pos_x_cm"], s["pos_y_cm"]))
             if pedal_down:
                 draw_str(res, (20, 80), "PEDAL ACTIVE")
 
@@ -708,6 +858,14 @@ def _handle_key(key):
             state["hud"] = not state["hud"]
         elif key == ord(' '):
             state["pedal_mode"] = not state["pedal_mode"]
+        elif key == ord('a'):            # pan the anatomy background: X−
+            state["pos_x_cm"] -= PAN_STEP_CM
+        elif key == ord('d'):            # X+
+            state["pos_x_cm"] += PAN_STEP_CM
+        elif key == ord('w'):            # Y−
+            state["pos_y_cm"] -= PAN_STEP_CM
+        elif key == ord('s'):            # Y+
+            state["pos_y_cm"] += PAN_STEP_CM
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
