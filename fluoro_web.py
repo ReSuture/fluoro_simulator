@@ -12,7 +12,7 @@ while the monitor shows the fluoro view.
 
 The web panel exposes the on/off toggles only (no numeric tuning sliders):
 
-    Subtraction, Overlay, Equalize, Pedal mode, Pedal press, HUD,
+    Overlay, Equalize, Pedal mode, Pedal press, HUD,
     plus Fullscreen / Windowed / Quit actions and a live preview.
 
 Architecture
@@ -66,8 +66,17 @@ LOGO_IMAGE = os.path.join(BASE_DIR, "static", "logosign_white.png")
 # Brightness threshold above which a pixel is treated as bright "white background"
 # and composited mostly from the overlay. (Mirrors fluoro_simulator (3).py.)
 MASK_THRESHOLD = 220
-# Background-model learning rate for cv.accumulateWeighted.
-ALPHA = 0.05
+# White-background-removal freeze: once the raw camera frame has stayed largely
+# the same for STABLE_FRAMES consecutive frames, the composite's white-background
+# mask is frozen so the exact same removal is applied to every following frame
+# (re-thresholding each live frame otherwise flips pixels near MASK_THRESHOLD
+# between the two blend weights with sensor noise, making a steady scene pulse).
+# The freeze holds until the frame drifts from the frozen reference frame by more
+# than CHANGE_DIFF (camera pan, lighting change), then it can re-freeze once the
+# scene settles again. Both thresholds are mean gray levels per pixel (0-255).
+STABLE_FRAMES = 15
+STABLE_DIFF = 3.0
+CHANGE_DIFF = 10.0
 
 # ── Camera-position → viewport calibration ────────────────────────────────────
 # The full-resolution "master" background: a plain (NO-CONTRAST) radiograph of the
@@ -84,6 +93,9 @@ ALPHA = 0.05
 # Calibrated against fulltorsofluoroimage.png (472×868), a plain no-contrast
 # full-torso radiograph. Retune these four values if the master image changes.
 MASTER_IMAGE = os.path.join(BASE_DIR, "fulltorsofluoroimage.png")
+# Brightness scale applied to the master at load. <1.0 darkens it (pulls the
+# bright/white areas down the most, since it's multiplicative); 1.0 = as-is.
+MASTER_BRIGHTNESS = 0.75
 # Master-image pixels per real centimetre of anatomy.
 PX_PER_CM = 5.0
 # The master pixel that camera coordinate (0, 0) maps to (viewport centre at origin).
@@ -96,7 +108,14 @@ FOV_CM = (80.0, 60.0)
 # Flip a sign if increasing X (or Y) should pan the viewport the opposite way.
 FLIP_X = 1.0
 FLIP_Y = 1.0
-# How far each on-screen nudge button / WASD keypress moves the camera position (cm).
+# Zoom (Z) calibration: nominal camera height above the anatomy (cm). The field
+# of view scales with (ZOOM_REF_CM + z) / ZOOM_REF_CM, so Z+ (raising the
+# camera) shows more anatomy (zoom out) and Z− zooms in; z = 0 gives exactly
+# FOV_CM. Flip FLIP_Z if the Z axis runs the other way.
+ZOOM_REF_CM = 50.0
+FLIP_Z = 1.0
+# How far each on-screen nudge button / keyboard keypress moves the camera
+# position (cm) — shared by the X/Y pan and Z zoom controls.
 PAN_STEP_CM = 5.0
 
 # ── Shared state ────────────────────────────────────────────────────────────────
@@ -104,7 +123,6 @@ PAN_STEP_CM = 5.0
 # guarded by `state_lock`. Booleans mirror the keyboard toggles of the original.
 state_lock = threading.Lock()
 state = {
-    "subtract": True,       # (1) background subtraction + inversion
     "overlay": True,        # (2/5) anatomy overlay; off => full raw video
     "equalize": True,       # (6) CLAHE histogram equalisation
     "pedal_mode": False,    # (space) only capture while the pedal is pressed
@@ -114,6 +132,7 @@ state = {
     "quit": False,          # set by the web Quit button to stop the loop
     "pos_x_cm": 0.0,        # camera X position (cm from origin) — drives the viewport
     "pos_y_cm": 0.0,        # camera Y position (cm from origin) — drives the viewport
+    "pos_z_cm": 0.0,        # camera Z position (cm from nominal height) — drives the zoom
 }
 
 # Latest processed frame, JPEG-encoded, for the MJPEG preview stream.
@@ -170,7 +189,7 @@ PAGE = """
       flex: 0 0 auto; padding: 10px 12px; background: #0b0f14; border-top: 1px solid #1d2733; }
   /* Lay the buttons out horizontally so the strip stays short. */
   .stage:fullscreen .panel .grid, .stage:-webkit-full-screen .panel .grid {
-      grid-template-columns: repeat(6, 1fr); margin-top: 0; }
+      grid-template-columns: repeat(5, 1fr); margin-top: 0; }
   .stage:fullscreen .panel .actions, .stage:-webkit-full-screen .panel .actions {
       grid-template-columns: repeat(3, 1fr); margin-top: 8px; }
   .stage:fullscreen .panel button, .stage:-webkit-full-screen .panel button {
@@ -208,7 +227,6 @@ PAGE = """
 
     <div class="panel">
       <div class="grid" id="toggles">
-        <button class="toggle" data-toggle="subtract">Subtraction<span class="st">—</span></button>
         <button class="toggle" data-toggle="overlay">Overlay<span class="st">—</span></button>
         <button class="toggle" data-toggle="equalize">Equalize<span class="st">—</span></button>
         <button class="toggle" data-toggle="hud">HUD<span class="st">—</span></button>
@@ -227,6 +245,7 @@ PAGE = """
   <div class="posctl">
     <label>X <input id="xin" type="number" step="0.5" value="0"> cm</label>
     <label>Y <input id="yin" type="number" step="0.5" value="0"> cm</label>
+    <label>Z <input id="zin" type="number" step="0.5" value="0"> cm</label>
     <button id="gopos" type="button">Pan</button>
   </div>
   <p class="hint" id="pos">Camera: —</p>
@@ -245,7 +264,8 @@ function applyState(s) {
   });
   var pos = document.getElementById('pos');
   if (pos) pos.textContent = 'Camera: x=' + (+s.pos_x_cm || 0).toFixed(1) +
-                             '  y=' + (+s.pos_y_cm || 0).toFixed(1) + ' cm';
+                             '  y=' + (+s.pos_y_cm || 0).toFixed(1) +
+                             '  z=' + (+s.pos_z_cm || 0).toFixed(1) + ' cm';
 }
 function refresh() {
   fetch('/api/state').then(function (r) { return r.json(); }).then(applyState).catch(function () {});
@@ -284,12 +304,13 @@ document.querySelectorAll('[data-action]').forEach(function (b) {
 function sendPos() {
   var x = parseFloat(document.getElementById('xin').value) || 0;
   var y = parseFloat(document.getElementById('yin').value) || 0;
+  var z = parseFloat(document.getElementById('zin').value) || 0;
   fetch('/api/position', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ x: x, y: y }) })
+    body: JSON.stringify({ x: x, y: y, z: z }) })
     .then(function (r) { return r.json(); }).then(applyState).catch(function () {});
 }
 document.getElementById('gopos').addEventListener('click', sendPos);
-['xin', 'yin'].forEach(function (id) {
+['xin', 'yin', 'zin'].forEach(function (id) {
   var el = document.getElementById(id);
   el.addEventListener('change', sendPos);                 // fires on blur / stepper arrows
   el.addEventListener('keydown', function (e) { if (e.key === 'Enter') sendPos(); });
@@ -325,7 +346,7 @@ def api_toggle(name):
     arbitrary key can't be injected into the state dict.
     '''
     with state_lock:
-        if name in ("subtract", "overlay", "equalize", "pedal_mode", "pedal_pressed", "hud"):
+        if name in ("overlay", "equalize", "pedal_mode", "pedal_pressed", "hud"):
             state[name] = not state[name]
         snap = dict(state)
     return jsonify(snap)
@@ -352,18 +373,23 @@ def api_position():
     This is the single input hook for the motion source: the position provider
     POSTs the camera's (x, y) here and the processing loop pans the anatomy
     viewport to match. Accepts JSON ``{"x": <cm>, "y": <cm>}`` or plain form/query
-    params ``x`` and ``y``. Returns the full updated state.
+    params ``x`` and ``y``. An optional ``z`` (cm) sets the zoom the same way;
+    omitting it leaves the current zoom unchanged. Returns the full updated state.
     '''
     data = request.get_json(silent=True) or {}
     x = data.get("x", request.values.get("x"))
     y = data.get("y", request.values.get("y"))
+    z = data.get("z", request.values.get("z"))
     try:
         x, y = float(x), float(y)
+        z = float(z) if z is not None else None
     except (TypeError, ValueError):
-        return jsonify({"error": "provide numeric x and y (cm)"}), 400
+        return jsonify({"error": "provide numeric x and y (cm), optional z (cm)"}), 400
     with state_lock:
         state["pos_x_cm"] = x
         state["pos_y_cm"] = y
+        if z is not None:
+            state["pos_z_cm"] = z
         snap = dict(state)
     return jsonify(snap)
 
@@ -386,11 +412,13 @@ def video_feed():
 
 
 # ── Image processing ────────────────────────────────────────────────────────────
-def compute_viewport(master, x_cm, y_cm):
+def compute_viewport(master, x_cm, y_cm, z_cm=0.0):
     '''Crop the anatomy viewport out of the full-res master at a camera position.
 
     Maps the camera's (x_cm, y_cm) — centimetres from the origin — to a pixel
     window in ``master`` using the calibration constants, centred on that point.
+    ``z_cm`` scales the window like camera height: Z+ widens the field of view
+    (zoom out), Z− narrows it (zoom in); see ZOOM_REF_CM.
     The window is clamped to lie fully inside the image, so reaching the edge of
     travel pans up against the border instead of returning a truncated crop (which
     would otherwise distort when resized to the frame).
@@ -398,8 +426,9 @@ def compute_viewport(master, x_cm, y_cm):
     Returns a view into ``master`` (no copy); the caller resizes it to the frame.
     '''
     mh, mw = master.shape[:2]
-    w = max(1, min(int(round(FOV_CM[0] * PX_PER_CM)), mw))
-    h = max(1, min(int(round(FOV_CM[1] * PX_PER_CM)), mh))
+    zoom = max(0.05, (ZOOM_REF_CM + FLIP_Z * z_cm) / ZOOM_REF_CM)
+    w = max(1, min(int(round(FOV_CM[0] * zoom * PX_PER_CM)), mw))
+    h = max(1, min(int(round(FOV_CM[1] * zoom * PX_PER_CM)), mh))
     cx = ORIGIN_PX[0] + FLIP_X * x_cm * PX_PER_CM
     cy = ORIGIN_PX[1] + FLIP_Y * y_cm * PX_PER_CM
     x0 = max(0, min(int(round(cx - w / 2.0)), mw - w))
@@ -407,14 +436,25 @@ def compute_viewport(master, x_cm, y_cm):
     return master[y0:y0 + h, x0:x0 + w]
 
 
-def composite_overlay(gray, overlay, equalize):
-    '''Composite the anatomy overlay onto a (subtracted) grayscale frame.
+def white_bg_mask(gray):
+    '''Mask of bright "white background" pixels (0 where white background).'''
+    _, m = cv.threshold(gray, MASK_THRESHOLD, 255, cv.THRESH_BINARY_INV)
+    return cv.medianBlur(m, 5)
+
+
+def composite_overlay(gray, overlay, equalize, bg_mask=None):
+    '''Composite the anatomy overlay onto a grayscale camera frame.
 
     Mirrors the blend weights in fluoro_simulator (3).py: bright/white areas are
     30% video / 70% overlay; vasculature areas are 60% video / 40% overlay.
+
+    ``bg_mask`` supplies a precomputed white-background mask (see white_bg_mask).
+    Pass the frozen mask while the scene is steady: thresholding each live frame
+    makes pixels near MASK_THRESHOLD flip between the two blend weights with
+    sensor noise, which pulses. None = threshold ``gray`` (scene changing).
     '''
-    _, bg_mask = cv.threshold(gray, MASK_THRESHOLD, 255, cv.THRESH_BINARY_INV)
-    bg_mask = cv.medianBlur(bg_mask, 5)
+    if bg_mask is None:
+        bg_mask = white_bg_mask(gray)
 
     ov = overlay.astype(np.float32)
     fr = gray.astype(np.float32)
@@ -555,9 +595,9 @@ def render_controls(s, logo, live):
     y += 26 + 14
 
     cw = (W - 2 * m - gap) // 2
-    toggles = [("Subtraction", "subtract"), ("Overlay", "overlay"),
-               ("Equalize", "equalize"), ("HUD", "hud"),
-               ("Pedal mode", "pedal_mode"), ("Pedal press", "pedal_pressed")]
+    toggles = [("Overlay", "overlay"), ("Equalize", "equalize"),
+               ("HUD", "hud"), ("Pedal mode", "pedal_mode"),
+               ("Pedal press", "pedal_pressed")]
     for i, (label, key) in enumerate(toggles):
         col, row = i % 2, i // 2
         bx = m + col * (cw + gap)
@@ -567,13 +607,15 @@ def render_controls(s, logo, live):
         buttons.append((bx, by, cw, bt, "toggle", key))
     y += 3 * (bt + gap)
 
-    # Background-location readout + nudge buttons (X−/X+/Y−/Y+).
-    cap = "Background   X %.0f   Y %.0f cm" % (s["pos_x_cm"], s["pos_y_cm"])
+    # Background-location readout + nudge buttons (X−/X+/Y−/Y+/Z−/Z+).
+    cap = "Background   X %.0f   Y %.0f   Z %.0f cm" % (
+        s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"])
     (capw, caph), _ = cv.getTextSize(cap, font, 0.5, 1)
     cv.putText(img, cap, ((W - capw) // 2, y + caph + 2), font, 0.5, C_SUBTEXT, 1, cv.LINE_AA)
     y += cap_h + gap
-    pw = (W - 2 * m - 3 * gap) // 4
-    for i, (label, name) in enumerate([("X-", "xm"), ("X+", "xp"), ("Y-", "ym"), ("Y+", "yp")]):
+    pw = (W - 2 * m - 5 * gap) // 6
+    for i, (label, name) in enumerate([("X-", "xm"), ("X+", "xp"), ("Y-", "ym"),
+                                       ("Y+", "yp"), ("Z-", "zm"), ("Z+", "zp")]):
         bx = m + i * (pw + gap)
         draw_button(img, bx, y, pw, ba, label, None, False)
         buttons.append((bx, y, pw, ba, "pan", name))
@@ -601,10 +643,10 @@ def render_control_bar(s, width, live):
     cv.line(img, (0, 0), (width, 0), C_BTN_BD, 1, cv.LINE_AA)
     buttons = []
 
-    toggles = [("Subtraction", "subtract"), ("Overlay", "overlay"),
-               ("Equalize", "equalize"), ("HUD", "hud"),
-               ("Pedal mode", "pedal_mode"), ("Pedal press", "pedal_pressed")]
-    cw = (width - 2 * pad - 5 * gap) // 6
+    toggles = [("Overlay", "overlay"), ("Equalize", "equalize"),
+               ("HUD", "hud"), ("Pedal mode", "pedal_mode"),
+               ("Pedal press", "pedal_pressed")]
+    cw = (width - 2 * pad - 4 * gap) // 5
     y = pad
     for i, (label, key) in enumerate(toggles):
         bx = pad + i * (cw + gap)
@@ -620,15 +662,17 @@ def render_control_bar(s, width, live):
     draw_button(img, pad + 2 * (aw + gap), y, aw, bh, "Quit simulator", None, False, "quit")
     buttons.append((pad + 2 * (aw + gap), y, aw, bh, "action", "quit"))
 
-    # Row 3: background-location readout + nudge buttons (X−/X+/Y−/Y+).
+    # Row 3: background-location readout + nudge buttons (X−/X+/Y−/Y+/Z−/Z+).
     y += bh + gap
-    cap = "Bg  X %.0f  Y %.0f cm" % (s["pos_x_cm"], s["pos_y_cm"])
-    cap_w = 190
+    cap = "Bg  X %.0f  Y %.0f  Z %.0f cm" % (
+        s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"])
+    cap_w = 240
     (_, caph), _ = cv.getTextSize(cap, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1)
     cv.putText(img, cap, (pad, y + (bh + caph) // 2), cv.FONT_HERSHEY_SIMPLEX, 0.5, C_SUBTEXT, 1, cv.LINE_AA)
-    pw = (width - 2 * pad - cap_w - 3 * gap) // 4
+    pw = (width - 2 * pad - cap_w - 5 * gap) // 6
     x = pad + cap_w
-    for (label, name) in [("X-", "xm"), ("X+", "xp"), ("Y-", "ym"), ("Y+", "yp")]:
+    for (label, name) in [("X-", "xm"), ("X+", "xp"), ("Y-", "ym"),
+                          ("Y+", "yp"), ("Z-", "zm"), ("Z+", "zp")]:
         draw_button(img, x, y, pw, bh, label, None, False)
         buttons.append((x, y, pw, bh, "pan", name))
         x += pw + gap
@@ -649,6 +693,10 @@ def apply_button(kind, name):
                 state["pos_y_cm"] -= PAN_STEP_CM
             elif name == "yp":
                 state["pos_y_cm"] += PAN_STEP_CM
+            elif name == "zm":
+                state["pos_z_cm"] -= PAN_STEP_CM
+            elif name == "zp":
+                state["pos_z_cm"] += PAN_STEP_CM
         elif name == "fullscreen":
             state["fullscreen"] = True
         elif name == "windowed":
@@ -684,9 +732,9 @@ def on_mouse_fluoro(event, x, y, flags, param):
 def run_simulation(cam_index, show_window):
     '''Main capture/process/display loop — runs on the main thread until quit.
 
-    Each iteration: read a frame, apply background subtraction (optional) and the
-    overlay composite (optional), draw the HUD, then both show it in the FLUORO
-    window and JPEG-encode it into ``_latest_jpeg`` for the web preview. The loop
+    Each iteration: read a frame, apply the overlay composite (optional), draw
+    the HUD, then both show it in the FLUORO window and JPEG-encode it into
+    ``_latest_jpeg`` for the web preview. The loop
     reads the shared toggle state once per frame via get_state_snapshot(), so the
     web buttons and the keyboard shortcuts drive exactly the same behaviour.
 
@@ -710,6 +758,8 @@ def run_simulation(cam_index, show_window):
         if master is None:
             raise FileNotFoundError("Cannot load image: %s" % OVERLAY_IMAGE)
     master = cv.cvtColor(master, cv.COLOR_BGR2GRAY)
+    if MASTER_BRIGHTNESS != 1.0:
+        master = cv.convertScaleAbs(master, alpha=MASTER_BRIGHTNESS, beta=0)
 
     # On-screen control panel: the logo image and a helper to (re)open the
     # separate CONTROLS window used in windowed mode.
@@ -729,7 +779,10 @@ def run_simulation(cam_index, show_window):
         if logo is None:
             print("Warning: logo not found at", LOGO_IMAGE)
 
-    background = None          # float32 running-average background model
+    prev_raw = None            # previous raw gray frame (freeze stability check)
+    stable_count = 0           # consecutive largely-unchanged frames so far
+    frozen_bg = None           # frozen reference frame (None = watching for stability)
+    frozen_mask = None         # frozen white-background mask for the composite
     applied_fullscreen = None  # last fullscreen state pushed to the window (avoids redundant calls)
     res = None                 # last processed frame (shown + streamed)
     live = False               # True once a frame has been read (drives the status dot)
@@ -780,35 +833,44 @@ def run_simulation(cam_index, show_window):
             frame_raw = frame_gray.copy()  # untouched copy shown when the overlay is off
             # Pan the anatomy: crop the viewport at the current camera position and
             # scale it to the frame. This is the background the vasculature sits on.
-            crop = compute_viewport(master, s["pos_x_cm"], s["pos_y_cm"])
+            crop = compute_viewport(master, s["pos_x_cm"], s["pos_y_cm"],
+                                    s["pos_z_cm"])
             overlay_frame = cv.resize(crop, (frame_gray.shape[1], frame_gray.shape[0]))
 
-            # Seed / read the running-background model used for subtraction.
-            if background is None:
-                background = frame_gray.astype("float")
-            bg_uint8 = cv.convertScaleAbs(background)
-
-            if s["subtract"]:
-                # Difference vs. background, stretch to full range, then invert so
-                # static background reads white and moving structures read dark.
-                frame_gray = cv.absdiff(frame_gray, bg_uint8)
-                cv.normalize(frame_gray, frame_gray, 0, 255, cv.NORM_MINMAX)
-                frame_gray = cv.bitwise_not(frame_gray)
-
-            # Slowly adapt the background model to gradual lighting changes.
-            cv.accumulateWeighted(frame_gray, background, ALPHA)
+            # Freeze the white-background removal once the scene has been steady
+            # for STABLE_FRAMES frames; thaw it when the frame moves significantly
+            # away from the frozen reference (pan, lighting change, ...).
+            step = (cv.norm(frame_gray, prev_raw, cv.NORM_L1) / frame_gray.size
+                    if prev_raw is not None else 0.0)
+            if frozen_bg is None:
+                if prev_raw is not None:
+                    stable_count = stable_count + 1 if step < STABLE_DIFF else 0
+                if stable_count >= STABLE_FRAMES:
+                    # Steady scene: freeze the composite's white-background mask
+                    # on the current frame so the identical removal is applied
+                    # every frame (thresholding each live frame flips pixels near
+                    # MASK_THRESHOLD with sensor noise; see composite_overlay).
+                    frozen_bg = frame_gray.copy()
+                    frozen_mask = white_bg_mask(frame_gray)
+            elif cv.norm(frame_gray, frozen_bg, cv.NORM_L1) / frame_gray.size > CHANGE_DIFF:
+                frozen_bg = None
+                frozen_mask = None
+                stable_count = 0
+            prev_raw = frame_gray
 
             # Overlay off => show the full raw video (bright/white areas intact).
             if s["overlay"]:
-                res = composite_overlay(frame_gray, overlay_frame, s["equalize"])
+                res = composite_overlay(frame_gray, overlay_frame, s["equalize"],
+                                        frozen_mask)
             else:
                 res = frame_raw
 
             if s["hud"]:
-                draw_str(res, (20, 20), "Subtraction:%s  Overlay:%s  Equalize:%s" %
-                         (s["subtract"], s["overlay"], s["equalize"]))
+                draw_str(res, (20, 20), "Overlay:%s  Equalize:%s" %
+                         (s["overlay"], s["equalize"]))
                 draw_str(res, (20, 40), "Pedal mode:%s  HUD:%s" % (s["pedal_mode"], s["hud"]))
-                draw_str(res, (20, 60), "Cam: x=%.1f  y=%.1f cm" % (s["pos_x_cm"], s["pos_y_cm"]))
+                draw_str(res, (20, 60), "Cam: x=%.1f  y=%.1f  z=%.1f cm" %
+                         (s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"]))
             if pedal_down:
                 draw_str(res, (20, 80), "PEDAL ACTIVE")
 
@@ -844,9 +906,7 @@ def run_simulation(cam_index, show_window):
 def _handle_key(key):
     '''Map FLUORO-window keypresses onto the shared state (keeps parity with the CLI).'''
     with state_lock:
-        if key == ord('1'):
-            state["subtract"] = not state["subtract"]
-        elif key == ord('2') or key == ord('5'):
+        if key == ord('2') or key == ord('5'):
             state["overlay"] = not state["overlay"]
         elif key == ord('3'):
             state["fullscreen"] = True
@@ -866,6 +926,10 @@ def _handle_key(key):
             state["pos_y_cm"] -= PAN_STEP_CM
         elif key == ord('s'):            # Y+
             state["pos_y_cm"] += PAN_STEP_CM
+        elif key == ord('q'):            # Z− (lower the camera = zoom in)
+            state["pos_z_cm"] -= PAN_STEP_CM
+        elif key == ord('e'):            # Z+ (raise the camera = zoom out)
+            state["pos_z_cm"] += PAN_STEP_CM
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
