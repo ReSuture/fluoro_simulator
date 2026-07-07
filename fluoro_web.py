@@ -13,7 +13,10 @@ while the monitor shows the fluoro view.
 The web panel exposes the on/off toggles only (no numeric tuning sliders):
 
     Overlay, Equalize, Pedal mode, Pedal press, HUD,
-    plus Fullscreen / Windowed / Quit actions and a live preview.
+    plus Fullscreen / Windowed / Start / Stop actions and a live preview.
+    Stop puts the simulation into standby (camera released, FLUORO window
+    closed) while this web server keeps running, so Start can bring it back
+    remotely without touching the Pi.
 
 Architecture
 ------------
@@ -129,7 +132,8 @@ state = {
     "pedal_pressed": False, # web stand-in for holding the foot pedal / 'b' key
     "hud": True,            # (7) on-screen text HUD
     "fullscreen": True,     # (3/4) FLUORO window fullscreen vs. windowed
-    "quit": False,          # set by the web Quit button to stop the loop
+    "running": True,        # simulation active; False = standby (web server stays up)
+    "quit": False,          # exit the whole process (ESC key); web Stop uses "running"
     "pos_x_cm": 0.0,        # camera X position (cm from origin) — drives the viewport
     "pos_y_cm": 0.0,        # camera Y position (cm from origin) — drives the viewport
     "pos_z_cm": 0.0,        # camera Z position (cm from nominal height) — drives the zoom
@@ -191,7 +195,7 @@ PAGE = """
   .stage:fullscreen .panel .grid, .stage:-webkit-full-screen .panel .grid {
       grid-template-columns: repeat(5, 1fr); margin-top: 0; }
   .stage:fullscreen .panel .actions, .stage:-webkit-full-screen .panel .actions {
-      grid-template-columns: repeat(3, 1fr); margin-top: 8px; }
+      grid-template-columns: repeat(4, 1fr); margin-top: 8px; }
   .stage:fullscreen .panel button, .stage:-webkit-full-screen .panel button {
       padding: 10px 8px; font-size: 14px; }
   .stage:fullscreen .panel button.quit, .stage:-webkit-full-screen .panel button.quit {
@@ -204,7 +208,8 @@ PAGE = """
   button.on { background: #103b2a; border-color: #12b76a; color: #7af0b6; }
   button.toggle .st { display: block; font-size: 12px; font-weight: 500; opacity: .7; margin-top: 2px; }
   .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
-  button.quit { grid-column: 1 / -1; background: #2a1416; border-color: #5b2327; color: #ff9a9a; }
+  button.quit { background: #2a1416; border-color: #5b2327; color: #ff9a9a; }
+  button.quit.on { background: #3b1013; border-color: #f04438; }
   .hint { color: #7d8a99; font-size: 12px; margin: 14px 2px 0; }
   .posctl { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
   .posctl label { display: flex; align-items: center; gap: 6px; color: #7d8a99; font-size: 14px; }
@@ -237,7 +242,8 @@ PAGE = """
       <div class="actions">
         <button class="fsbtn" data-action="fullscreen" data-fs="1">Fullscreen</button>
         <button class="fsbtn" data-action="windowed" data-fs="0">Windowed</button>
-        <button class="quit" data-action="quit">Quit simulator</button>
+        <button class="runbtn" data-action="start" data-run="1">Start simulator</button>
+        <button class="quit runbtn" data-action="stop" data-run="0">Stop simulator</button>
       </div>
     </div>
   </div>
@@ -261,6 +267,9 @@ function applyState(s) {
   });
   document.querySelectorAll('.fsbtn').forEach(function (b) {
     b.classList.toggle('on', (b.dataset.fs === '1') === !!s.fullscreen);
+  });
+  document.querySelectorAll('.runbtn').forEach(function (b) {
+    b.classList.toggle('on', (b.dataset.run === '1') === !!s.running);
   });
   var pos = document.getElementById('pos');
   if (pos) pos.textContent = 'Camera: x=' + (+s.pos_x_cm || 0).toFixed(1) +
@@ -292,7 +301,7 @@ function browserFullscreen(on) {
 }
 document.querySelectorAll('[data-action]').forEach(function (b) {
   b.addEventListener('click', function () {
-    if (b.dataset.action === 'quit' && !confirm('Stop the simulator?')) return;
+    if (b.dataset.action === 'stop' && !confirm('Stop the simulator?')) return;
     // Fullscreen/Windowed also control this browser's preview, not just the
     // popup window on the computer running the simulator.
     if (b.dataset.action === 'fullscreen') browserFullscreen(true);
@@ -364,14 +373,21 @@ def api_toggle(name):
 
 @app.route("/api/action/<action>", methods=["POST"])
 def api_action(action):
-    '''Apply a one-shot action (fullscreen / windowed / quit) and return the state.'''
+    '''Apply a one-shot action (fullscreen / windowed / start / stop) and return the state.
+
+    "stop" puts the simulation into standby but keeps this server running so a
+    later "start" can resume it remotely. ("quit" is kept as an alias of "stop"
+    for old clients — the web panel no longer exits the process.)
+    '''
     with state_lock:
         if action == "fullscreen":
             state["fullscreen"] = True
         elif action == "windowed":
             state["fullscreen"] = False
-        elif action == "quit":
-            state["quit"] = True
+        elif action == "start":
+            state["running"] = True
+        elif action in ("stop", "quit"):
+            state["running"] = False
         snap = dict(state)
     return jsonify(snap)
 
@@ -637,8 +653,8 @@ def render_controls(s, logo, live):
     buttons.append((m + cw + gap, y, cw, ba, "action", "windowed"))
     y += ba + gap
 
-    draw_button(img, m, y, W - 2 * m, ba, "Quit simulator", None, False, "quit")
-    buttons.append((m, y, W - 2 * m, ba, "action", "quit"))
+    draw_button(img, m, y, W - 2 * m, ba, "Stop simulator", None, False, "quit")
+    buttons.append((m, y, W - 2 * m, ba, "action", "stop"))
     return img, buttons
 
 
@@ -669,8 +685,8 @@ def render_control_bar(s, width, live):
     buttons.append((pad, y, aw, bh, "action", "fullscreen"))
     draw_button(img, pad + aw + gap, y, aw, bh, "Windowed", None, not s["fullscreen"])
     buttons.append((pad + aw + gap, y, aw, bh, "action", "windowed"))
-    draw_button(img, pad + 2 * (aw + gap), y, aw, bh, "Quit simulator", None, False, "quit")
-    buttons.append((pad + 2 * (aw + gap), y, aw, bh, "action", "quit"))
+    draw_button(img, pad + 2 * (aw + gap), y, aw, bh, "Stop simulator", None, False, "quit")
+    buttons.append((pad + 2 * (aw + gap), y, aw, bh, "action", "stop"))
 
     # Row 3: background-location readout + nudge buttons (X−/X+/Y−/Y+/Z−/Z+).
     y += bh + gap
@@ -711,8 +727,10 @@ def apply_button(kind, name):
             state["fullscreen"] = True
         elif name == "windowed":
             state["fullscreen"] = False
-        elif name == "quit":
-            state["quit"] = True
+        elif name in ("stop", "quit"):
+            # Standby, not process exit: the web server stays up so the panel's
+            # Start button (or the desktop shortcut) can bring the sim back.
+            state["running"] = False
 
 
 def _hit(buttons, x, y):
@@ -753,9 +771,18 @@ def run_simulation(cam_index, show_window):
     '''
     global _latest_jpeg
 
-    cap = cv.VideoCapture(cam_index, cv.CAP_V4L2)
-    if not cap.isOpened():
-        print("Warning: unable to open video source:", cam_index)
+    def open_camera():
+        c = cv.VideoCapture(cam_index, cv.CAP_V4L2)
+        if not c.isOpened():
+            print("Warning: unable to open video source:", cam_index)
+        return c
+
+    # Placeholder frame published to the preview while the sim is in standby.
+    stopped_img = np.full((480, 640), 16, np.uint8)
+    draw_str(stopped_img, (200, 230), "SIMULATION STOPPED")
+    draw_str(stopped_img, (150, 260), "press Start simulator on the control panel")
+    ok, _stopped_jpg = cv.imencode(".jpg", stopped_img, [cv.IMWRITE_JPEG_QUALITY, 80])
+    stopped_buf = _stopped_jpg.tobytes() if ok else None
 
     # Full-resolution "master" anatomy background, kept untouched at full res so we
     # can crop a fresh viewport out of it every frame (see compute_viewport). Falls
@@ -780,15 +807,19 @@ def run_simulation(cam_index, show_window):
         cv.setMouseCallback("CONTROLS", on_mouse_controls)
         cv.moveWindow("CONTROLS", 20, 20)
 
-    if show_window:
+    def show_fluoro_window():
         cv.namedWindow("FLUORO", cv.WND_PROP_FULLSCREEN)
         cv.setWindowProperty("FLUORO", cv.WND_PROP_ASPECT_RATIO, cv.WINDOW_KEEPRATIO)
         # Clicks on the FLUORO window only matter in fullscreen, where the control
         # bar is stacked below the video (see overlay_buttons).
         cv.setMouseCallback("FLUORO", on_mouse_fluoro)
-        if logo is None:
-            print("Warning: logo not found at", LOGO_IMAGE)
 
+    if show_window and logo is None:
+        print("Warning: logo not found at", LOGO_IMAGE)
+
+    # The camera and the windows are opened lazily on the first running
+    # iteration (and reopened after a standby stop) — see the loop below.
+    cap = None
     prev_raw = None            # previous raw gray frame (freeze stability check)
     stable_count = 0           # consecutive largely-unchanged frames so far
     frozen_bg = None           # frozen reference frame (None = watching for stability)
@@ -801,6 +832,34 @@ def run_simulation(cam_index, show_window):
         s = get_state_snapshot()
         if s["quit"]:
             break
+
+        # Standby: release the camera and close the windows, publish the
+        # "stopped" placeholder to the preview, and idle until the web panel's
+        # Start button (POST /api/action/start) sets running again. The Flask
+        # server stays up throughout, so start/stop work fully remotely.
+        if not s["running"]:
+            if cap is not None:
+                cap.release()
+                cap = None
+                if show_window:
+                    cv.destroyAllWindows()
+                    cv.waitKey(1)  # let the GUI process the window teardown
+                applied_fullscreen = None
+                prev_raw, stable_count = None, 0
+                frozen_bg = frozen_mask = None
+                res, live = None, False
+            if stopped_buf is not None:
+                with _latest_lock:
+                    _latest_jpeg = stopped_buf
+            time.sleep(0.2)
+            continue
+
+        # (Re)open the camera and windows on the first running iteration and
+        # when resuming from standby.
+        if cap is None:
+            cap = open_camera()
+            if show_window:
+                show_fluoro_window()
 
         # Keep the OpenCV window's fullscreen state in sync with the toggle, and
         # move the on-screen controls between the separate CONTROLS window
@@ -907,7 +966,8 @@ def run_simulation(cam_index, show_window):
                 with _latest_lock:
                     _latest_jpeg = jpg.tobytes()
 
-    cap.release()
+    if cap is not None:
+        cap.release()
     cv.destroyAllWindows()
     # Stop the process so the Flask daemon thread exits too.
     os._exit(0)
