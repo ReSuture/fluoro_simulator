@@ -124,7 +124,7 @@ PAN_STEP_CM = 5.0
 state_lock = threading.Lock()
 state = {
     "overlay": True,        # (2/5) anatomy overlay; off => full raw video
-    "equalize": True,       # (6) CLAHE histogram equalisation
+    "equalize": False,      # (6) CLAHE histogram equalisation
     "pedal_mode": False,    # (space) only capture while the pedal is pressed
     "pedal_pressed": False, # web stand-in for holding the foot pedal / 'b' key
     "hud": True,            # (7) on-screen text HUD
@@ -318,6 +318,16 @@ document.getElementById('gopos').addEventListener('click', sendPos);
 var feed = document.getElementById('feed');
 feed.addEventListener('load', function () { document.getElementById('dot').classList.add('live'); });
 feed.addEventListener('error', function () { document.getElementById('dot').classList.remove('live'); });
+// Tablets suspend a backgrounded tab's timers and its MJPEG connection, so the
+// toggle chips go stale (showing e.g. ON for a state that has since changed)
+// and the preview freezes. Re-sync and restart the stream the moment the page
+// is visible again instead of waiting for the next poll.
+function resume() {
+  refresh();
+  feed.src = '/video_feed?t=' + Date.now();
+}
+document.addEventListener('visibilitychange', function () { if (!document.hidden) resume(); });
+window.addEventListener('pageshow', resume);
 refresh();
 setInterval(refresh, 1500);
 </script>
