@@ -81,17 +81,17 @@ ALPHA = 0.05
 # controller) is not this module's concern — it's pushed in via POST /api/position
 # and lives in state["pos_x_cm"] / state["pos_y_cm"].
 #
-# ALL FOUR VALUES BELOW ARE PLACEHOLDERS — recalibrate when the real (high-res
-# adult) master image is dropped in. master_body.jpg is a low-res stand-in.
-MASTER_IMAGE = os.path.join(BASE_DIR, "master_body.jpg")
+# Calibrated against fulltorsofluoroimage.png (472×868), a plain no-contrast
+# full-torso radiograph. Retune these four values if the master image changes.
+MASTER_IMAGE = os.path.join(BASE_DIR, "fulltorsofluoroimage.png")
 # Master-image pixels per real centimetre of anatomy.
-PX_PER_CM = 6.0
+PX_PER_CM = 5.0
 # The master pixel that camera coordinate (0, 0) maps to (viewport centre at origin).
-ORIGIN_PX = (285, 463)          # centre of the 570×926 placeholder
+ORIGIN_PX = (236, 434)          # centre of the 472×868 master
 # Physical area the detector sees at once, (width_cm, height_cm). Keep 4:3 to match
 # the camera frame. This is the ZOOM knob: larger = zoomed out (more anatomy shown),
-# smaller = zoomed in. With the placeholder master it's tuned so one frame shows most
-# of the body width (like skel.jpg filled the frame) while leaving room to pan.
+# smaller = zoomed in. Tuned so one frame shows most of the body width (like
+# skel.jpg filled the frame) while leaving room to pan.
 FOV_CM = (80.0, 60.0)
 # Flip a sign if increasing X (or Y) should pan the viewport the opposite way.
 FLIP_X = 1.0
