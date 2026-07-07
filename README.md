@@ -108,6 +108,32 @@ The browser will show a one-time "not private" warning for the self-signed cert 
 
 > **Fullscreen note:** the panel forces OpenCV's X11/XWayland Qt backend (`QT_QPA_PLATFORM=xcb`) so the Fullscreen/Windowed controls can actually toggle the `FLUORO` window — the native Wayland backend ignores those calls.
 
+## Running as a service (auto-start, crash recovery)
+
+`fluorosim.service` is a systemd **user** unit that runs `launch_fluoro.sh` under
+supervision: the simulator starts automatically at boot (once the desktop session
+is up) and restarts itself within a few seconds if it crashes. A deliberate quit
+(the web panel's **Quit** button or `ESC` on the `FLUORO` window) stays stopped —
+only crashes trigger a restart.
+
+Install on a new machine:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp fluorosim.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now fluorosim.service
+```
+
+Manage it with `systemctl --user {start,stop,restart,status} fluorosim`. The
+app's output goes to `launch.log` in this directory (via `launch_fluoro.sh`),
+not the journal. Auto-start at boot assumes the machine logs the user into the
+desktop automatically (standard Raspberry Pi OS autologin).
+
+The `FluoroSim.desktop` shortcut runs `systemctl --user restart fluorosim.service`,
+so the desktop button (re)launches the supervised service in any state — stopped,
+running, or wedged.
+
 ## Notes
 
 - Tuning knobs live near the top of the processing code: the background mask cutoff (`MASK_THRESHOLD` / `mask_threshold`), the running-background accumulation weight (`ALPHA` / `alpha`), and the overlay blend weights (bright areas 30% video / 70% overlay; vasculature 60% video / 40% overlay).
