@@ -11,3 +11,11 @@ launch.log
 
 # Runtime log from the headless server launch
 server.log
+
+# Portal runtime data — customer emails and device ids live here, never commit
+portal/*.db
+portal/*.db-wal
+portal/*.db-shm
+
+# Pytest cache
+.pytest_cache/

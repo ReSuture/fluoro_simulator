@@ -1,0 +1,60 @@
+/* Matches the FluoroSim Pi panel's dark theme (fluoro_web.py PAGE styles). */
+:root { color-scheme: dark; }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+       background: #0b0f14; color: #e7edf3; min-height: 100vh;
+       display: flex; flex-direction: column; }
+header { padding: 18px 16px; display: flex; flex-direction: column; align-items: center;
+         gap: 10px; border-bottom: 1px solid #1d2733; background: #0b0f14; }
+header .titlerow { display: flex; align-items: center; gap: 10px; }
+header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+header img.logo { width: min(420px, 82%); height: auto; display: block; }
+.whoami { color: #7d8a99; font-size: 13px; }
+.whoami a { color: #7af0b6; }
+main { padding: 16px; max-width: 960px; margin: 0 auto; width: 100%; flex: 1; }
+footer { padding: 14px 16px; text-align: center; }
+.hint { color: #7d8a99; font-size: 12px; }
+a { color: #9ecbff; }
+
+.dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+       background: #f04438; vertical-align: middle; }
+.dot.live { background: #12b76a; box-shadow: 0 0 8px #12b76a; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+         gap: 14px; margin-top: 8px; }
+.card { background: #131a22; border: 1px solid #26323f; border-radius: 12px;
+        padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+.card.empty { text-align: center; max-width: 520px; margin: 40px auto; }
+.cardrow { display: flex; align-items: center; gap: 10px; }
+.devname { font-weight: 600; font-size: 16px; }
+.devstatus { margin-left: auto; color: #7d8a99; font-size: 13px; }
+
+.openbtn { display: block; text-align: center; text-decoration: none; font-weight: 600;
+           font-size: 16px; padding: 14px 12px; border-radius: 12px;
+           border: 1px solid #12b76a; background: #103b2a; color: #7af0b6;
+           transition: background .12s, border-color .12s; }
+.openbtn:active { transform: translateY(1px); }
+.openbtn.disabled { border-color: #26323f; background: #131a22; color: #7d8a99;
+                    pointer-events: none; }
+
+/* Admin table */
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #1d2733;
+         vertical-align: top; }
+th { color: #7d8a99; font-weight: 500; font-size: 12px; text-transform: uppercase; }
+form.inline { display: inline-block; margin: 2px 4px 2px 0; }
+input[type=email] { font-size: 14px; padding: 8px 10px; border-radius: 8px;
+                    border: 1px solid #26323f; background: #0b0f14; color: #e7edf3; }
+button { font-size: 14px; padding: 8px 12px; border-radius: 8px; border: 1px solid #26323f;
+         background: #131a22; color: #e7edf3; cursor: pointer; font-weight: 600; }
+button:active { transform: translateY(1px); }
+button.danger { background: #2a1416; border-color: #5b2327; color: #ff9a9a; }
+.chip { display: inline-flex; align-items: center; gap: 4px; background: #0b0f14;
+        border: 1px solid #26323f; border-radius: 999px; padding: 4px 6px 4px 10px;
+        font-size: 13px; }
+button.chipx { border: 0; background: none; color: #7d8a99; padding: 0 4px;
+               font-size: 14px; line-height: 1; }
+button.chipx:hover { color: #ff9a9a; }
+code { background: #131a22; border: 1px solid #26323f; border-radius: 6px;
+       padding: 1px 6px; }

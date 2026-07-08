@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% set is_admin = True %}
+{% block title %}Admin — ReSuture Portal{% endblock %}
+{% block heading %}Device Administration{% endblock %}
+{% block content %}
+
+<p class="hint"><a href="{{ url_for('home') }}">&larr; back to my devices</a></p>
+
+{% if devices %}
+<div class="tablewrap">
+<table>
+  <thead>
+    <tr><th>Status</th><th>Device</th><th>Hostname</th><th>Assigned to</th>
+        <th>Provisioned</th><th>Actions</th></tr>
+  </thead>
+  <tbody>
+  {% for d in devices %}
+    <tr>
+      <td><span class="dot {{ 'live' if d.online else '' }}" title="{{ d.status }}"></span>
+          {{ d.status }}</td>
+      <td><strong>{{ d.device_id }}</strong>
+          {% if d.notes %}<div class="hint">{{ d.notes }}</div>{% endif %}</td>
+      <td><a href="https://{{ d.hostname }}/">{{ d.hostname }}</a></td>
+      <td>
+        {% for e in d.emails %}
+          <form class="inline" method="post"
+                action="{{ url_for('unassign', device_id=d.device_id) }}">
+            <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+            <input type="hidden" name="email" value="{{ e }}">
+            <span class="chip">{{ e }}
+              <button class="chipx" title="Unassign {{ e }}"
+                      onclick="return confirm('Remove {{ e }} from {{ d.device_id }}?')">&times;</button>
+            </span>
+          </form>
+        {% else %}
+          <span class="hint">unassigned</span>
+        {% endfor %}
+        <form class="inline" method="post"
+              action="{{ url_for('assign', device_id=d.device_id) }}">
+          <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+          <input type="email" name="email" placeholder="customer@email.com" required>
+          <button type="submit">Assign</button>
+        </form>
+      </td>
+      <td class="hint">{{ d.created_at }}</td>
+      <td>
+        <form class="inline" method="post"
+              action="{{ url_for('delete_device', device_id=d.device_id) }}">
+          <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+          <button class="danger"
+                  onclick="return confirm('Decommission {{ d.device_id }}? This deletes its tunnel, DNS record and Access app.')">
+            Decommission
+          </button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<div class="card empty">
+  <p>No devices registered yet.</p>
+  <p class="hint">Run <code>pi_setup/provision_pi.py</code> on a bench Pi to
+    register the first device — it will appear here as unassigned.</p>
+</div>
+{% endif %}
+
+{% endblock %}

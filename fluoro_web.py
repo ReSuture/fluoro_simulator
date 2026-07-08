@@ -38,9 +38,14 @@ served over HTTPS (so browsers that force secure connections can reach it). Pass
         -addext "subjectAltName=IP:<your-lan-ip>,DNS:localhost,IP:127.0.0.1"
 
 Usage:
-    python fluoro_web.py [<video device number>] [--port 5000] [--no-window] [--http]
+    python fluoro_web.py [<video device number>] [--port 5000] [--host 0.0.0.0]
+                         [--no-window] [--http]
 
 Then open  https://<this-machine-ip>:<port>/  in a browser (http:// without a cert).
+
+``--host 127.0.0.1`` restricts the panel to local connections only — used on
+Pis exposed through a Cloudflare Tunnel, where the tunnel daemon on the same
+machine is the only client allowed to reach the panel directly.
 '''
 
 from __future__ import print_function
@@ -1008,6 +1013,7 @@ if __name__ == "__main__":
 
     args = sys.argv[1:]
     port = 5000
+    host = "0.0.0.0"
     show_window = True
     cam_index = 0
     force_http = False
@@ -1017,6 +1023,8 @@ if __name__ == "__main__":
         a = args[i]
         if a == "--port":
             port = int(args[i + 1]); i += 2; continue
+        if a == "--host":          # bind address; 127.0.0.1 = local/tunnel only
+            host = args[i + 1]; i += 2; continue
         if a == "--no-window":
             show_window = False; i += 1; continue
         if a == "--http":          # force plain HTTP even if a cert is present
@@ -1034,7 +1042,7 @@ if __name__ == "__main__":
 
     # Flask in a daemon thread; the simulation owns the main thread (OpenCV GUI rule).
     flask_thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=port, threaded=True,
+        target=lambda: app.run(host=host, port=port, threaded=True,
                                debug=False, use_reloader=False,
                                ssl_context=ssl_context),
         daemon=True)

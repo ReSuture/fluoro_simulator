@@ -3,10 +3,10 @@
 # Launch FluoroSim: the on-screen FLUORO simulation window AND the web control
 # panel server from one process (fluoro_web.py, default window mode).
 #
-# The control panel is NOT opened on the Raspberry Pi itself — connect to it
-# from a phone/tablet/browser on the same network at:
-#
-#     https://<this-pi-ip>:5000/
+# The panel binds to 127.0.0.1 only: on a provisioned Pi the sole way in is the
+# Cloudflare Tunnel (cloudflared on this machine -> localhost:5000), with
+# Cloudflare Access enforcing the customer sign-in at the edge. Customers reach
+# it via their portal link (https://sim-<device-id>.<device-domain>/).
 #
 # Wired to the desktop shortcut ~/Desktop/FluoroSim.desktop.
 
@@ -28,4 +28,7 @@ export QT_QPA_PLATFORM=xcb
 export DISPLAY="${DISPLAY:-:0}"
 
 # Serves the panel and shows the FLUORO window (no --no-window).
-exec python3 fluoro_web.py
+# --host 127.0.0.1: only local cloudflared may connect (never expose :5000 on
+# the LAN — the app has no auth of its own; Cloudflare Access is the gate).
+# --http: cloudflared originates over plain HTTP; TLS terminates at the edge.
+exec python3 fluoro_web.py --host 127.0.0.1 --http

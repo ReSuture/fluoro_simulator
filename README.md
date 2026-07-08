@@ -110,17 +110,17 @@ The browser will show a one-time "not private" warning for the self-signed cert 
 
 ## Running as a service (auto-start, crash recovery)
 
-`fluorosim.service` is a systemd **user** unit that runs `launch_fluoro.sh` under
-supervision: the simulator starts automatically at boot (once the desktop session
-is up) and restarts itself within a few seconds if it crashes. A deliberate quit
-(the web panel's **Quit** button or `ESC` on the `FLUORO` window) stays stopped —
+`pi_setup/fluorosim.service` is a systemd **user** unit that runs `launch_fluoro.sh`
+under supervision: the simulator starts automatically at boot (once the desktop
+session is up) and restarts itself within a few seconds if it crashes. A deliberate
+quit (the web panel's **Quit** button or `ESC` on the `FLUORO` window) stays stopped —
 only crashes trigger a restart.
 
 Install on a new machine:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp fluorosim.service ~/.config/systemd/user/
+cp pi_setup/fluorosim.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now fluorosim.service
 ```
@@ -133,6 +133,24 @@ desktop automatically (standard Raspberry Pi OS autologin).
 The `FluoroSim.desktop` shortcut runs `systemctl --user restart fluorosim.service`,
 so the desktop button (re)launches the supervised service in any state — stopped,
 running, or wedged.
+
+## Remote access: customer portal + Cloudflare Tunnel
+
+Customer devices are reachable from anywhere through a per-device Cloudflare
+Tunnel and a sign-in portal:
+
+- **`portal/`** — the multi-tenant portal (Flask). Customers sign in through
+  Cloudflare Access and open their own Pi's panel at
+  `https://sim-<device-id>.<device-domain>/`. Admins assign devices to
+  customer emails at `/admin`. Deployment runbook: `portal/README.md`.
+- **`pi_setup/`** — bench provisioning for new Pis (`provision_pi.py`) and the
+  canonical `fluorosim.service`. Manufacturing checklist: `pi_setup/README.md`.
+
+On tunneled customer devices, `launch_fluoro.sh` starts the panel with
+`--host 127.0.0.1 --http`: port 5000 is unreachable from the LAN, the local
+`cloudflared` is the only way in, and Cloudflare Access enforces the sign-in
+at the edge (the panel itself has no auth). For a LAN-only demo machine, run
+`python3 fluoro_web.py` directly — it still binds `0.0.0.0:5000` by default.
 
 ## Notes
 

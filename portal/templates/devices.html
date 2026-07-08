@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}My Simulators — ReSuture{% endblock %}
+{% block heading %}My Simulators{% endblock %}
+{% block content %}
+
+{% if devices %}
+<div class="cards" id="cards">
+  {% for d in devices %}
+  <div class="card" data-device="{{ d.device_id }}">
+    <div class="cardrow">
+      <span class="dot {{ 'live' if d.online else '' }}" title="{{ d.status }}"></span>
+      <span class="devname">Simulator {{ d.device_id }}</span>
+      <span class="devstatus">{{ 'online' if d.online else 'offline' }}</span>
+    </div>
+    <a class="openbtn {{ '' if d.online else 'disabled' }}" href="{{ d.url }}">
+      Open my simulator
+    </a>
+    <div class="hint">If the simulator shows offline, check that the device is
+      powered on and connected to the internet.</div>
+  </div>
+  {% endfor %}
+</div>
+
+<script>
+  // Refresh the online badges every 30 s without reloading the page.
+  async function refreshStatus() {
+    try {
+      const r = await fetch('/api/my/devices');
+      if (!r.ok) return;
+      const data = await r.json();
+      for (const d of data.devices) {
+        const card = document.querySelector(`.card[data-device="${d.device_id}"]`);
+        if (!card) continue;
+        card.querySelector('.dot').classList.toggle('live', d.online);
+        card.querySelector('.devstatus').textContent = d.online ? 'online' : 'offline';
+        card.querySelector('.openbtn').classList.toggle('disabled', !d.online);
+      }
+    } catch (e) { /* transient network error — keep last state */ }
+  }
+  setInterval(refreshStatus, 30000);
+</script>
+
+{% else %}
+<div class="card empty">
+  <p>No simulator is linked to <strong>{{ email }}</strong> yet.</p>
+  <p class="hint">If you recently received your ReSuture simulator, contact
+    support and we'll connect it to your account.</p>
+</div>
+{% endif %}
+
+{% endblock %}
