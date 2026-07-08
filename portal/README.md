@@ -30,7 +30,7 @@ Customer browser
 | `CF_API_TOKEN` | API token, scopes: Zone/DNS/Edit (device zone only), Account/Access: Apps and Policies/Edit, Account/Cloudflare Tunnel/Edit |
 | `CF_ACCOUNT_ID` | Cloudflare account id (dashboard → Overview, right column) |
 | `CF_ZONE_ID` | Zone id of the **device domain** |
-| `ACCESS_TEAM_DOMAIN` | `<team>.cloudflareaccess.com` (Zero Trust → Settings → Custom Pages) |
+| `ACCESS_TEAM_DOMAIN` | `<team>.cloudflareaccess.com` (Zero Trust → Reusable components → Custom pages → Team domain) |
 | `ACCESS_PORTAL_AUD` | AUD tag of the portal's own Access application |
 | `ADMIN_EMAILS` | `ben@resuture.com` (comma-separated; admins see /admin and stay on every device policy) |
 | `PROVISION_TOKEN` | `python3 -c "import secrets; print(secrets.token_urlsafe(32))"` |
@@ -46,8 +46,10 @@ Customer browser
    a brand-new domain, so nothing can break).
 2. **Zero Trust team**: dashboard → Zero Trust → choose a team name. Note the
    team domain `<team>.cloudflareaccess.com`.
-3. **Login methods**: Zero Trust → Settings → Authentication → enable
-   **One-time PIN** (works for every customer email; optionally add Google).
+3. **Login methods**: Zero Trust → Integrations → Identity providers →
+   Add new identity provider → **One-time PIN** (works for every customer
+   email — no Cloudflare or Google account needed; optionally add Google from
+   the same screen).
 4. **API token**: My Profile → API Tokens → Create Token with the three scopes
    in the table above, zone-scoped to the device domain.
 
@@ -72,14 +74,15 @@ created by the portal itself):
    install `cloudflared` on the AWS box with the shown token.
 2. Add a public hostname: `portal.<device-domain>` → `http://localhost:8080`.
    (No security-group changes — cloudflared only makes outbound connections.)
-3. Zero Trust → Access → Applications → Add self-hosted app
+3. Zero Trust → Access controls → Applications → Add self-hosted app
    `portal.<device-domain>`, session 24h, policy **Allow** → Include →
    *Everyone with a valid login method* (or restrict to known customer emails).
    Copy the app's **AUD tag** into `ACCESS_PORTAL_AUD` and restart the service.
-4. **Provisioning service token**: Zero Trust → Access → Service Auth →
-   Create service token `pi-bench`. Then add a second Access application
-   scoped to path `portal.<device-domain>/api/provision` with a **Service
-   Auth** policy accepting that token. The bench script presents the token's
+4. **Provisioning service token**: Zero Trust → Access controls → Service
+   credentials → Service Tokens → Create Service Token, name `pi-bench`.
+   Then add a second Access application scoped to path
+   `portal.<device-domain>/api/provision` with a **Service Auth** policy
+   accepting that token. The bench script presents the token's
    `CF-Access-Client-Id/Secret` headers *plus* the `PROVISION_TOKEN` bearer.
 
 ## Day-to-day flow
