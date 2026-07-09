@@ -8,7 +8,11 @@ Wants=network-online.target
 WorkingDirectory=/opt/fluoro_simulator
 # All secrets/config live here (root:root, chmod 600) — see portal/README.md.
 EnvironmentFile=/etc/resuture-portal.env
-ExecStart=/opt/fluoro_simulator/portal/venv/bin/gunicorn -w 2 -b 127.0.0.1:8080 portal.app:create_app()
+# --preload: create_app() (and its one-time SQLite schema init) runs once in
+# the master before workers fork, so concurrent workers can't race the DB.
+# --no-control-socket: gunicorn 25+ tries to create gunicorn.ctl in the
+# working directory, which the unprivileged portal user can't write.
+ExecStart=/opt/fluoro_simulator/portal/venv/bin/gunicorn --preload --no-control-socket -w 2 -b 127.0.0.1:8080 portal.app:create_app()
 Restart=on-failure
 RestartSec=3
 # Run as an unprivileged user (create with: useradd -r -s /usr/sbin/nologin portal).

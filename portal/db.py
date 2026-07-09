@@ -17,7 +17,9 @@ _SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "schema.sql")
 
 
 def _connect():
-    conn = sqlite3.connect(config.DATABASE_PATH)
+    # Generous busy timeout: if two processes ever touch the DB at once
+    # (e.g. workers booting together), wait for the lock instead of erroring.
+    conn = sqlite3.connect(config.DATABASE_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
