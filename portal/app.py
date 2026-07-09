@@ -123,7 +123,7 @@ def create_app():
             # Roll back so the portal never claims access that Access won't grant.
             db.remove_assignment(device_id, email)
             db.audit(g.email, "cf_error", device_id, op="assign", error=str(exc))
-            abort(502, description="Cloudflare policy update failed: %s" % exc)
+            abort(500, description="Cloudflare policy update failed: %s" % exc)
         db.audit(g.email, "assign", device_id, email=email)
         return redirect(url_for("admin"))
 
@@ -139,7 +139,7 @@ def create_app():
         except cf_api.CfApiError as exc:
             db.add_assignment(device_id, email, g.email)  # restore consistency
             db.audit(g.email, "cf_error", device_id, op="unassign", error=str(exc))
-            abort(502, description="Cloudflare policy update failed: %s" % exc)
+            abort(500, description="Cloudflare policy update failed: %s" % exc)
         db.audit(g.email, "unassign", device_id, email=email)
         return redirect(url_for("admin"))
 
@@ -162,7 +162,7 @@ def create_app():
                 failures.append("%s: %s" % (op, exc))
         if failures:
             db.audit(g.email, "cf_error", device_id, op="delete", error="; ".join(failures))
-            abort(502, description="Decommission incomplete — fix in the Cloudflare "
+            abort(500, description="Decommission incomplete — fix in the Cloudflare "
                                    "dashboard, then retry. Failed: %s" % "; ".join(failures))
         db.delete_device(device_id)
         db.audit(g.email, "delete", device_id, hostname=device["hostname"])
@@ -216,7 +216,7 @@ def create_app():
         except cf_api.CfApiError as exc:
             _rollback_provision(created)
             db.audit("provisioner", "cf_error", device_id, op="provision", error=str(exc))
-            abort(502, description="Cloudflare provisioning failed (rolled back): %s" % exc)
+            abort(500, description="Cloudflare provisioning failed (rolled back): %s" % exc)
 
         db.insert_device(device_id, hostname, tunnel_id, app_id, policy_id,
                          dns_record_id, notes)
@@ -247,7 +247,7 @@ def create_app():
     @app.errorhandler(401)
     @app.errorhandler(403)
     @app.errorhandler(404)
-    @app.errorhandler(502)
+    @app.errorhandler(500)
     def error_page(err):
         if request.path.startswith("/api/"):
             return jsonify(error=err.description or err.name), err.code

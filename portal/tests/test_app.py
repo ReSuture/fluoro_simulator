@@ -85,7 +85,7 @@ def test_provision_rolls_back_on_cf_failure(client, mock_cf, monkeypatch):
     monkeypatch.setattr(cf_api, "create_dns_cname",
                         lambda sub, target: (_ for _ in ()).throw(cf_api.CfApiError("dns boom")))
     resp = _provision(client)
-    assert resp.status_code == 502
+    assert resp.status_code == 500
     kinds = [c[0] for c in mock_cf]
     assert "del_tunnel" in kinds and "del_access" in kinds
     # Device must not exist afterwards; re-provisioning starts fresh.
@@ -140,7 +140,7 @@ def test_assign_rolls_back_if_policy_update_fails(client, monkeypatch):
     resp = client.post("/admin/devices/abc123/assign",
                        data={"email": "customer@example.com", "csrf": csrf},
                        headers=ADMIN)
-    assert resp.status_code == 502
+    assert resp.status_code == 500
     # Customer must NOT see the device (portal never claims access CF won't grant).
     html = client.get("/", headers=CUSTOMER).get_data(as_text=True)
     assert "No simulator is linked" in html
