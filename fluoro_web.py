@@ -12,11 +12,17 @@ while the monitor shows the fluoro view.
 
 The web panel exposes the on/off toggles only (no numeric tuning sliders):
 
-    Overlay, Equalize, Pedal mode, Pedal press, HUD,
+    Overlay, Equalize, Pedal mode, Pedal press, HUD, Record,
     plus Fullscreen / Windowed / Start / Stop actions and a live preview.
     Stop puts the simulation into standby (camera released, FLUORO window
     closed) while this web server keeps running, so Start can bring it back
     remotely without touching the Pi.
+
+The FLUORO window itself is tabbed: **Fluoro** (the sim), **Remote Access**
+(WiFi setup + registering the device to a customer email on the ReSuture
+portal — see device_setup.py), and **Library** (browse/replay the session
+recordings made with the Record toggle — see recording.py). The sim is fully
+usable offline; the tabs never block launch.
 
 Architecture
 ------------
@@ -54,6 +60,7 @@ import os
 import sys
 import time
 import threading
+import traceback
 
 # Force OpenCV's Qt GUI onto the X11/XWayland backend. Under the native Wayland
 # Qt backend, cv.setWindowProperty(FULLSCREEN) is a no-op (it logs
@@ -65,6 +72,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 import numpy as np
 import cv2 as cv
 from flask import Flask, Response, jsonify, render_template_string, request
+
+import device_setup
+import recording
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -103,7 +113,7 @@ CHANGE_DIFF = 10.0
 MASTER_IMAGE = os.path.join(BASE_DIR, "fulltorsofluoroimage.png")
 # Brightness scale applied to the master at load. <1.0 darkens it (pulls the
 # bright/white areas down the most, since it's multiplicative); 1.0 = as-is.
-MASTER_BRIGHTNESS = 0.75
+MASTER_BRIGHTNESS = 0.90
 # Master-image pixels per real centimetre of anatomy.
 PX_PER_CM = 5.0
 # The master pixel that camera coordinate (0, 0) maps to (viewport centre at origin).
@@ -142,6 +152,8 @@ state = {
     "pos_x_cm": 0.0,        # camera X position (cm from origin) — drives the viewport
     "pos_y_cm": 0.0,        # camera Y position (cm from origin) — drives the viewport
     "pos_z_cm": 0.0,        # camera Z position (cm from nominal height) — drives the zoom
+    "ui_view": "fluoro",    # which tab the FLUORO window shows: fluoro|remote|library
+    "recording": False,     # session recording to ~/fluorosim_recordings
 }
 
 # Latest processed frame, JPEG-encoded, for the MJPEG preview stream.
@@ -211,6 +223,7 @@ PAGE = """
            transition: background .12s, border-color .12s; }
   button:active { transform: translateY(1px); }
   button.on { background: #103b2a; border-color: #12b76a; color: #7af0b6; }
+  button.rec.on { background: #3b1013; border-color: #f04438; color: #ff9a9a; }
   button.toggle .st { display: block; font-size: 12px; font-weight: 500; opacity: .7; margin-top: 2px; }
   .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
   button.quit { background: #2a1416; border-color: #5b2327; color: #ff9a9a; }
@@ -242,6 +255,7 @@ PAGE = """
         <button class="toggle" data-toggle="hud">HUD<span class="st">—</span></button>
         <button class="toggle" data-toggle="pedal_mode">Pedal mode<span class="st">—</span></button>
         <button class="toggle" data-toggle="pedal_pressed">Pedal press<span class="st">—</span></button>
+        <button class="toggle rec" data-toggle="recording">Record<span class="st">—</span></button>
       </div>
 
       <div class="actions">
@@ -370,7 +384,8 @@ def api_toggle(name):
     arbitrary key can't be injected into the state dict.
     '''
     with state_lock:
-        if name in ("overlay", "equalize", "pedal_mode", "pedal_pressed", "hud"):
+        if name in ("overlay", "equalize", "pedal_mode", "pedal_pressed", "hud",
+                    "recording"):
             state[name] = not state[name]
         snap = dict(state)
     return jsonify(snap)
@@ -532,8 +547,27 @@ C_DOT_ON   = (106, 183, 18)   # #12b76a
 # Button hit-boxes (x, y, w, h, kind, name), rebuilt every render. `ctrl_buttons`
 # are positions inside the separate CONTROLS window (windowed); `overlay_buttons`
 # are positions on the FLUORO frame when the bar is stacked below it (fullscreen).
+# `tab_buttons` is the persistent tab bar on top of the FLUORO frame, and
+# `view_buttons` the active Remote Access / Library view's own buttons.
 ctrl_buttons = []
 overlay_buttons = []
+tab_buttons = []
+view_buttons = []
+
+# UI-local state for the Remote Access / Library views (text-field contents,
+# focus, list selection). Only ever touched from the OpenCV main thread — the
+# mouse callback and cv.waitKey both run inside the main loop's GUI pump — so
+# no lock is needed (unlike `state`, which the Flask thread also reads).
+ui = {
+    "focus": None,          # name of the focused text field: "password"|"email"
+    "password": "",
+    "email": "",
+    "show_pw": False,
+    "selected_ssid": None,  # network picked from the scan list
+    "selected_secured": False,
+    "net_page": 0,
+    "email_editing": False, # entering/changing the registration email
+}
 
 
 def rounded_rect(img, x, y, w, h, r, color, thickness=-1):
@@ -593,6 +627,55 @@ def draw_button(img, x, y, w, h, label, sub=None, on=False, variant="normal"):
                    tx if on else C_SUBTEXT, 1, cv.LINE_AA)
 
 
+TAB_H = 44  # height of the persistent tab bar stacked on top of the FLUORO frame
+
+
+def render_tab_bar(width, active_view, rec_elapsed=None):
+    '''Render the persistent Fluoro / Remote Access / Library tab bar.
+
+    Returns (image, buttons) with hit-boxes relative to the bar's top-left.
+    `rec_elapsed` is a "mm:ss" string shown with a red dot while recording.
+    '''
+    img = np.full((TAB_H, width, 3), C_BG, np.uint8)
+    cv.line(img, (0, TAB_H - 1), (width, TAB_H - 1), C_BTN_BD, 1, cv.LINE_AA)
+    buttons = []
+    pad, gap, bh = 5, 6, TAB_H - 10
+    tw = min(190, (width - 2 * pad - 2 * gap) // 3)
+    for i, (label, name) in enumerate([("Fluoro", "fluoro"),
+                                       ("Remote Access", "remote"),
+                                       ("Library", "library")]):
+        bx = pad + i * (tw + gap)
+        draw_button(img, bx, 5, tw, bh, label, None, active_view == name)
+        buttons.append((bx, 5, tw, bh, "tab", name))
+    if rec_elapsed is not None:
+        font = cv.FONT_HERSHEY_SIMPLEX
+        txt = "REC %s" % rec_elapsed
+        (tw2, th2), _ = cv.getTextSize(txt, font, 0.55, 1)
+        cv.circle(img, (width - tw2 - 28, TAB_H // 2), 7, C_DOT_OFF, -1, cv.LINE_AA)
+        cv.putText(img, txt, (width - tw2 - 14, (TAB_H + th2) // 2), font, 0.55,
+                   C_QUIT_TX, 1, cv.LINE_AA)
+    return img, buttons
+
+
+def draw_text_field(img, x, y, w, h, text, focused=False, masked=False,
+                    placeholder=""):
+    '''Draw a clickable text field (the keyboard types into it while focused).'''
+    rounded_rect(img, x, y, w, h, 8, C_BTN_BG, -1)
+    rounded_rect(img, x, y, w, h, 8, C_ON_BD if focused else C_BTN_BD, 1)
+    font = cv.FONT_HERSHEY_SIMPLEX
+    shown = ("*" * len(text)) if masked else text
+    color = C_TEXT
+    if focused:
+        shown += "_"
+    elif not shown and placeholder:
+        shown, color = placeholder, C_SUBTEXT
+    # Keep the tail visible when the text outgrows the box.
+    while len(shown) > 1 and cv.getTextSize(shown, font, 0.55, 1)[0][0] > w - 20:
+        shown = shown[1:]
+    (_, th), _ = cv.getTextSize("Ag", font, 0.55, 1)
+    cv.putText(img, shown, (x + 10, y + (h + th) // 2), font, 0.55, color, 1, cv.LINE_AA)
+
+
 def render_controls(s, logo, live):
     '''Render the vertical control panel (logo + button grid) for the CONTROLS window.
 
@@ -628,13 +711,14 @@ def render_controls(s, logo, live):
     cw = (W - 2 * m - gap) // 2
     toggles = [("Overlay", "overlay"), ("Equalize", "equalize"),
                ("HUD", "hud"), ("Pedal mode", "pedal_mode"),
-               ("Pedal press", "pedal_pressed")]
+               ("Pedal press", "pedal_pressed"), ("Record", "recording")]
     for i, (label, key) in enumerate(toggles):
         col, row = i % 2, i // 2
         bx = m + col * (cw + gap)
         by = y + row * (bt + gap)
         on = bool(s[key])
-        draw_button(img, bx, by, cw, bt, label, "ON" if on else "OFF", on)
+        draw_button(img, bx, by, cw, bt, label, "ON" if on else "OFF", on,
+                    "quit" if key == "recording" and on else "normal")
         buttons.append((bx, by, cw, bt, "toggle", key))
     y += 3 * (bt + gap)
 
@@ -663,25 +747,33 @@ def render_controls(s, logo, live):
     return img, buttons
 
 
+# Control-bar geometry, shared with the Remote Access / Library views so their
+# canvases match the fluoro composite's height exactly (no window resizing).
+BAR_PAD, BAR_GAP, BAR_BH = 6, 6, 34
+BAR_H = BAR_PAD + 3 * BAR_BH + 2 * BAR_GAP + BAR_PAD  # 3 rows: toggles, actions, location
+
+
 def render_control_bar(s, width, live):
     '''Render a short, full-width control strip stacked below the video in fullscreen.
 
     Returns (image, buttons) with hit-boxes relative to the bar's top-left.
     '''
-    pad, gap, bh = 6, 6, 34
-    bar_h = pad + bh + gap + bh + gap + bh + pad   # 3 rows: toggles, actions, location
+    pad, gap, bh = BAR_PAD, BAR_GAP, BAR_BH
+    bar_h = BAR_H
     img = np.full((bar_h, width, 3), C_BG, np.uint8)
     cv.line(img, (0, 0), (width, 0), C_BTN_BD, 1, cv.LINE_AA)
     buttons = []
 
     toggles = [("Overlay", "overlay"), ("Equalize", "equalize"),
                ("HUD", "hud"), ("Pedal mode", "pedal_mode"),
-               ("Pedal press", "pedal_pressed")]
-    cw = (width - 2 * pad - 4 * gap) // 5
+               ("Pedal press", "pedal_pressed"), ("Record", "recording")]
+    cw = (width - 2 * pad - 5 * gap) // 6
     y = pad
     for i, (label, key) in enumerate(toggles):
         bx = pad + i * (cw + gap)
-        draw_button(img, bx, y, cw, bh, label, None, bool(s[key]))
+        on = bool(s[key])
+        draw_button(img, bx, y, cw, bh, label, None, on,
+                    "quit" if key == "recording" and on else "normal")
         buttons.append((bx, y, cw, bh, "toggle", key))
 
     y += bh + gap
@@ -710,8 +802,449 @@ def render_control_bar(s, width, live):
     return img, buttons
 
 
+# ── Remote Access view ────────────────────────────────────────────────────────
+# WiFi + portal registration, drawn into the FLUORO window under the tab bar.
+# All slow work (nmcli, portal HTTP) lives in device_setup.SetupManager on
+# daemon threads; this section only renders its snapshot and posts button
+# presses back to it.
+
+setup_mgr = device_setup.SetupManager()
+
+NET_ROWS = 5  # networks shown per page of the scan list
+
+
+def _draw_signal_bars(img, x, y, signal):
+    '''Four little bars, filled according to a 0-100 signal strength.'''
+    for i in range(4):
+        h = 5 + i * 4
+        color = C_ON_BD if signal > i * 25 else C_BTN_BD
+        cv.rectangle(img, (x + i * 7, y - h), (x + i * 7 + 4, y), color, -1)
+
+
+def render_remote_view(s, W, H):
+    '''Render the Remote Access view. Returns (canvas, buttons).'''
+    setup_mgr.refresh_status()  # TTL-gated and non-blocking
+    st = setup_mgr.snapshot()
+    img = np.full((H, W, 3), C_BG, np.uint8)
+    buttons = []
+    m, gap, bh = 24, 8, 38
+    font = cv.FONT_HERSHEY_SIMPLEX
+
+    def text(txt, x, yy, scale=0.55, color=C_TEXT):
+        cv.putText(img, txt, (x, yy), font, scale, color, 1, cv.LINE_AA)
+
+    # ── WiFi ──
+    y = 34
+    text("WiFi", m, y, 0.7)
+    cv.circle(img, (m + 78, y - 6), 6,
+              C_DOT_ON if st["wifi_connected"] else C_DOT_OFF, -1, cv.LINE_AA)
+    text("connected to %s" % st["wifi_ssid"] if st["wifi_connected"]
+         else "not connected", m + 94, y, 0.55, C_SUBTEXT)
+    if st["provisioned"]:
+        chip = ("portal: online", C_ON_TX) if st["online"] else \
+               ("portal: unreachable", C_QUIT_TX) if st["wifi_connected"] else None
+        if chip:
+            (cw_, _), _ = cv.getTextSize(chip[0], font, 0.5, 1)
+            text(chip[0], W - m - cw_, y, 0.5, chip[1])
+    y += 14
+
+    scanning = st["wifi"] == "scanning"
+    draw_button(img, m, y, 250, bh,
+                "Scanning..." if scanning else "Scan for networks", None, scanning)
+    if not scanning:
+        buttons.append((m, y, 250, bh, "setup", "scan"))
+    y += bh + gap
+
+    # Scan-result list (paged).
+    nets = st["networks"]
+    page = min(ui["net_page"], max(0, (len(nets) - 1) // NET_ROWS))
+    ui["net_page"] = page
+    for i in range(page * NET_ROWS, min(len(nets), (page + 1) * NET_ROWS)):
+        n = nets[i]
+        selected = n["ssid"] == ui["selected_ssid"]
+        draw_button(img, m, y, W - 2 * m, 32, "", None, selected)
+        label = n["ssid"] if len(n["ssid"]) <= 40 else n["ssid"][:39] + "~"
+        text(label, m + 14, y + 22, 0.55, C_ON_TX if selected else C_TEXT)
+        _draw_signal_bars(img, W - m - 100, y + 24, n["signal"])
+        if n["secured"]:
+            text("secured", W - m - 70, y + 22, 0.45, C_SUBTEXT)
+        buttons.append((m, y, W - 2 * m, 32, "setup", "pick:%d" % i))
+        y += 32 + 4
+    if len(nets) > NET_ROWS:
+        pw_ = 90
+        if page > 0:
+            draw_button(img, m, y, pw_, 30, "Prev", None, False)
+            buttons.append((m, y, pw_, 30, "setup", "page_prev"))
+        if (page + 1) * NET_ROWS < len(nets):
+            draw_button(img, m + pw_ + gap, y, pw_, 30, "Next", None, False)
+            buttons.append((m + pw_ + gap, y, pw_, 30, "setup", "page_next"))
+        y += 30 + gap
+
+    # Selected network: password + connect.
+    if ui["selected_ssid"]:
+        connecting = st["wifi"] == "connecting"
+        if connecting:
+            text("Connecting to %s..." % ui["selected_ssid"], m, y + 24, 0.55, C_ON_TX)
+            y += bh + gap
+        else:
+            fw_ = min(360, W - 2 * m - 3 * (90 + gap))
+            if ui["selected_secured"]:
+                draw_text_field(img, m, y, fw_, bh, ui["password"],
+                                ui["focus"] == "password", not ui["show_pw"],
+                                "password for %s" % ui["selected_ssid"])
+                buttons.append((m, y, fw_, bh, "focus", "password"))
+                bx = m + fw_ + gap
+                draw_button(img, bx, y, 90, bh, "Hide" if ui["show_pw"] else "Show",
+                            None, ui["show_pw"])
+                buttons.append((bx, y, 90, bh, "setup", "show_pw"))
+                bx += 90 + gap
+            else:
+                text("Open network: %s" % ui["selected_ssid"], m, y + 24, 0.55, C_SUBTEXT)
+                bx = m + fw_ + 2 * gap + 90
+            draw_button(img, bx, y, 110, bh, "Connect", None, True)
+            buttons.append((bx, y, 110, bh, "setup", "connect"))
+            bx += 110 + gap
+            draw_button(img, bx, y, 90, bh, "Cancel", None, False)
+            buttons.append((bx, y, 90, bh, "setup", "cancel_net"))
+            y += bh + gap
+
+    # ── Registration ──
+    y += 10
+    cv.line(img, (m, y), (W - m, y), C_BTN_BD, 1, cv.LINE_AA)
+    y += 34
+    text("Remote access", m, y, 0.7)
+    y += 16
+
+    if not st["provisioned"]:
+        text("Remote registration unavailable — this device has not been",
+             m, y + 20, 0.55, C_SUBTEXT)
+        text("provisioned. Contact ReSuture. The simulator works normally.",
+             m, y + 44, 0.55, C_SUBTEXT)
+        y += 60
+    elif st["registered_email"] and not ui["email_editing"]:
+        suffix = "" if st["online"] else "  (cached - offline)"
+        text("Registered to %s%s" % (st["registered_email"], suffix),
+             m, y + 24, 0.6)
+        draw_button(img, m, y + 38, 110, bh, "Change", None, False)
+        buttons.append((m, y + 38, 110, bh, "setup", "change"))
+        y += 38 + bh + gap
+    else:
+        claiming = st["portal"] == "claiming"
+        if claiming:
+            text("Registering...", m, y + 24, 0.6, C_ON_TX)
+            y += bh + gap
+        else:
+            text("Enter your email to register this simulator to your account:",
+                 m, y + 18, 0.5, C_SUBTEXT)
+            y += 28
+            fw_ = min(420, W - 2 * m - 2 * (120 + gap))
+            draw_text_field(img, m, y, fw_, bh, ui["email"],
+                            ui["focus"] == "email", False, "you@example.com")
+            buttons.append((m, y, fw_, bh, "focus", "email"))
+            bx = m + fw_ + gap
+            if st["online"]:
+                draw_button(img, bx, y, 120, bh, "Register", None, True)
+                buttons.append((bx, y, 120, bh, "setup", "claim"))
+            else:
+                draw_button(img, bx, y, 120, bh, "Register", None, False)
+                text("connect to WiFi first", bx + 130, y + 24, 0.5, C_SUBTEXT)
+            bx += 120 + gap
+            if st["registered_email"]:
+                draw_button(img, bx, y, 100, bh, "Cancel", None, False)
+                buttons.append((bx, y, 100, bh, "setup", "cancel_email"))
+            y += bh + gap
+
+    # Errors / notices at the bottom of the section.
+    if st["error"]:
+        text(str(st["error"])[:90], m, y + 24, 0.5, C_QUIT_TX)
+    elif st["notice"]:
+        text(str(st["notice"])[:90], m, y + 24, 0.5, C_ON_TX)
+    return img, buttons
+
+
+def handle_setup_button(name):
+    '''Apply a Remote Access button press (runs on the main thread; instant).'''
+    if name == "scan":
+        ui["net_page"] = 0
+        setup_mgr.start_scan()
+    elif name.startswith("pick:"):
+        nets = setup_mgr.snapshot()["networks"]
+        idx = int(name.split(":", 1)[1])
+        if 0 <= idx < len(nets):
+            ui["selected_ssid"] = nets[idx]["ssid"]
+            ui["selected_secured"] = nets[idx]["secured"]
+            ui["password"] = ""
+            ui["focus"] = "password" if nets[idx]["secured"] else None
+    elif name == "connect":
+        if ui["selected_ssid"]:
+            setup_mgr.connect(ui["selected_ssid"], ui["password"])
+    elif name == "cancel_net":
+        ui["selected_ssid"], ui["password"], ui["focus"] = None, "", None
+    elif name == "show_pw":
+        ui["show_pw"] = not ui["show_pw"]
+    elif name == "page_prev":
+        ui["net_page"] = max(0, ui["net_page"] - 1)
+    elif name == "page_next":
+        ui["net_page"] += 1
+    elif name == "change":
+        ui["email_editing"], ui["email"], ui["focus"] = True, "", "email"
+    elif name == "cancel_email":
+        ui["email_editing"], ui["focus"] = False, None
+    elif name == "claim":
+        email = ui["email"].strip().lower()
+        if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
+            setup_mgr.set_error("That doesn't look like an email address.")
+            return
+        ui["email_editing"] = False
+        setup_mgr.claim(email)
+
+
+# ── Library view ──────────────────────────────────────────────────────────────
+# Recorded-session browser + player. Only ever touched from the OpenCV main
+# thread (like `ui`), except the duration cache, which a probe worker fills
+# under its own lock.
+
+recorder = recording.Recorder()
+
+LIB_ROWS = 7  # recordings shown per page
+
+
+class LibraryManager:
+    def __init__(self):
+        self.mode = "list"        # list | playing
+        self.entries = []
+        self.durations = {}
+        self._dur_lock = threading.Lock()
+        self.page = 0
+        self.confirm_path = None  # Delete pressed once; Confirm? shown
+        self.confirm_at = 0.0
+        self.error = None
+        # Playback state.
+        self.cap = None
+        self.path = None
+        self.fps = recording.FPS
+        self.total = 0
+        self.idx = 0
+        self.paused = False
+        self.ended = False
+        self.next_due = 0.0
+        self.frame = None
+
+    @property
+    def playing(self):
+        return self.mode == "playing" and not self.paused and not self.ended
+
+    def enter(self):
+        self.refresh()
+
+    def leave(self):
+        self.stop_playback()
+
+    def refresh(self):
+        self.entries = recording.list_recordings()
+        self.error = recorder.error  # surface a failed writer here too
+        with self._dur_lock:
+            unknown = [e["path"] for e in self.entries
+                       if e["path"] not in self.durations]
+        if unknown:
+            threading.Thread(
+                target=recording.probe_durations,
+                args=(unknown, self.durations, self._dur_lock),
+                daemon=True).start()
+
+    def duration(self, path):
+        with self._dur_lock:
+            return self.durations.get(path, "...")
+
+    def handle(self, name):
+        if name.startswith("play:"):
+            i = int(name.split(":", 1)[1])
+            if 0 <= i < len(self.entries):
+                self.start_playback(self.entries[i]["path"])
+        elif name.startswith("del:"):
+            i = int(name.split(":", 1)[1])
+            if 0 <= i < len(self.entries):
+                self.confirm_path = self.entries[i]["path"]
+                self.confirm_at = time.monotonic()
+        elif name == "confirm_del":
+            if self.confirm_path:
+                if not recording.delete_recording(self.confirm_path):
+                    self.error = "Could not delete the recording."
+                self.confirm_path = None
+                self.refresh()
+        elif name == "refresh":
+            self.refresh()
+        elif name == "page_prev":
+            self.page = max(0, self.page - 1)
+        elif name == "page_next":
+            self.page += 1
+        elif name == "pause":
+            self.paused = not self.paused
+            if not self.paused:
+                self.next_due = time.monotonic()
+        elif name == "replay":
+            if self.path:
+                self.start_playback(self.path)
+        elif name == "back":
+            self.stop_playback()
+            self.refresh()
+
+    def start_playback(self, path):
+        self.stop_playback()
+        cap = cv.VideoCapture(path)
+        if not cap.isOpened():
+            self.error = "Cannot open %s" % os.path.basename(path)
+            return
+        self.cap, self.path = cap, path
+        self.fps = cap.get(cv.CAP_PROP_FPS) or recording.FPS
+        self.total = int(cap.get(cv.CAP_PROP_FRAME_COUNT) or 0)
+        self.idx, self.paused, self.ended = 0, False, False
+        self.frame, self.next_due = None, time.monotonic()
+        self.mode = "playing"
+
+    def stop_playback(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self.mode, self.paused, self.ended = "list", False, False
+
+    def tick(self):
+        '''Advance playback when the next frame is due (called every render).'''
+        if not self.playing or self.cap is None:
+            return
+        now = time.monotonic()
+        if now < self.next_due:
+            return
+        ok, f = self.cap.read()
+        if not ok:
+            self.ended = True
+            return
+        self.frame = f
+        self.idx += 1
+        # Never let the schedule fall far behind wall time (long stalls).
+        self.next_due = max(self.next_due + 1.0 / self.fps, now - 0.25)
+
+
+library = LibraryManager()
+
+
+def _fmt_when(mtime):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+
+
+def render_library_view(W, H):
+    '''Render the Library view (list or playback). Returns (canvas, buttons).'''
+    library.tick()
+    img = np.full((H, W, 3), C_BG, np.uint8)
+    buttons = []
+    m, gap, bh = 24, 8, 38
+    font = cv.FONT_HERSHEY_SIMPLEX
+
+    def text(txt, x, yy, scale=0.55, color=C_TEXT):
+        cv.putText(img, txt, (x, yy), font, scale, color, 1, cv.LINE_AA)
+
+    if library.mode == "playing":
+        ctrl_h = bh + 18
+        area_h = H - ctrl_h - 40
+        f = library.frame
+        if f is not None:
+            fh, fw = f.shape[:2]
+            scale = min((W - 2 * m) / float(fw), area_h / float(fh))
+            tw, th = max(1, int(fw * scale)), max(1, int(fh * scale))
+            x0, y0 = (W - tw) // 2, 8 + (area_h - th) // 2
+            img[y0:y0 + th, x0:x0 + tw] = cv.resize(f, (tw, th))
+        if library.ended:
+            text("Ended", W // 2 - 30, 40, 0.7, C_ON_TX)
+        # Progress bar + time.
+        py = H - ctrl_h - 24
+        cv.rectangle(img, (m, py), (W - m, py + 6), C_BTN_BD, -1)
+        if library.total > 0:
+            frac = min(1.0, library.idx / float(library.total))
+            cv.rectangle(img, (m, py), (m + int((W - 2 * m) * frac), py + 6),
+                         C_ON_BD, -1)
+        cur = int(library.idx / library.fps) if library.fps else 0
+        tot = int(library.total / library.fps) if library.fps else 0
+        text("%d:%02d / %d:%02d" % (cur // 60, cur % 60, tot // 60, tot % 60),
+             W - m - 110, py - 8, 0.5, C_SUBTEXT)
+        # Controls.
+        y = H - ctrl_h + 4
+        for label, name, w_ in ((("Resume" if library.paused else "Pause"),
+                                 "pause", 110),
+                                ("Replay", "replay", 110),
+                                ("Back to list", "back", 140)):
+            draw_button(img, m, y, w_, bh, label, None, name == "pause" and library.paused)
+            buttons.append((m, y, w_, bh, "lib", name))
+            m += w_ + gap
+        return img, buttons
+
+    # ── list mode ──
+    y = 34
+    text("Library - recorded sessions", m, y, 0.7)
+    draw_button(img, W - m - 110, y - 24, 110, 34, "Refresh", None, False)
+    buttons.append((W - m - 110, y - 24, 110, 34, "lib", "refresh"))
+    y += 20
+
+    if not library.entries:
+        text("No recordings yet - press Record on the Fluoro tab.",
+             m, y + 40, 0.6, C_SUBTEXT)
+    # Auto-cancel a pending delete confirmation after 5 s.
+    if library.confirm_path and time.monotonic() - library.confirm_at > 5.0:
+        library.confirm_path = None
+
+    page = min(library.page, max(0, (len(library.entries) - 1) // LIB_ROWS))
+    library.page = page
+    row_h = 44
+    for i in range(page * LIB_ROWS,
+                   min(len(library.entries), (page + 1) * LIB_ROWS)):
+        e = library.entries[i]
+        rounded_rect(img, m, y, W - 2 * m, row_h - 6, 8, C_BTN_BG, -1)
+        rounded_rect(img, m, y, W - 2 * m, row_h - 6, 8, C_BTN_BD, 1)
+        name = e["name"]
+        if len(name) > 34:
+            name = name[:33] + "~"
+        text(name, m + 12, y + 25, 0.5)
+        text(_fmt_when(e["mtime"]), m + 320, y + 25, 0.45, C_SUBTEXT)
+        text(library.duration(e["path"]), m + 470, y + 25, 0.45, C_SUBTEXT)
+        bx = W - m - 200
+        draw_button(img, bx, y + 4, 80, row_h - 14, "Play", None, False)
+        buttons.append((bx, y + 4, 80, row_h - 14, "lib", "play:%d" % i))
+        bx += 80 + gap
+        if library.confirm_path == e["path"]:
+            draw_button(img, bx, y + 4, 100, row_h - 14, "Confirm?", None, False, "quit")
+            buttons.append((bx, y + 4, 100, row_h - 14, "lib", "confirm_del"))
+        else:
+            draw_button(img, bx, y + 4, 100, row_h - 14, "Delete", None, False)
+            buttons.append((bx, y + 4, 100, row_h - 14, "lib", "del:%d" % i))
+        y += row_h
+
+    if len(library.entries) > LIB_ROWS:
+        if page > 0:
+            draw_button(img, m, y, 90, 30, "Prev", None, False)
+            buttons.append((m, y, 90, 30, "lib", "page_prev"))
+        if (page + 1) * LIB_ROWS < len(library.entries):
+            draw_button(img, m + 98, y, 90, 30, "Next", None, False)
+            buttons.append((m + 98, y, 90, 30, "lib", "page_next"))
+        y += 38
+    if library.error:
+        text(str(library.error)[:90], m, y + 24, 0.5, C_QUIT_TX)
+    return img, buttons
+
+
 def apply_button(kind, name):
     '''Apply an on-screen button press to the shared `state` (under state_lock).'''
+    if kind == "tab":
+        with state_lock:
+            state["ui_view"] = name
+        on_view_enter(name)
+        return
+    if kind == "focus":
+        ui["focus"] = name
+        return
+    if kind in ("setup", "lib"):
+        # Remote Access / Library view buttons — handled outside state_lock
+        # (they talk to their own managers, which have their own locks).
+        handle_view_button(kind, name)
+        return
     with state_lock:
         if kind == "toggle":
             state[name] = not state[name]
@@ -755,11 +1288,75 @@ def on_mouse_controls(event, x, y, flags, param):
 
 
 def on_mouse_fluoro(event, x, y, flags, param):
-    '''Click handler for buttons stacked below the video (fullscreen mode).'''
+    '''Click handler for the FLUORO window: tab bar first, then the active
+    view's buttons (the fluoro control bar, or the Remote Access / Library UI).'''
     if event == cv.EVENT_LBUTTONDOWN:
-        hit = _hit(overlay_buttons, x, y)
+        hit = _hit(tab_buttons, x, y)
+        if hit is None:
+            with state_lock:
+                view = state["ui_view"]
+            hit = _hit(overlay_buttons if view == "fluoro" else view_buttons, x, y)
         if hit:
             apply_button(*hit)
+
+
+def handle_ui_key(key):
+    '''Route a keypress to the tab UI. Returns True when consumed.
+
+    On the Fluoro view nothing is consumed (shortcuts work as always). On the
+    other views a focused text field captures typing (so "wifi2024!" cannot pan
+    the anatomy); with no focus, ESC returns to Fluoro and 'b' passes through
+    so a foot pedal keeps working on any tab.
+    '''
+    with state_lock:
+        view = state["ui_view"]
+    if view == "fluoro":
+        return False
+    focus = ui["focus"]
+    if focus:
+        if 32 <= key <= 126:
+            ui[focus] += chr(key)
+        elif key in (8, 127):
+            ui[focus] = ui[focus][:-1]
+        elif key in (10, 13):
+            ui["focus"] = None
+            submit_field(focus)
+        elif key == 27:
+            ui["focus"] = None
+        return True
+    if key == 27:
+        with state_lock:
+            state["ui_view"] = "fluoro"
+        return True
+    if key == ord('b'):
+        return False
+    return True
+
+
+def on_view_enter(name):
+    '''Hook run when a tab is selected (refresh lists/status; never blocks).'''
+    if name == "remote":
+        setup_mgr.refresh_status()
+    elif name == "library":
+        library.enter()
+    elif name == "fluoro":
+        library.leave()
+
+
+def submit_field(field):
+    '''Enter pressed in a text field — same as clicking its action button.'''
+    if field == "password":
+        handle_view_button("setup", "connect")
+    elif field == "email":
+        handle_view_button("setup", "claim")
+
+
+def handle_view_button(kind, name):
+    '''Dispatch a Remote Access ("setup") or Library ("lib") button press.'''
+    if kind == "setup":
+        handle_setup_button(name)
+    elif kind == "lib":
+        library.handle(name)
 
 
 def run_simulation(cam_index, show_window):
@@ -843,10 +1440,15 @@ def run_simulation(cam_index, show_window):
         # Start button (POST /api/action/start) sets running again. The Flask
         # server stays up throughout, so start/stop work fully remotely.
         if not s["running"]:
+            if recorder.active:
+                recorder.stop()
+                with state_lock:
+                    state["recording"] = False
             if cap is not None:
                 cap.release()
                 cap = None
                 if show_window:
+                    library.stop_playback()
                     cv.destroyAllWindows()
                     cv.waitKey(1)  # let the GUI process the window teardown
                 applied_fullscreen = None
@@ -881,20 +1483,32 @@ def run_simulation(cam_index, show_window):
                 overlay_buttons[:] = []
             applied_fullscreen = s["fullscreen"]
 
-        # Keyboard shortcuts still work on the FLUORO window.
+        # Keyboard: the tab UI (focused text fields, ESC-back) gets first look;
+        # unconsumed keys keep their existing shortcut meaning on the Fluoro view.
         key = (cv.waitKey(1) & 0xFF) if show_window else 0xFF
-        key_pedal = key == ord('b')
-        if key != 0xFF:
+        consumed = handle_ui_key(key) if key != 0xFF else False
+        key_pedal = not consumed and key == ord('b')
+        if key != 0xFF and not consumed:
             _handle_key(key)
-        if key == 27:  # ESC
+        if key == 27 and not consumed:  # ESC (on the Fluoro view) exits
             with state_lock:
                 state["quit"] = True
             break
 
+        # Which tab is showing (read after waitKey so a click this iteration
+        # counts). While a Library recording is actually playing, skip the
+        # live processing so the CPU goes to decoding — one grab() keeps the
+        # camera's buffer fresh so switching back to Fluoro is instant.
+        with state_lock:
+            view = state["ui_view"]
+        lib_playing = show_window and view == "library" and library.playing
+        if lib_playing and cap is not None:
+            cap.grab()
+
         # In pedal mode, only grab a frame while the pedal/'b' is held; otherwise
         # capture continuously.
         pedal_down = s["pedal_pressed"] or key_pedal
-        capture_now = pedal_down or not s["pedal_mode"]
+        capture_now = (pedal_down or not s["pedal_mode"]) and not lib_playing
 
         if capture_now:
             ret, frame = cap.read()
@@ -948,22 +1562,65 @@ def run_simulation(cam_index, show_window):
             if pedal_down:
                 draw_str(res, (20, 80), "PEDAL ACTIVE")
 
-        if res is not None:
-            if show_window:
-                if s["fullscreen"]:
-                    # Stack the video on top and a thin control bar below it.
-                    vid = cv.cvtColor(res, cv.COLOR_GRAY2BGR) if res.ndim == 2 else res
-                    bar, bbtns = render_control_bar(s, vid.shape[1], live)
-                    composite = np.vstack([vid, bar])
-                    overlay_buttons[:] = [(x, y + vid.shape[0], w, h, k, n)
-                                          for (x, y, w, h, k, n) in bbtns]
-                    cv.imshow("FLUORO", composite)
+        # Session recording: feed the processed frame to the recorder while
+        # the toggle is on; a writer that fails to open flips the toggle back
+        # off and surfaces its error on the Library tab.
+        if s["recording"] and res is not None:
+            if recorder.ensure_started(res.shape):
+                if capture_now:
+                    recorder.submit(res)
+            else:
+                with state_lock:
+                    state["recording"] = False
+                library.error = recorder.error
+        elif not s["recording"] and recorder.active:
+            recorder.stop()
+
+        rec_elapsed = recorder.elapsed_str() if recorder.active else None
+
+        if show_window and view != "fluoro":
+            # Remote Access / Library replace the video area under the tab
+            # bar; the capture pipeline above keeps running so the preview
+            # stays live and switching back is instant. A failure in tab code
+            # must never take down the sim: fall back to the Fluoro view.
+            try:
+                fh, fw = res.shape[:2] if res is not None else (480, 640)
+                canvas_h = fh + (BAR_H if s["fullscreen"] else 0)
+                if view == "remote":
+                    canvas, vbtns = render_remote_view(s, fw, canvas_h)
                 else:
-                    # Clean video in FLUORO, the vertical panel in CONTROLS.
+                    canvas, vbtns = render_library_view(fw, canvas_h)
+                tab, tbtns = render_tab_bar(fw, view, rec_elapsed)
+                tab_buttons[:] = tbtns
+                view_buttons[:] = [(x, y + TAB_H, w, h, k, n)
+                                   for (x, y, w, h, k, n) in vbtns]
+                if not s["fullscreen"]:
                     panel, btns = render_controls(s, logo, live)
                     ctrl_buttons[:] = btns
                     cv.imshow("CONTROLS", panel)
-                    cv.imshow("FLUORO", res)
+                cv.imshow("FLUORO", np.vstack([tab, canvas]))
+            except Exception:
+                traceback.print_exc()
+                with state_lock:
+                    state["ui_view"] = "fluoro"
+        elif res is not None and show_window:
+            vid = cv.cvtColor(res, cv.COLOR_GRAY2BGR) if res.ndim == 2 else res
+            tab, tbtns = render_tab_bar(vid.shape[1], view, rec_elapsed)
+            tab_buttons[:] = tbtns
+            if s["fullscreen"]:
+                # Stack the video between the tab bar and a thin control bar.
+                bar, bbtns = render_control_bar(s, vid.shape[1], live)
+                composite = np.vstack([tab, vid, bar])
+                overlay_buttons[:] = [(x, y + TAB_H + vid.shape[0], w, h, k, n)
+                                      for (x, y, w, h, k, n) in bbtns]
+                cv.imshow("FLUORO", composite)
+            else:
+                # Tabbed video in FLUORO, the vertical panel in CONTROLS.
+                panel, btns = render_controls(s, logo, live)
+                ctrl_buttons[:] = btns
+                cv.imshow("CONTROLS", panel)
+                cv.imshow("FLUORO", np.vstack([tab, vid]))
+        if res is not None:
             # The web MJPEG preview always streams the clean frame (the browser has
             # its own HTML buttons), so encode `res`, not the composited view.
             ok, jpg = cv.imencode(".jpg", res, [cv.IMWRITE_JPEG_QUALITY, 80])
@@ -971,6 +1628,8 @@ def run_simulation(cam_index, show_window):
                 with _latest_lock:
                     _latest_jpeg = jpg.tobytes()
 
+    recorder.stop(wait=True)  # finalize the .avi before os._exit
+    library.stop_playback()
     if cap is not None:
         cap.release()
     cv.destroyAllWindows()
