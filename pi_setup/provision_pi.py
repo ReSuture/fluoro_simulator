@@ -37,6 +37,8 @@ import urllib.request
 CLOUDFLARED_DEB = ("https://github.com/cloudflare/cloudflared/releases/latest/"
                    "download/cloudflared-linux-{arch}.deb")
 DEVICE_ID_FILE = "/etc/fluorosim/device-id"
+PORTAL_URL_FILE = "/etc/fluorosim/portal-url"
+CLAIM_SECRET_FILE = "/etc/fluorosim/claim-secret"
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -94,6 +96,9 @@ def register_with_portal(args, device_id):
         data=json.dumps({"device_id": device_id, "notes": args.notes}).encode(),
         headers={
             "Content-Type": "application/json",
+            # Cloudflare's Browser Integrity Check rejects Python-urllib's
+            # default signature with error 1010, so identify as the bench tool.
+            "User-Agent": "resuture-provision-pi/1.0",
             "Authorization": "Bearer %s" % args.provision_token,
             "CF-Access-Client-Id": args.cf_client_id,
             "CF-Access-Client-Secret": args.cf_client_secret,
@@ -131,13 +136,31 @@ def install_fluorosim_service():
     run(["sudo", "loginctl", "enable-linger", os.environ.get("USER", "")])
 
 
-def write_device_id(device_id):
-    run(["sudo", "mkdir", "-p", os.path.dirname(DEVICE_ID_FILE)])
+def write_etc_file(path, content, mode="644", owner=None):
+    run(["sudo", "mkdir", "-p", os.path.dirname(path)])
     subprocess.run(
-        ["sudo", "tee", DEVICE_ID_FILE],
-        input=device_id + "\n", text=True, check=True,
+        ["sudo", "tee", path],
+        input=content + "\n", text=True, check=True,
         stdout=subprocess.DEVNULL,
     )
+    run(["sudo", "chmod", mode, path])
+    if owner:
+        run(["sudo", "chown", "%s:%s" % (owner, owner), path])
+
+
+def write_identity_files(device_id, portal_url, claim_secret):
+    write_etc_file(DEVICE_ID_FILE, device_id)
+    write_etc_file(PORTAL_URL_FILE, portal_url)
+    if claim_secret:
+        # The Remote Access tab (fluoro_web.py, running as the desktop user)
+        # presents this to the portal's /api/device endpoints; nobody else on
+        # the box needs to read it.
+        write_etc_file(CLAIM_SECRET_FILE, claim_secret, mode="600",
+                       owner=os.environ.get("USER", ""))
+    else:
+        log("WARNING: portal did not return a claim secret — on-device "
+            "registration stays disabled until this Pi is re-provisioned "
+            "against an updated portal")
 
 
 # ── Verification ──────────────────────────────────────────────────────────────
@@ -208,14 +231,16 @@ def main():
 
     install_tunnel_service(result["tunnel_token"])
     install_fluorosim_service()
-    write_device_id(device_id)
+    write_identity_files(device_id, args.portal.rstrip("/"),
+                         result.get("claim_secret"))
     verify(hostname)
 
     print()
     log("─" * 60)
     log("Device ID : %s   (put this on the sticker)" % device_id)
     log("Panel URL : https://%s/" % hostname)
-    log("Status    : unassigned — assign a customer at %s/admin" % args.portal.rstrip("/"))
+    log("Status    : unassigned — the customer can self-register on the")
+    log("            device's Remote Access tab, or assign at %s/admin" % args.portal.rstrip("/"))
     log("─" * 60)
 
 

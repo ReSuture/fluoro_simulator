@@ -41,8 +41,21 @@ What it does:
 
 The script is idempotent — re-run it after any failure.
 
+It leaves three files in `/etc/fluorosim/`:
+
+| File | Mode | Contents |
+|---|---|---|
+| `device-id` | 644 root | the 6-char device id |
+| `portal-url` | 644 root | `https://portal.<device-domain>` |
+| `claim-secret` | **600, desktop user** | per-device secret for `/api/device/*` |
+
+The claim secret lets the customer self-register their email from the app's
+**Remote Access** tab (WiFi → email → done). **Every re-provision rotates
+it** — old images of the device can no longer claim; that's intended.
+
 Afterwards the device shows up as **unassigned** on the portal's `/admin`
-page; assign the customer's email there when the unit ships.
+page; the customer self-registers from the Remote Access tab, or assign
+their email at `/admin` when the unit ships.
 
 ## Security rules for tunneled Pis (do not break these)
 
