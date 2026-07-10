@@ -84,14 +84,29 @@ created by the portal itself):
    `portal.<device-domain>/api/provision` with a **Service Auth** policy
    accepting that token. The bench script presents the token's
    `CF-Access-Client-Id/Secret` headers *plus* the `PROVISION_TOKEN` bearer.
+5. **Device API bypass**: add a third Access application scoped to path
+   `portal.<device-domain>/api/device` with a single **Bypass** policy
+   (Everyone). Shipped Pis call `/api/device/status` and `/api/device/claim`
+   from their Remote Access tab, and they hold neither a service token nor a
+   browser session — the gate for these endpoints is application-level: a
+   per-device `claim_secret` minted by `/api/provision` (only its sha256 is
+   stored), compared with `hmac.compare_digest`, plus a small rate limit.
+   Device requests must send a real `User-Agent` header (Cloudflare's Browser
+   Integrity Check rejects Python-urllib's default with error 1010).
 
 ## Day-to-day flow
 
 1. **Bench**: run `pi_setup/provision_pi.py` on a new Pi → it registers itself
-   and appears on `/admin` as *unassigned* (only admins can open it).
-2. **Assign**: on `/admin`, enter the customer's email next to the device.
-   This edits the device's Cloudflare Access policy; the customer can sign in
-   immediately at the portal and open their simulator.
+   and appears on `/admin` as *unassigned* (only admins can open it). The
+   response includes a fresh `claim_secret` the Pi stores; **re-provisioning
+   rotates it** (older images of that device can no longer claim — intended).
+2. **Assign**: either the customer self-registers from the device's Remote
+   Access tab (WiFi → enter email → `/api/device/claim`), or an admin enters
+   the email on `/admin`. Both edit the device's Cloudflare Access policy; the
+   customer can sign in immediately at the portal and open their simulator.
+   A device claim replaces the previous device claim (one self-registered
+   email per device, shown as "(device)" on `/admin`) but never touches
+   admin-added assignments; it stays until re-claimed or unassigned.
 3. **Unassign / Decommission**: same page. Note: unassigning removes the
    policy entry, but an already-signed-in session lasts until its 24h expiry.
    To cut access instantly, also use Zero Trust → My Team → Users → Revoke
@@ -111,6 +126,12 @@ curl -H "X-Dev-Email: ben@resuture.com" http://localhost:8080/admin
 
 Tests: `python -m pytest portal/tests` (JWT verification against a local
 RS256 keypair; provision/assign flows with the Cloudflare API mocked).
+
+## Deploying schema changes
+
+`db.init_db()` migrates the SQLite database in place at boot (e.g. adding
+`devices.claim_secret_hash`). Still: back up `/var/lib/resuture-portal/portal.db`
+before deploying a version that changes the schema.
 
 ## Security notes
 

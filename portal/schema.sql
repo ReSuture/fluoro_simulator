@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS devices (
     access_policy_id TEXT NOT NULL,                 -- the allow policy edited on assign
     dns_record_id    TEXT NOT NULL,                 -- for clean decommission
     notes            TEXT NOT NULL DEFAULT '',
+    claim_secret_hash TEXT,                         -- sha256 hex of the device's claim secret
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

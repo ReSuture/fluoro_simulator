@@ -13,9 +13,12 @@ Run (local dev):   PORTAL_DEV=1 flask --app portal.app run
                    then send an X-Dev-Email header to impersonate users.
 """
 
+import hashlib
 import hmac
 import re
 import secrets
+import threading
+import time
 
 from flask import (Flask, abort, g, jsonify, redirect, render_template,
                    request, session, url_for)
@@ -89,7 +92,8 @@ def create_app():
                 "hostname": d["hostname"],
                 "notes": d["notes"],
                 "created_at": d["created_at"],
-                "emails": db.device_emails(d["device_id"]),
+                "emails": [{"email": e, "by_device": by == "device"}
+                           for (e, by) in db.get_assignments(d["device_id"])],
                 "status": statuses.get(d["tunnel_id"], "unknown"),
                 "online": status.is_online(statuses.get(d["tunnel_id"])),
             })
@@ -100,10 +104,19 @@ def create_app():
     def admin():
         return render_template("admin.html", devices=_admin_rows(), email=g.email)
 
+    def _cf_disabled():
+        """Local development without a Cloudflare account: the DB is the only
+        state, so the provision/claim/assign flows can run fully offline."""
+        return config.DEV_MODE and not config.CF_API_TOKEN
+
     def _sync_access_policy(device):
         """Push the device's allowed-email set (customers + admins) to its
         Cloudflare Access policy. Admins stay on every policy for support."""
         emails = set(db.device_emails(device["device_id"])) | set(config.ADMIN_EMAILS)
+        if _cf_disabled():
+            app.logger.info("DEV_MODE: skipping Access policy sync for %s: %s",
+                            device["device_id"], sorted(emails))
+            return
         cf_api.set_access_policy_emails(
             device["access_app_id"], device["access_policy_id"], emails
         )
@@ -189,18 +202,39 @@ def create_app():
 
         hostname = config.device_hostname(device_id)
 
+        # Every provision (first or re-run) mints a fresh claim secret; the Pi
+        # stores it and later uses it to authenticate /api/device requests.
+        # Only its sha256 is kept here, so a stolen portal DB can't claim.
+        claim_secret = secrets.token_urlsafe(32)
+        claim_hash = hashlib.sha256(claim_secret.encode()).hexdigest()
+
         # Idempotent re-run: an already-registered device just gets its tunnel
-        # token re-issued (e.g. the bench script died after registration).
+        # token re-issued (e.g. the bench script died after registration). The
+        # claim secret rotates — re-provisioning means the device is in hand,
+        # and whatever secret older images hold stops working.
         existing = db.get_device(device_id)
         if existing:
-            token = cf_api.get_tunnel_token(existing["tunnel_id"])
-            db.audit("provisioner", "provision", device_id, rerun=True)
+            token = ("dev-tunnel-token" if _cf_disabled()
+                     else cf_api.get_tunnel_token(existing["tunnel_id"]))
+            db.set_claim_secret_hash(device_id, claim_hash)
+            db.audit("provisioner", "provision", device_id, rerun=True,
+                     secret_rotated=True)
             return jsonify(device_id=device_id, hostname=existing["hostname"],
-                           tunnel_token=token, existing=True)
+                           tunnel_token=token, claim_secret=claim_secret,
+                           existing=True)
 
         # Order matters: the Access app must exist before the DNS record so the
         # hostname is never publicly reachable ungated. New devices allow
         # admins only until an admin assigns a customer.
+        if _cf_disabled():
+            db.insert_device(device_id, hostname, "dev-tun-" + device_id,
+                             "dev-app", "dev-pol", "dev-dns", notes,
+                             claim_secret_hash=claim_hash)
+            db.audit("provisioner", "provision", device_id, hostname=hostname,
+                     dev_mode=True)
+            return jsonify(device_id=device_id, hostname=hostname,
+                           tunnel_token="dev-tunnel-token",
+                           claim_secret=claim_secret, existing=False)
         created = {}  # for rollback
         try:
             app_id, policy_id = cf_api.create_access_app(
@@ -219,10 +253,11 @@ def create_app():
             abort(500, description="Cloudflare provisioning failed (rolled back): %s" % exc)
 
         db.insert_device(device_id, hostname, tunnel_id, app_id, policy_id,
-                         dns_record_id, notes)
+                         dns_record_id, notes, claim_secret_hash=claim_hash)
         db.audit("provisioner", "provision", device_id, hostname=hostname)
         return jsonify(device_id=device_id, hostname=hostname,
-                       tunnel_token=token, existing=False)
+                       tunnel_token=token, claim_secret=claim_secret,
+                       existing=False)
 
     def _rollback_provision(created):
         if "dns_record_id" in created:
@@ -241,12 +276,88 @@ def create_app():
             except cf_api.CfApiError:
                 pass
 
+    # ── Device API (shipped Pis) ──────────────────────────────────────────────
+    #
+    # Called by the FluoroSim Remote Access tab on customer devices. Shipped
+    # Pis have neither an Access service token nor a browser session, so these
+    # paths sit behind a path-scoped Access application with a Bypass policy
+    # (see portal/README.md); the real gate is the per-device claim secret
+    # minted at provisioning, plus a small rate limit against guessing.
+
+    _rl_lock = threading.Lock()
+    _rl_hits = {}  # key -> [timestamps]
+    RL_MAX, RL_WINDOW = 10, 300.0
+
+    def _rate_limit(*keys):
+        now = time.monotonic()
+        with _rl_lock:
+            for key in keys:
+                hits = [t for t in _rl_hits.get(key, []) if now - t < RL_WINDOW]
+                if len(hits) >= RL_MAX:
+                    _rl_hits[key] = hits
+                    abort(429, description="Too many requests — try again later.")
+                hits.append(now)
+                _rl_hits[key] = hits
+
+    def _authenticate_device(body):
+        """Return the device row iff body carries its valid claim secret.
+
+        Uniform 403 whether the device id is unknown, has no secret on file
+        (pre-rotation record), or the secret is wrong — no existence leak.
+        """
+        device_id = str(body.get("device_id", "")).strip().lower()
+        secret = str(body.get("claim_secret", ""))
+        _rate_limit("ip:%s" % request.remote_addr, "dev:%s" % device_id)
+        device = db.get_device(device_id) if _DEVICE_ID_RE.match(device_id) else None
+        stored = device["claim_secret_hash"] if device else None
+        presented = hashlib.sha256(secret.encode()).hexdigest()
+        if not stored or not hmac.compare_digest(presented, stored):
+            abort(403, description="Unknown device or bad claim secret.")
+        return device
+
+    def _device_claimed_email(device_id):
+        emails = [e for (e, by) in db.get_assignments(device_id) if by == "device"]
+        return emails[0] if emails else None
+
+    @app.post("/api/device/status")
+    def device_status():
+        # POST, not GET: the claim secret must never appear in a URL or log.
+        body = request.get_json(silent=True) or {}
+        device = _authenticate_device(body)
+        return jsonify(device_id=device["device_id"], hostname=device["hostname"],
+                       claimed_email=_device_claimed_email(device["device_id"]))
+
+    @app.post("/api/device/claim")
+    def device_claim():
+        body = request.get_json(silent=True) or {}
+        device = _authenticate_device(body)
+        device_id = device["device_id"]
+        email = str(body.get("email", "")).strip().lower()
+        if not _EMAIL_RE.match(email):
+            abort(400, description="That doesn't look like an email address.")
+        removed = db.replace_device_claim(device_id, email)
+        try:
+            _sync_access_policy(device)
+        except cf_api.CfApiError as exc:
+            # Same invariant as admin assign: never claim access that
+            # Cloudflare Access won't actually grant.
+            db.remove_assignment(device_id, email)
+            db.restore_assignments(device_id, removed)
+            db.audit("device:%s" % device_id, "cf_error", device_id,
+                     op="claim", error=str(exc))
+            abort(500, description="Could not update remote access — try again.")
+        db.audit("device:%s" % device_id, "claim", device_id, email=email,
+                 replaced=[e for (e, _by) in removed])
+        return jsonify(device_id=device_id, hostname=device["hostname"],
+                       claimed_email=email)
+
     # ── Errors ────────────────────────────────────────────────────────────────
 
     @app.errorhandler(400)
     @app.errorhandler(401)
     @app.errorhandler(403)
     @app.errorhandler(404)
+    @app.errorhandler(429)
     @app.errorhandler(500)
     def error_page(err):
         if request.path.startswith("/api/"):

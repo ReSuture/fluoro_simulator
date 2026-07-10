@@ -32,6 +32,11 @@ def init_db():
         conn.execute("PRAGMA journal_mode = WAL")
         with open(_SCHEMA_PATH, encoding="utf-8") as f:
             conn.executescript(f.read())
+        # schema.sql is CREATE TABLE IF NOT EXISTS, so databases created before
+        # a column existed never gain it; patch such columns in place here.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(devices)")}
+        if "claim_secret_hash" not in cols:
+            conn.execute("ALTER TABLE devices ADD COLUMN claim_secret_hash TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -79,14 +84,25 @@ def device_emails(device_id):
 
 
 def insert_device(device_id, hostname, tunnel_id, access_app_id,
-                  access_policy_id, dns_record_id, notes=""):
+                  access_policy_id, dns_record_id, notes="",
+                  claim_secret_hash=None):
     conn = get_db()
     conn.execute(
         """INSERT INTO devices (device_id, hostname, tunnel_id, access_app_id,
-                                access_policy_id, dns_record_id, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                access_policy_id, dns_record_id, notes,
+                                claim_secret_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (device_id, hostname, tunnel_id, access_app_id,
-         access_policy_id, dns_record_id, notes),
+         access_policy_id, dns_record_id, notes, claim_secret_hash),
+    )
+    conn.commit()
+
+
+def set_claim_secret_hash(device_id, claim_secret_hash):
+    conn = get_db()
+    conn.execute(
+        "UPDATE devices SET claim_secret_hash = ? WHERE device_id = ?",
+        (claim_secret_hash, device_id),
     )
     conn.commit()
 
@@ -106,6 +122,57 @@ def remove_assignment(device_id, email):
     conn.execute(
         "DELETE FROM assignments WHERE device_id = ? AND email = ?",
         (device_id, email.lower()),
+    )
+    conn.commit()
+
+
+def get_assignments(device_id):
+    """All assignment rows for a device as (email, created_by) tuples."""
+    rows = get_db().execute(
+        """SELECT email, created_by FROM assignments
+           WHERE device_id = ? ORDER BY email""",
+        (device_id,),
+    ).fetchall()
+    return [(r["email"], r["created_by"]) for r in rows]
+
+
+def replace_device_claim(device_id, email):
+    """Make `email` the device's one device-claimed assignment.
+
+    Atomically removes any prior created_by='device' rows plus any existing
+    row for the same email (so an email an admin already added becomes the
+    device claim deterministically), then inserts the new claim. Returns the
+    removed (email, created_by) rows so a failed Cloudflare sync can restore
+    them via restore_assignments().
+    """
+    email = email.lower()
+    conn = get_db()
+    removed = conn.execute(
+        """SELECT email, created_by FROM assignments
+           WHERE device_id = ? AND (created_by = 'device' OR email = ?)""",
+        (device_id, email),
+    ).fetchall()
+    removed = [(r["email"], r["created_by"]) for r in removed]
+    conn.execute(
+        """DELETE FROM assignments
+           WHERE device_id = ? AND (created_by = 'device' OR email = ?)""",
+        (device_id, email),
+    )
+    conn.execute(
+        "INSERT INTO assignments (device_id, email, created_by) VALUES (?, ?, 'device')",
+        (device_id, email),
+    )
+    conn.commit()
+    return removed
+
+
+def restore_assignments(device_id, rows):
+    """Re-insert assignment rows removed by replace_device_claim (rollback)."""
+    conn = get_db()
+    conn.executemany(
+        """INSERT OR IGNORE INTO assignments (device_id, email, created_by)
+           VALUES (?, ?, ?)""",
+        [(device_id, email, created_by) for (email, created_by) in rows],
     )
     conn.commit()
 

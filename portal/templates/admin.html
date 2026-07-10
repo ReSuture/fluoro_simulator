@@ -22,14 +22,15 @@
           {% if d.notes %}<div class="hint">{{ d.notes }}</div>{% endif %}</td>
       <td><a href="https://{{ d.hostname }}/">{{ d.hostname }}</a></td>
       <td>
-        {% for e in d.emails %}
+        {% for a in d.emails %}
           <form class="inline" method="post"
                 action="{{ url_for('unassign', device_id=d.device_id) }}">
             <input type="hidden" name="csrf" value="{{ csrf_token() }}">
-            <input type="hidden" name="email" value="{{ e }}">
-            <span class="chip">{{ e }}
-              <button class="chipx" title="Unassign {{ e }}"
-                      onclick="return confirm('Remove {{ e }} from {{ d.device_id }}?')">&times;</button>
+            <input type="hidden" name="email" value="{{ a.email }}">
+            <span class="chip">{{ a.email }}{% if a.by_device %}
+              <span class="hint" title="Self-registered from the device's Remote Access tab">(device)</span>{% endif %}
+              <button class="chipx" title="Unassign {{ a.email }}"
+                      onclick="return confirm('Remove {{ a.email }} from {{ d.device_id }}?')">&times;</button>
             </span>
           </form>
         {% else %}
