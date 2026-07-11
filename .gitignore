@@ -1,0 +1,21 @@
+# Self-signed TLS material for the web control panel — never commit the private key
+cert.pem
+key.pem
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Runtime log from the desktop launcher
+launch.log
+
+# Runtime log from the headless server launch
+server.log
+
+# Portal runtime data — customer emails and device ids live here, never commit
+portal/*.db
+portal/*.db-wal
+portal/*.db-shm
+
+# Pytest cache
+.pytest_cache/

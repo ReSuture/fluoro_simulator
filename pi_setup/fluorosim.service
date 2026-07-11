@@ -1,0 +1,19 @@
+[Unit]
+Description=FluoroSim simulation window and web control panel
+# Needs the desktop session up so the FLUORO window can open on the display.
+After=graphical-session.target
+
+[Service]
+# %h = the user's home directory, so the unit works for any username.
+ExecStart=%h/fluoro_simulator/launch_fluoro.sh
+# Bring the sim back automatically if it crashes, but stay stopped when
+# quit deliberately (Quit button / systemctl --user stop fluorosim).
+Restart=on-failure
+RestartSec=3
+# At boot the service can start before the desktop is up; window creation then
+# fails until the display appears. Never stop retrying, so it comes up as soon
+# as the session is ready.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=default.target

@@ -54,15 +54,106 @@ Make sure `skel.jpg` is in the same folder as the script before running, or it w
 | `2`       | Toggle anatomy overlay                              |
 | `3`       | Fullscreen                                          |
 | `4`       | Windowed mode                                       |
-| `5`       | Retake the background image used in subtraction     |
+| `5`       | Toggle the anatomy overlay (off = full raw video)   |
 | `6`       | Toggle histogram equalization                       |
 | `7`       | Toggle the HUD (on-screen text display)             |
 | `b`       | Acts as the pedal press (keyboard stand-in)         |
 
 > When **pedal mode** is on, frames are only captured while the pedal is held (or the `b` key is pressed). When it's off, the simulator captures continuously.
+>
+> Keys `2` and `5` both toggle the overlay. With the overlay **off**, the simulator shows the full raw video with the bright/white areas intact (nothing removed).
+
+## Web control panel (`fluoro_web.py`)
+
+`fluoro_web.py` runs the same simulation (the fullscreen `FLUORO` window and the keyboard shortcuts above) **and** serves a small web page so the simulation can be controlled from a phone, tablet, or any browser on the same network — handy for operating the demo from a tablet while the monitor shows the fluoro view.
+
+### What it provides
+
+- A **live preview** (MJPEG stream) of the processed feed.
+- On/off **toggle buttons** mirroring the keyboard shortcuts: Subtraction, Overlay, Equalize, Pedal mode, Pedal press, and HUD. Toggles stay in sync whether you use the web buttons or the keyboard.
+- **Fullscreen / Windowed** buttons that control both the `FLUORO` popup window on the computer **and** the live preview in your browser, plus a **Quit** button.
+
+### Requirements
+
+In addition to the base requirements, install Flask:
+
+```bash
+pip install flask
+```
+
+### Usage
+
+```bash
+python fluoro_web.py [<video device number>] [--port 5000] [--no-window] [--http]
+```
+
+- `<video device number>` — camera index (default `0`).
+- `--port` — web server port (default `5000`).
+- `--no-window` — run web-only, without the on-screen `FLUORO` window.
+- `--http` — force plain HTTP even if a TLS cert is present.
+
+Then open `https://<this-machine-ip>:<port>/` in a browser (or `http://…` if running without a cert).
+
+### HTTPS (self-signed cert)
+
+Some browsers force `https://`. If `cert.pem` and `key.pem` are present next to the script, the panel is served over HTTPS automatically. Generate a self-signed cert (valid ~2 years) with:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem \
+    -days 825 -subj "/CN=FluoroSim" \
+    -addext "subjectAltName=IP:<your-lan-ip>,DNS:localhost,IP:127.0.0.1"
+```
+
+The browser will show a one-time "not private" warning for the self-signed cert — click through to proceed. `cert.pem` and `key.pem` are git-ignored, so the private key is never committed; each machine generates its own.
+
+> **Fullscreen note:** the panel forces OpenCV's X11/XWayland Qt backend (`QT_QPA_PLATFORM=xcb`) so the Fullscreen/Windowed controls can actually toggle the `FLUORO` window — the native Wayland backend ignores those calls.
+
+## Running as a service (auto-start, crash recovery)
+
+`pi_setup/fluorosim.service` is a systemd **user** unit that runs `launch_fluoro.sh`
+under supervision: the simulator starts automatically at boot (once the desktop
+session is up) and restarts itself within a few seconds if it crashes. A deliberate
+quit (the web panel's **Quit** button or `ESC` on the `FLUORO` window) stays stopped —
+only crashes trigger a restart.
+
+Install on a new machine:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp pi_setup/fluorosim.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now fluorosim.service
+```
+
+Manage it with `systemctl --user {start,stop,restart,status} fluorosim`. The
+app's output goes to `launch.log` in this directory (via `launch_fluoro.sh`),
+not the journal. Auto-start at boot assumes the machine logs the user into the
+desktop automatically (standard Raspberry Pi OS autologin).
+
+The `FluoroSim.desktop` shortcut runs `systemctl --user restart fluorosim.service`,
+so the desktop button (re)launches the supervised service in any state — stopped,
+running, or wedged.
+
+## Remote access: customer portal + Cloudflare Tunnel
+
+Customer devices are reachable from anywhere through a per-device Cloudflare
+Tunnel and a sign-in portal:
+
+- **`portal/`** — the multi-tenant portal (Flask). Customers sign in through
+  Cloudflare Access and open their own Pi's panel at
+  `https://sim-<device-id>.<device-domain>/`. Admins assign devices to
+  customer emails at `/admin`. Deployment runbook: `portal/README.md`.
+- **`pi_setup/`** — bench provisioning for new Pis (`provision_pi.py`) and the
+  canonical `fluorosim.service`. Manufacturing checklist: `pi_setup/README.md`.
+
+On tunneled customer devices, `launch_fluoro.sh` starts the panel with
+`--host 127.0.0.1 --http`: port 5000 is unreachable from the LAN, the local
+`cloudflared` is the only way in, and Cloudflare Access enforces the sign-in
+at the edge (the panel itself has no auth). For a LAN-only demo machine, run
+`python3 fluoro_web.py` directly — it still binds `0.0.0.0:5000` by default.
 
 ## Notes
 
-- Tuning knobs live near the top of the main loop: `mask_threshold` (background mask cutoff) and `alpha` (running-background accumulation weight).
+- Tuning knobs live near the top of the processing code: the background mask cutoff (`MASK_THRESHOLD` / `mask_threshold`), the running-background accumulation weight (`ALPHA` / `alpha`), and the overlay blend weights (bright areas 30% video / 70% overlay; vasculature 60% video / 40% overlay).
 - The `FLUORO` window opens full-screen by default; use `4` to drop into a normal window.
 - This is a demonstration/training tool and is **not** a medical device.

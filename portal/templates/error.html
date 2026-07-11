@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ error.code }} — ReSuture Portal{% endblock %}
+{% block heading %}{{ error.name }}{% endblock %}
+{% block content %}
+<div class="card empty">
+  <p>{{ error.description }}</p>
+  <p class="hint"><a href="{{ url_for('home') }}">&larr; back to the portal</a></p>
+</div>
+{% endblock %}
