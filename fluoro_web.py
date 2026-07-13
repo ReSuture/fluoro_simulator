@@ -230,9 +230,6 @@ PAGE = """
   button.quit { background: #2a1416; border-color: #5b2327; color: #ff9a9a; }
   button.quit.on { background: #3b1013; border-color: #f04438; }
   .hint { color: #7d8a99; font-size: 12px; margin: 14px 2px 0; }
-  .liblink { color: #7af0b6; font-size: 14px; font-weight: 600; text-decoration: none;
-             border: 1px solid #26323f; border-radius: 999px; padding: 6px 16px; }
-  .liblink:active { transform: translateY(1px); }
   .posctl { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
   .posctl label { display: flex; align-items: center; gap: 6px; color: #7d8a99; font-size: 14px; }
   .posctl input { width: 90px; font-size: 16px; padding: 12px 10px; border-radius: 10px;
@@ -247,9 +244,6 @@ PAGE = """
     <span id="dot" class="dot"></span>
     <h1>NAVISLab Controls</h1>
   </div>
-  {% if library_url %}
-  <a class="liblink" href="{{ library_url }}" target="_blank" rel="noopener">Session Library &#8599;</a>
-  {% endif %}
 </header>
 <main>
   <div class="stage" id="stage">
@@ -374,11 +368,7 @@ setInterval(refresh, 1500);
 @app.route("/")
 def index():
     '''Serve the single-page control panel.'''
-    # Provisioned devices link straight to their portal's session library;
-    # unprovisioned (bench/LAN) boxes have no portal, so the link is hidden.
-    portal_url = device_setup.read_identity()["portal_url"]
-    return render_template_string(
-        PAGE, library_url=portal_url + "/library" if portal_url else None)
+    return render_template_string(PAGE)
 
 
 @app.route("/api/state")
