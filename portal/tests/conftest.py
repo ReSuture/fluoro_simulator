@@ -21,6 +21,7 @@ from portal import config
 @pytest.fixture()
 def app(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DATABASE_PATH", str(tmp_path / "portal.db"))
+    monkeypatch.setattr(config, "VIDEO_DIR", str(tmp_path / "videos"))
     from portal.app import create_app
     application = create_app()
     application.config["TESTING"] = True

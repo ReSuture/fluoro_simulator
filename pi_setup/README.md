@@ -10,6 +10,7 @@ Cloudflare Access (only the assigned customer + ReSuture admins can open it).
 - Raspberry Pi OS with desktop autologin (standard image), camera attached.
 - This repo cloned at `~/fluoro_simulator`.
 - App dependencies: `pip install opencv-python numpy flask`.
+- `ffmpeg` for the Library auto-upload (the provision script installs it).
 - From the portal operator (see `portal/README.md`): the portal URL, the
   `PROVISION_TOKEN`, and the Access service-token id/secret for the bench.
 
@@ -52,6 +53,12 @@ It leaves three files in `/etc/fluorosim/`:
 The claim secret lets the customer self-register their email from the app's
 **Remote Access** tab (WiFi → email → done). **Every re-provision rotates
 it** — old images of the device can no longer claim; that's intended.
+
+The same secret authenticates the **Library auto-upload**: when a Record
+session ends, the app transcodes it to MP4 and uploads it to the portal's
+`/library`. The Library tab shows a dot per recording — green (in the
+portal library), amber (upload pending/retrying), red (failed), grey (local
+only, e.g. unprovisioned).
 
 Afterwards the device shows up as **unassigned** on the portal's `/admin`
 page; the customer self-registers from the Remote Access tab, or assign

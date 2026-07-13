@@ -34,6 +34,7 @@ class Recorder:
         self._last_submit = 0.0
         self.error = None
         self.dropped = 0
+        self.path = None  # file being written while active (uploader skips it)
 
     @property
     def active(self):
@@ -58,6 +59,7 @@ class Recorder:
             self.error = "Cannot open video writer for %s" % path
             return False
         self._queue = queue.Queue(maxsize=90)
+        self.path = path
         self._started_at = time.monotonic()
         self._thread = threading.Thread(target=self._worker,
                                         args=(writer, self._queue), daemon=True)

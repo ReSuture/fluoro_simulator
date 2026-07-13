@@ -58,3 +58,11 @@ button.chipx { border: 0; background: none; color: #7d8a99; padding: 0 4px;
 button.chipx:hover { color: #ff9a9a; }
 code { background: #131a22; border: 1px solid #26323f; border-radius: 6px;
        padding: 1px 6px; }
+
+/* Session library */
+.cards.vids { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+.card video { width: 100%; border-radius: 8px; background: #000; aspect-ratio: 4 / 3; }
+form.titlerow { display: flex; gap: 8px; }
+input.titlebox { flex: 1; min-width: 0; font-size: 15px; font-weight: 600;
+                 padding: 8px 10px; border-radius: 8px; border: 1px solid #26323f;
+                 background: #0b0f14; color: #e7edf3; }

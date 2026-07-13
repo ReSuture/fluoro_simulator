@@ -3,18 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{% block title %}ReSuture Portal{% endblock %}</title>
+<title>{% block title %}NAVISLab Portal{% endblock %}</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
 <header>
   <img class="logo" src="{{ url_for('static', filename='logosign_white.png') }}" alt="ReSuture logo">
   <div class="titlerow">
-    <h1>{% block heading %}Simulator Portal{% endblock %}</h1>
+    <h1>{% block heading %}NAVISLab Portal{% endblock %}</h1>
   </div>
   {% if email %}
   <div class="whoami">
     Signed in as <strong>{{ email }}</strong>
+    · <a href="{{ url_for('library_page') }}">Library</a>
     {% if is_admin %} · <a href="{{ url_for('admin') }}">Admin</a>{% endif %}
   </div>
   {% endif %}
@@ -23,7 +24,7 @@
 {% block content %}{% endblock %}
 </main>
 <footer>
-  <span class="hint">ReSuture FluoroSim — for training and demonstration; not a medical device.</span>
+  <span class="hint">ReSuture NAVISLab — for training and demonstration; not a medical device.</span>
 </footer>
 </body>
 </html>

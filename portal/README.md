@@ -37,6 +37,9 @@ Customer browser
 | `DATABASE_PATH` | `/var/lib/resuture-portal/portal.db` |
 | `SIM_DOMAIN_SUFFIX` | `.resuturesim.com` (leading dot) |
 | `FLASK_SECRET_KEY` | another `secrets.token_urlsafe(32)` |
+| `VIDEO_DIR` | *(optional)* uploaded session videos; default `videos/` next to the DB |
+| `VIDEO_MAX_UPLOAD_MB` | *(optional, default 95)* per-file cap — keep under Cloudflare's 100 MB free-plan request limit |
+| `VIDEO_QUOTA_GB` | *(optional, default 20)* total video storage; uploads are refused (HTTP 507) beyond it |
 | `PORTAL_DEV` | `1` only for local development — enables the `X-Dev-Email` auth bypass. **Never set in production.** |
 
 ## One-time Cloudflare setup (Phase 0)
@@ -111,6 +114,25 @@ created by the portal itself):
    policy entry, but an already-signed-in session lasts until its 24h expiry.
    To cut access instantly, also use Zero Trust → My Team → Users → Revoke
    sessions for that user.
+
+## Session video library
+
+Devices auto-upload finished recordings (transcoded to H.264 MP4 on the Pi)
+to `POST /api/device/videos` — the same claim-secret gate and path-scoped
+Bypass Access app as the other `/api/device` endpoints, plus sha256 dedupe so
+retries never duplicate. Signed-in users see them at `/library`:
+
+- A video belongs to its **device**: every email assigned to the device can
+  play, rename, **share**, and delete it. Admins can manage everything.
+- Sharing grants **view-only** access to any email — the colleague signs in
+  with the usual one-time-PIN flow and finds the video in their `/library`
+  (no simulator required). Recipients can remove themselves.
+- Storage: files live in `VIDEO_DIR`, capped by `VIDEO_QUOTA_GB`; when full,
+  devices show "server storage full" until someone deletes old videos.
+  Decommissioning a device deletes its videos and files.
+- **Caveat**: because visibility follows the device's *current* assignments,
+  reassigning a device to a new customer hands them its whole library —
+  delete the videos first if that matters.
 
 ## Local development (no Cloudflare needed)
 

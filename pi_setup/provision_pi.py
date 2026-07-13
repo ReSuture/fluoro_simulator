@@ -88,6 +88,14 @@ def install_cloudflared():
     os.remove(deb)
 
 
+def install_ffmpeg():
+    """The Library auto-upload transcodes recordings to MP4 with ffmpeg."""
+    if shutil.which("ffmpeg"):
+        log("ffmpeg already installed")
+        return
+    run(["sudo", "apt-get", "install", "-y", "ffmpeg"])
+
+
 # ── Portal registration ───────────────────────────────────────────────────────
 
 def register_with_portal(args, device_id):
@@ -223,6 +231,7 @@ def main():
     log("device id: %s" % device_id)
 
     install_cloudflared()
+    install_ffmpeg()
 
     result = register_with_portal(args, device_id)
     hostname = result["hostname"]
