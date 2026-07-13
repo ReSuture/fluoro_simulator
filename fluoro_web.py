@@ -75,6 +75,7 @@ from flask import Flask, Response, jsonify, render_template_string, request
 
 import device_setup
 import recording
+import uploader
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -543,6 +544,7 @@ C_QUIT_BD  = (39, 35, 91)     # #5b2327
 C_QUIT_TX  = (154, 154, 255)  # #ff9a9a
 C_DOT_OFF  = (56, 68, 240)    # #f04438
 C_DOT_ON   = (106, 183, 18)   # #12b76a
+C_DOT_WAIT = (18, 180, 240)   # #f0b412 — upload pending/in progress
 
 # Button hit-boxes (x, y, w, h, kind, name), rebuilt every render. `ctrl_buttons`
 # are positions inside the separate CONTROLS window (windowed); `overlay_buttons`
@@ -1006,6 +1008,12 @@ def handle_setup_button(name):
 
 recorder = recording.Recorder()
 
+# Background auto-upload of finished recordings to the portal library (no-op
+# until the device is provisioned). Skips whatever file the recorder still
+# has open; poked whenever a recording stops so uploads start promptly.
+uploads = uploader.Uploader(
+    active_path_fn=lambda: recorder.path if recorder.active else None)
+
 LIB_ROWS = 7  # recordings shown per page
 
 
@@ -1199,10 +1207,16 @@ def render_library_view(W, H):
         e = library.entries[i]
         rounded_rect(img, m, y, W - 2 * m, row_h - 6, 8, C_BTN_BG, -1)
         rounded_rect(img, m, y, W - 2 * m, row_h - 6, 8, C_BTN_BD, 1)
+        # Upload-status dot: green = in the portal library, amber = pending/
+        # retrying, red = failed for good, grey = local only (unprovisioned).
+        st = uploads.status_for(e["name"])
+        dot = {None: C_BTN_BD, "uploaded": C_DOT_ON,
+               "failed": C_DOT_OFF}.get(st, C_DOT_WAIT)
+        cv.circle(img, (m + 15, y + (row_h - 6) // 2), 5, dot, -1, cv.LINE_AA)
         name = e["name"]
-        if len(name) > 34:
-            name = name[:33] + "~"
-        text(name, m + 12, y + 25, 0.5)
+        if len(name) > 31:
+            name = name[:30] + "~"
+        text(name, m + 28, y + 25, 0.5)
         text(_fmt_when(e["mtime"]), m + 320, y + 25, 0.45, C_SUBTEXT)
         text(library.duration(e["path"]), m + 470, y + 25, 0.45, C_SUBTEXT)
         bx = W - m - 200
@@ -1225,6 +1239,10 @@ def render_library_view(W, H):
             draw_button(img, m + 98, y, 90, 30, "Next", None, False)
             buttons.append((m + 98, y, 90, 30, "lib", "page_next"))
         y += 38
+    summary = uploads.snapshot()["summary"]
+    if summary:
+        text(str(summary)[:90], m, y + 20, 0.45, C_SUBTEXT)
+        y += 18
     if library.error:
         text(str(library.error)[:90], m, y + 24, 0.5, C_QUIT_TX)
     return img, buttons
@@ -1442,6 +1460,7 @@ def run_simulation(cam_index, show_window):
         if not s["running"]:
             if recorder.active:
                 recorder.stop()
+                uploads.poke()
                 with state_lock:
                     state["recording"] = False
             if cap is not None:
@@ -1575,6 +1594,7 @@ def run_simulation(cam_index, show_window):
                 library.error = recorder.error
         elif not s["recording"] and recorder.active:
             recorder.stop()
+            uploads.poke()
 
         rec_elapsed = recorder.elapsed_str() if recorder.active else None
 
@@ -1706,6 +1726,7 @@ if __name__ == "__main__":
                                ssl_context=ssl_context),
         daemon=True)
     flask_thread.start()
+    uploads.start()   # auto-upload finished recordings to the portal library
     print("Control panel:  %s://<this-machine-ip>:%d/" % (scheme, port))
     if use_https:
         print("(self-signed cert — your browser will show a one-time "

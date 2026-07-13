@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Library — ReSuture{% endblock %}
+{% block heading %}Session Library{% endblock %}
+{% block content %}
+
+<p class="hint"><a href="{{ url_for('home') }}">&larr; back to my devices</a></p>
+
+{% if videos %}
+<div class="cards vids">
+  {% for v in videos %}
+  <div class="card">
+    <video controls preload="metadata"
+           src="{{ url_for('video_stream', video_id=v.video_id) }}"></video>
+
+    {% if v.manage %}
+    <form method="post" class="titlerow"
+          action="{{ url_for('video_title', video_id=v.video_id) }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <input class="titlebox" type="text" name="title" value="{{ v.title }}"
+             maxlength="120" required>
+      <button type="submit" title="Rename">Save</button>
+    </form>
+    {% else %}
+    <div class="devname">{{ v.title }}</div>
+    {% endif %}
+
+    <div class="hint">
+      Simulator {{ v.device_id }} · {{ v.recorded_at }} UTC
+      · {{ '%d:%02d' % (v.duration_s // 60, v.duration_s % 60) }}
+      · {{ '%.1f' % (v.size / 1048576) }} MB
+    </div>
+
+    {% if v.manage %}
+    <div>
+      {% for s in v.shares %}
+      <form class="inline" method="post"
+            action="{{ url_for('video_unshare', video_id=v.video_id) }}">
+        <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+        <input type="hidden" name="email" value="{{ s }}">
+        <span class="chip">{{ s }}
+          <button class="chipx" title="Stop sharing with {{ s }}">&times;</button>
+        </span>
+      </form>
+      {% endfor %}
+      <form class="inline" method="post"
+            action="{{ url_for('video_share', video_id=v.video_id) }}">
+        <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+        <input type="email" name="email" placeholder="share with an email" required>
+        <button type="submit">Share</button>
+      </form>
+    </div>
+    <form method="post" action="{{ url_for('video_delete', video_id=v.video_id) }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <button class="danger"
+              onclick="return confirm('Delete “{{ v.title }}” for everyone it is shared with?')">
+        Delete
+      </button>
+    </form>
+    {% else %}
+    <form method="post" action="{{ url_for('video_unshare', video_id=v.video_id) }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <input type="hidden" name="email" value="{{ email }}">
+      <button title="This video was shared with you — remove it from your library">
+        Remove from my library
+      </button>
+    </form>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card empty">
+  <p>No session videos yet.</p>
+  <p class="hint">Press <strong>Record</strong> on your simulator during a
+    session — the recording uploads here automatically when you stop, as long
+    as the device is online.</p>
+</div>
+{% endif %}
+
+{% endblock %}

@@ -183,6 +183,113 @@ def delete_device(device_id):
     conn.commit()
 
 
+# ── Videos ────────────────────────────────────────────────────────────────────
+
+def insert_video(video_id, device_id, title, sha256, size, duration_s,
+                 recorded_at):
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO videos (video_id, device_id, title, sha256, size,
+                               duration_s, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (video_id, device_id, title, sha256, size, duration_s, recorded_at),
+    )
+    conn.commit()
+
+
+def get_video(video_id):
+    return get_db().execute(
+        "SELECT * FROM videos WHERE video_id = ?", (video_id,)
+    ).fetchone()
+
+
+def find_video_by_sha(device_id, sha256):
+    """The retry-dedupe lookup: has this device already uploaded these bytes?"""
+    return get_db().execute(
+        "SELECT * FROM videos WHERE device_id = ? AND sha256 = ?",
+        (device_id, sha256),
+    ).fetchone()
+
+
+def videos_for_email(email):
+    """Videos the email may see: its devices' videos plus explicit shares.
+
+    Each row carries `via` = 'device' (may manage) or 'share' (view only);
+    a video reachable both ways surfaces once as manageable.
+    """
+    return get_db().execute(
+        """SELECT v.*, MIN(via) AS via FROM (
+               SELECT v.video_id, 'device' AS via FROM videos v
+               JOIN assignments a ON a.device_id = v.device_id
+               WHERE a.email = ?
+               UNION
+               SELECT s.video_id, 'share' AS via FROM video_shares s
+               WHERE s.email = ?
+           ) r JOIN videos v ON v.video_id = r.video_id
+           GROUP BY v.video_id
+           ORDER BY v.uploaded_at DESC""",
+        (email.lower(), email.lower()),
+    ).fetchall()
+
+
+def all_videos():
+    return get_db().execute(
+        "SELECT * FROM videos ORDER BY uploaded_at DESC"
+    ).fetchall()
+
+
+def videos_for_device(device_id):
+    return get_db().execute(
+        "SELECT * FROM videos WHERE device_id = ? ORDER BY uploaded_at DESC",
+        (device_id,),
+    ).fetchall()
+
+
+def set_video_title(video_id, title):
+    conn = get_db()
+    conn.execute("UPDATE videos SET title = ? WHERE video_id = ?",
+                 (title, video_id))
+    conn.commit()
+
+
+def delete_video(video_id):
+    conn = get_db()
+    conn.execute("DELETE FROM videos WHERE video_id = ?", (video_id,))
+    conn.commit()
+
+
+def video_bytes_total():
+    row = get_db().execute("SELECT COALESCE(SUM(size), 0) AS total FROM videos").fetchone()
+    return row["total"]
+
+
+def add_video_share(video_id, email, created_by):
+    conn = get_db()
+    conn.execute(
+        """INSERT OR IGNORE INTO video_shares (video_id, email, created_by)
+           VALUES (?, ?, ?)""",
+        (video_id, email.lower(), created_by),
+    )
+    conn.commit()
+
+
+def remove_video_share(video_id, email):
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM video_shares WHERE video_id = ? AND email = ?",
+        (video_id, email.lower()),
+    )
+    conn.commit()
+
+
+def video_shares(video_id):
+    rows = get_db().execute(
+        "SELECT email FROM video_shares WHERE video_id = ? ORDER BY email",
+        (video_id,),
+    ).fetchall()
+    return [r["email"] for r in rows]
+
+
 def audit(actor, action, device_id=None, **detail):
     conn = get_db()
     conn.execute(

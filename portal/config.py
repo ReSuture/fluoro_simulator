@@ -38,6 +38,16 @@ PROVISION_TOKEN = _env("PROVISION_TOKEN")
 
 DATABASE_PATH = _env("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "portal.db"))
 
+# Where uploaded session videos live, one <video_id>.mp4 per row in `videos`.
+# Defaults to a `videos/` dir next to the database (/var/lib/resuture-portal).
+VIDEO_DIR = _env("VIDEO_DIR", os.path.join(os.path.dirname(DATABASE_PATH), "videos"))
+
+# Server-side caps for device video uploads. The per-file cap stays under
+# Cloudflare's 100 MB free-plan request limit — a bigger value would just move
+# the failure to the edge, where the Pi gets an unhelpful HTML error page.
+VIDEO_MAX_UPLOAD_BYTES = int(_env("VIDEO_MAX_UPLOAD_MB", "95")) * 1024 * 1024
+VIDEO_QUOTA_BYTES = int(_env("VIDEO_QUOTA_GB", "20")) * 1024 * 1024 * 1024
+
 # Device hostname suffix, with leading dot: ".resuturesim.com".
 SIM_DOMAIN_SUFFIX = _env("SIM_DOMAIN_SUFFIX", "")
 

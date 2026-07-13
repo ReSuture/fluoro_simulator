@@ -15,6 +15,7 @@
   {% if email %}
   <div class="whoami">
     Signed in as <strong>{{ email }}</strong>
+    · <a href="{{ url_for('library_page') }}">Library</a>
     {% if is_admin %} · <a href="{{ url_for('admin') }}">Admin</a>{% endif %}
   </div>
   {% endif %}
