@@ -111,6 +111,28 @@ def _multipart(fields, file_name, file_path):
     return b"\r\n".join(lines), "multipart/form-data; boundary=%s" % boundary
 
 
+class _ProgressBody:
+    '''File-like wrapper over the request body that reports the fraction sent.
+
+    urllib transmits a file-like body in blocks (Content-Length must then be
+    set explicitly), calling read() as each block goes to the socket, so the
+    read position tracks upload progress to within one send buffer.
+    '''
+
+    def __init__(self, data, on_progress):
+        self._data = data
+        self._pos = 0
+        self._on_progress = on_progress
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = len(self._data) - self._pos
+        chunk = self._data[self._pos:self._pos + size]
+        self._pos += len(chunk)
+        self._on_progress(self._pos / float(len(self._data) or 1))
+        return chunk
+
+
 class Uploader:
     '''Owns upload state; the render loop reads it via snapshot()/status_for().
 
@@ -124,6 +146,7 @@ class Uploader:
         self._wake = threading.Event()
         self._state = _load_state()      # name -> {"status","video_id","error",...}
         self._live = {}                  # name -> "queued"|"working"|"retrying"
+        self._progress = {}              # name -> fraction sent (upload phase only)
         self._retry_at = {}              # name -> (monotonic deadline, tries)
         self._summary = None             # one-line notice for the Library tab
         self._thread = None
@@ -148,6 +171,12 @@ class Uploader:
                 return "failed"
             return self._live.get(name)
 
+    def progress_for(self, name):
+        '''Fraction (0.0-1.0) of the file sent while it is uploading, else
+        None — the transcode/hash phases have no measurable fraction.'''
+        with self._lock:
+            return self._progress.get(name)
+
     def snapshot(self):
         with self._lock:
             return {"summary": self._summary, "live": dict(self._live)}
@@ -164,6 +193,13 @@ class Uploader:
                 self._live.pop(name, None)
             else:
                 self._live[name] = status
+
+    def _set_progress(self, name, frac):
+        with self._lock:
+            if frac is None:
+                self._progress.pop(name, None)
+            else:
+                self._progress[name] = frac
 
     def _record(self, name, **entry):
         with self._lock:
@@ -257,6 +293,7 @@ class Uploader:
                 self._set_live(name, None)
                 self._set_summary("Upload of %s failed: %s" % (name, result))
         finally:
+            self._set_progress(name, None)
             if mp4 is not None:
                 try:
                     os.remove(mp4)
@@ -297,9 +334,14 @@ class Uploader:
         }
         body, content_type = _multipart(
             fields, os.path.basename(mp4), mp4)
+        # Stream through a tracking reader so the Library tab can show how
+        # much of the video has been sent.
+        reader = _ProgressBody(
+            body, lambda frac: self._set_progress(e["name"], frac))
         req = urllib.request.Request(
-            identity["portal_url"] + "/api/device/videos", data=body,
+            identity["portal_url"] + "/api/device/videos", data=reader,
             headers={"Content-Type": content_type,
+                     "Content-Length": str(len(body)),
                      "User-Agent": device_setup.USER_AGENT},
             method="POST")
         try:
