@@ -1248,13 +1248,17 @@ def render_library_view(W, H):
             cv.circle(img, (cx, cy), 5, C_DOT_WAIT, -1, cv.LINE_AA)
         else:
             cv.circle(img, (cx, cy), 5, C_BTN_BD, -1, cv.LINE_AA)
-        # Columns are laid out right-to-left from the buttons' edge so the
-        # date and duration can never slide underneath Play/Delete; whatever
-        # width is left after them belongs to the (truncated) file name.
+        # Columns are laid out right-to-left from the buttons' edge, each
+        # placed by its measured text width, so the duration can't overwrite
+        # the timestamp and neither can slide underneath Play/Delete;
+        # whatever width is left belongs to the (truncated) file name.
         bx = W - m - 200
-        date_x, dur_x = bx - 178, bx - 52
-        text(_fmt_when(e["mtime"]), date_x, y + 25, 0.45, C_SUBTEXT)
-        text(library.duration(e["path"]), dur_x, y + 25, 0.45, C_SUBTEXT)
+        when = _fmt_when(e["mtime"])
+        dur = library.duration(e["path"])
+        dur_x = bx - cv.getTextSize(dur, font, 0.45, 1)[0][0] - 12
+        date_x = dur_x - cv.getTextSize(when, font, 0.45, 1)[0][0] - 16
+        text(when, date_x, y + 25, 0.45, C_SUBTEXT)
+        text(dur, dur_x, y + 25, 0.45, C_SUBTEXT)
         name = e["name"]
         name_w = date_x - (m + 28) - 10
         while len(name) > 4 and cv.getTextSize(name, font, 0.5, 1)[0][0] > name_w:
