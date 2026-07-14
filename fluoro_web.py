@@ -1147,7 +1147,7 @@ library = LibraryManager()
 
 
 def _fmt_when(mtime):
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
 
 
 def render_library_view(W, H):
