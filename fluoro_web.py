@@ -114,7 +114,7 @@ CHANGE_DIFF = 10.0
 MASTER_IMAGE = os.path.join(BASE_DIR, "fulltorsofluoroimage.png")
 # Brightness scale applied to the master at load. <1.0 darkens it (pulls the
 # bright/white areas down the most, since it's multiplicative); 1.0 = as-is.
-MASTER_BRIGHTNESS = 0.90
+MASTER_BRIGHTNESS = 1.0
 # Master-image pixels per real centimetre of anatomy.
 PX_PER_CM = 5.0
 # The master pixel that camera coordinate (0, 0) maps to (viewport centre at origin).
@@ -1217,19 +1217,49 @@ def render_library_view(W, H):
         e = library.entries[i]
         rounded_rect(img, m, y, W - 2 * m, row_h - 6, 8, C_BTN_BG, -1)
         rounded_rect(img, m, y, W - 2 * m, row_h - 6, 8, C_BTN_BD, 1)
-        # Upload-status dot: green = in the portal library, amber = pending/
-        # retrying, red = failed for good, grey = local only (unprovisioned).
+        # Upload status: green check = in the portal library, ring = upload
+        # in progress (percent sent inside once measurable, spinner during
+        # the transcode), amber dot = queued/retrying, red X = failed for
+        # good, grey dot = local only (unprovisioned).
         st = uploads.status_for(e["name"])
-        dot = {None: C_BTN_BD, "uploaded": C_DOT_ON,
-               "failed": C_DOT_OFF}.get(st, C_DOT_WAIT)
-        cv.circle(img, (m + 15, y + (row_h - 6) // 2), 5, dot, -1, cv.LINE_AA)
-        name = e["name"]
-        if len(name) > 31:
-            name = name[:30] + "~"
-        text(name, m + 28, y + 25, 0.5)
-        text(_fmt_when(e["mtime"]), m + 320, y + 25, 0.45, C_SUBTEXT)
-        text(library.duration(e["path"]), m + 470, y + 25, 0.45, C_SUBTEXT)
+        cx, cy = m + 15, y + (row_h - 6) // 2
+        if st == "uploaded":
+            cv.line(img, (cx - 6, cy), (cx - 2, cy + 4), C_DOT_ON, 2, cv.LINE_AA)
+            cv.line(img, (cx - 2, cy + 4), (cx + 6, cy - 5), C_DOT_ON, 2, cv.LINE_AA)
+        elif st == "working":
+            frac = uploads.progress_for(e["name"])
+            if frac is None:
+                a0 = int(time.monotonic() * 300) % 360
+                cv.ellipse(img, (cx, cy), (8, 8), 0, a0, a0 + 270,
+                           C_DOT_WAIT, 2, cv.LINE_AA)
+            else:
+                cv.ellipse(img, (cx, cy), (8, 8), 0, 0, 360,
+                           C_BTN_BD, 2, cv.LINE_AA)
+                cv.ellipse(img, (cx, cy), (8, 8), -90, 0, int(360 * frac),
+                           C_DOT_ON, 2, cv.LINE_AA)
+                pct = "%d" % int(frac * 100)
+                (pw, ph), _ = cv.getTextSize(pct, font, 0.3, 1)
+                cv.putText(img, pct, (cx - pw // 2, cy + ph // 2), font, 0.3,
+                           C_TEXT, 1, cv.LINE_AA)
+        elif st == "failed":
+            cv.line(img, (cx - 5, cy - 5), (cx + 5, cy + 5), C_DOT_OFF, 2, cv.LINE_AA)
+            cv.line(img, (cx - 5, cy + 5), (cx + 5, cy - 5), C_DOT_OFF, 2, cv.LINE_AA)
+        elif st in ("queued", "retrying"):
+            cv.circle(img, (cx, cy), 5, C_DOT_WAIT, -1, cv.LINE_AA)
+        else:
+            cv.circle(img, (cx, cy), 5, C_BTN_BD, -1, cv.LINE_AA)
+        # Columns are laid out right-to-left from the buttons' edge so the
+        # date and duration can never slide underneath Play/Delete; whatever
+        # width is left after them belongs to the (truncated) file name.
         bx = W - m - 200
+        date_x, dur_x = bx - 178, bx - 52
+        text(_fmt_when(e["mtime"]), date_x, y + 25, 0.45, C_SUBTEXT)
+        text(library.duration(e["path"]), dur_x, y + 25, 0.45, C_SUBTEXT)
+        name = e["name"]
+        name_w = date_x - (m + 28) - 10
+        while len(name) > 4 and cv.getTextSize(name, font, 0.5, 1)[0][0] > name_w:
+            name = name[:-2] + "~"
+        text(name, m + 28, y + 25, 0.5)
         draw_button(img, bx, y + 4, 80, row_h - 14, "Play", None, False)
         buttons.append((bx, y + 4, 80, row_h - 14, "lib", "play:%d" % i))
         bx += 80 + gap
