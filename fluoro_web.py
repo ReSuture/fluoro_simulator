@@ -130,9 +130,10 @@ PX_PER_CM = 14.2
 ORIGIN_PX = (670, 1845)         # centre of the 1340×3691 master
 # Physical area the detector sees at once, (width_cm, height_cm). Keep 4:3 to match
 # the camera frame. This is the ZOOM knob: larger = zoomed out (more anatomy shown),
-# smaller = zoomed in. Tuned so one frame shows most of the body width (like
-# skel.jpg filled the frame) while leaving room to pan.
-FOV_CM = (80.0, 60.0)
+# smaller = zoomed in. Widened from (80, 60) by 1.17 — the old view at z=+8.5 —
+# so the resting z=0 view shows the full body width; z stays a pure offset from
+# nominal camera height, so the motion controller's z=0 lands on this framing.
+FOV_CM = (93.6, 70.2)
 # Flip a sign if increasing X (or Y) should pan the viewport the opposite way.
 FLIP_X = 1.0
 FLIP_Y = 1.0
