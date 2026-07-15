@@ -85,6 +85,12 @@ LOGO_IMAGE = os.path.join(BASE_DIR, "static", "logosign_white.png")
 # Brightness threshold above which a pixel is treated as bright "white background"
 # and composited mostly from the overlay. (Mirrors fluoro_simulator (3).py.)
 MASK_THRESHOLD = 220
+# Composite blend weights: the video's share of each region (the rest is the
+# anatomy master). WHITE_VIDEO_OPACITY keeps the removed white background
+# faintly present instead of fully transparent; WORK_VIDEO_OPACITY is the
+# working (vasculature/tool) areas — lower makes the anatomy more visible.
+WHITE_VIDEO_OPACITY = 0.40
+WORK_VIDEO_OPACITY = 0.50
 # White-background-removal freeze: once the raw camera frame has stayed largely
 # the same for STABLE_FRAMES consecutive frames, the composite's white-background
 # mask is frozen so the exact same removal is applied to every following frame
@@ -505,8 +511,9 @@ def white_bg_mask(gray):
 def composite_overlay(gray, overlay, equalize, bg_mask=None):
     '''Composite the anatomy overlay onto a grayscale camera frame.
 
-    Mirrors the blend weights in fluoro_simulator (3).py: bright/white areas are
-    30% video / 70% overlay; vasculature areas are 60% video / 40% overlay.
+    Per-region video share comes from WHITE_VIDEO_OPACITY (bright/white
+    background — reduced opacity, never fully transparent) and
+    WORK_VIDEO_OPACITY (vasculature/tool areas); the remainder is overlay.
 
     ``bg_mask`` supplies a precomputed white-background mask (see white_bg_mask).
     Pass the frozen mask while the scene is steady: thresholding each live frame
@@ -520,8 +527,10 @@ def composite_overlay(gray, overlay, equalize, bg_mask=None):
     fr = gray.astype(np.float32)
     result = ov.copy()
     white = bg_mask == 0
-    result[white] = 0.30 * fr[white] + 0.70 * ov[white]
-    result[~white] = 0.60 * fr[~white] + 0.40 * ov[~white]
+    result[white] = (WHITE_VIDEO_OPACITY * fr[white]
+                     + (1.0 - WHITE_VIDEO_OPACITY) * ov[white])
+    result[~white] = (WORK_VIDEO_OPACITY * fr[~white]
+                      + (1.0 - WORK_VIDEO_OPACITY) * ov[~white])
     out = np.clip(result, 0, 255).astype(np.uint8)
 
     if equalize:
