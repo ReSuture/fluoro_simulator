@@ -130,9 +130,10 @@ PX_PER_CM = 14.2
 ORIGIN_PX = (670, 1845)         # centre of the 1340×3691 master
 # Physical area the detector sees at once, (width_cm, height_cm). Keep 4:3 to match
 # the camera frame. This is the ZOOM knob: larger = zoomed out (more anatomy shown),
-# smaller = zoomed in. Tuned so one frame shows most of the body width (like
-# skel.jpg filled the frame) while leaving room to pan.
-FOV_CM = (80.0, 60.0)
+# smaller = zoomed in. Widened from (80, 60) by 1.17 — the old view at z=+8.5 —
+# so the resting z=0 view shows the full body width; z stays a pure offset from
+# nominal camera height, so the motion controller's z=0 lands on this framing.
+FOV_CM = (93.6, 70.2)
 # Flip a sign if increasing X (or Y) should pan the viewport the opposite way.
 FLIP_X = 1.0
 FLIP_Y = 1.0
@@ -161,8 +162,7 @@ state = {
     "quit": False,          # exit the whole process (ESC key); web Stop uses "running"
     "pos_x_cm": 0.0,        # camera X position (cm from origin) — drives the viewport
     "pos_y_cm": 0.0,        # camera Y position (cm from origin) — drives the viewport
-    "pos_z_cm": 8.5,        # camera Z position (cm from nominal height) — drives the zoom;
-                            # defaults zoomed out so the resting view shows the full body width
+    "pos_z_cm": 0.0,        # camera Z position (cm from nominal height) — drives the zoom
     "ui_view": "fluoro",    # which tab the FLUORO window shows: fluoro|remote|library
     "recording": False,     # session recording to ~/fluorosim_recordings
 }
@@ -287,7 +287,7 @@ PAGE = """
   <div class="posctl">
     <label>X <input id="xin" type="number" step="0.5" value="0"> cm</label>
     <label>Y <input id="yin" type="number" step="0.5" value="0"> cm</label>
-    <label>Z <input id="zin" type="number" step="0.5" value="8.5"> cm</label>
+    <label>Z <input id="zin" type="number" step="0.5" value="0"> cm</label>
     <button id="gopos" type="button">Pan</button>
   </div>
   <p class="hint" id="pos">Camera: —</p>
