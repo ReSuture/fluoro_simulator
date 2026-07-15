@@ -161,7 +161,8 @@ state = {
     "quit": False,          # exit the whole process (ESC key); web Stop uses "running"
     "pos_x_cm": 0.0,        # camera X position (cm from origin) — drives the viewport
     "pos_y_cm": 0.0,        # camera Y position (cm from origin) — drives the viewport
-    "pos_z_cm": 0.0,        # camera Z position (cm from nominal height) — drives the zoom
+    "pos_z_cm": 8.5,        # camera Z position (cm from nominal height) — drives the zoom;
+                            # defaults zoomed out so the resting view shows the full body width
     "ui_view": "fluoro",    # which tab the FLUORO window shows: fluoro|remote|library
     "recording": False,     # session recording to ~/fluorosim_recordings
 }
@@ -286,7 +287,7 @@ PAGE = """
   <div class="posctl">
     <label>X <input id="xin" type="number" step="0.5" value="0"> cm</label>
     <label>Y <input id="yin" type="number" step="0.5" value="0"> cm</label>
-    <label>Z <input id="zin" type="number" step="0.5" value="0"> cm</label>
+    <label>Z <input id="zin" type="number" step="0.5" value="8.5"> cm</label>
     <button id="gopos" type="button">Pan</button>
   </div>
   <p class="hint" id="pos">Camera: —</p>
