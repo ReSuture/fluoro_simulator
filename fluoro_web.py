@@ -109,16 +109,19 @@ CHANGE_DIFF = 10.0
 # controller) is not this module's concern — it's pushed in via POST /api/position
 # and lives in state["pos_x_cm"] / state["pos_y_cm"].
 #
-# Calibrated against fulltorsofluoroimage.png (472×868), a plain no-contrast
+# Calibrated against fulltorsofluoroimage.png (1340×3691), a plain no-contrast
 # full-torso radiograph. Retune these four values if the master image changes.
+# (PX_PER_CM carries the previous master's by-eye tuning forward, scaled by the
+# width ratio, so the default framing and pan feel are unchanged — the FOV is
+# anchored to the body width, not to true anatomical centimetres.)
 MASTER_IMAGE = os.path.join(BASE_DIR, "fulltorsofluoroimage.png")
 # Brightness scale applied to the master at load. <1.0 darkens it (pulls the
 # bright/white areas down the most, since it's multiplicative); 1.0 = as-is.
 MASTER_BRIGHTNESS = 1.0
 # Master-image pixels per real centimetre of anatomy.
-PX_PER_CM = 5.0
+PX_PER_CM = 14.2
 # The master pixel that camera coordinate (0, 0) maps to (viewport centre at origin).
-ORIGIN_PX = (236, 434)          # centre of the 472×868 master
+ORIGIN_PX = (670, 1845)         # centre of the 1340×3691 master
 # Physical area the detector sees at once, (width_cm, height_cm). Keep 4:3 to match
 # the camera frame. This is the ZOOM knob: larger = zoomed out (more anatomy shown),
 # smaller = zoomed in. Tuned so one frame shows most of the body width (like
