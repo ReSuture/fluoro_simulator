@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReSuture — NAVISLab Device Portal</title>
+<meta name="description"
+      content="resuture.io is the secure device-access domain for ReSuture's
+               NAVISLab surgical training simulators. Customers sign in to
+               reach their simulator and session library.">
+<style>
+  /* Matches resuture.com: light theme, dark navy + blue accents, clean sans. */
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         background: #f6f8fb; color: #1a2433; line-height: 1.6; }
+  .hero { background: linear-gradient(160deg, #0e1f38 0%, #16324f 100%);
+          color: #fff; padding: 56px 24px 64px; text-align: center; }
+  .hero img.logo { width: min(420px, 80%); height: auto; margin-bottom: 28px; }
+  .hero h1 { font-size: clamp(24px, 4vw, 36px); font-weight: 600; letter-spacing: .3px; }
+  .hero p.tag { margin-top: 12px; color: #b9c9dd; font-size: clamp(15px, 2vw, 18px); }
+  main { max-width: 880px; margin: -32px auto 0; padding: 0 20px 40px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
+  .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px;
+          padding: 26px 24px; box-shadow: 0 8px 24px rgba(14, 31, 56, .07); }
+  .card h2 { font-size: 17px; color: #0e1f38; margin-bottom: 8px; }
+  .card p { font-size: 14.5px; color: #51617a; margin-bottom: 18px; }
+  .btn { display: inline-block; text-decoration: none; font-weight: 600; font-size: 15px;
+         padding: 11px 22px; border-radius: 9px; background: #1d5fad; color: #fff; }
+  .btn.secondary { background: #fff; color: #1d5fad; border: 1.5px solid #1d5fad; }
+  .about { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px;
+           padding: 26px 24px; margin-top: 18px; box-shadow: 0 8px 24px rgba(14, 31, 56, .07); }
+  .about h2 { font-size: 17px; color: #0e1f38; margin-bottom: 8px; }
+  .about p { font-size: 14.5px; color: #51617a; }
+  .about p + p { margin-top: 10px; }
+  footer { text-align: center; padding: 26px 20px 40px; color: #7a8aa0; font-size: 13px; }
+  footer a { color: #1d5fad; text-decoration: none; }
+</style>
+</head>
+<body>
+<header class="hero">
+  <img class="logo" src="{{ url_for('static', filename='logosign_white.png') }}" alt="ReSuture logo">
+  <h1>NAVISLab Device Portal</h1>
+  <p class="tag">Lifelike vasculature. Custom disease states. Data-driven surgical training.</p>
+</header>
+<main>
+  <div class="cards">
+    <div class="card">
+      <h2>Customer sign-in</h2>
+      <p>Access your NAVISLab simulator and session library from anywhere.
+         Sign-in uses a one-time email PIN — no password to manage.</p>
+      <a class="btn" href="https://{{ portal_host }}/">Open the portal</a>
+    </div>
+    <div class="card">
+      <h2>About ReSuture</h2>
+      <p>Purposeful design, captivating solutions for medtech — endovascular
+         and surgical training simulation from Phoenix, Arizona.</p>
+      <a class="btn secondary" href="https://resuture.com/">Visit resuture.com</a>
+    </div>
+  </div>
+  <div class="about">
+    <h2>What is this domain?</h2>
+    <p><strong>{{ apex_host }}</strong> is the secure device-access domain for
+       ReSuture's NAVISLab surgical training simulators. Each simulator is
+       reachable only through an encrypted tunnel, gated by Cloudflare
+       Access: customers authenticate with a one-time PIN sent to their
+       registered email address.</p>
+    <p>No credentials are collected or stored on this domain. If you arrived
+       here unexpectedly, you most likely want
+       <a href="https://resuture.com/">resuture.com</a>, or your simulator's
+       sign-in at <a href="https://{{ portal_host }}/">{{ portal_host }}</a>.</p>
+  </div>
+</main>
+<footer>
+  © 2026 ReSuture · Phoenix, AZ ·
+  <a href="mailto:info@resuture.com">info@resuture.com</a> · (480) 744-4180<br>
+  For training and demonstration; not a medical device.
+</footer>
+</body>
+</html>
