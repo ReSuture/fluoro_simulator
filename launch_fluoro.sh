@@ -27,8 +27,20 @@ export QT_QPA_PLATFORM=xcb
 # session; fall back to :0 so the FLUORO window can open.
 export DISPLAY="${DISPLAY:-:0}"
 
+# Size the fullscreen UI to the attached display (e.g. a 1024x600 touch
+# monitor): ask xrandr for the current mode and pass it as --screen so the
+# app composes natively at that resolution — letterboxed video, touch-sized
+# buttons, and the on-screen keyboard laid out for the real panel. If xrandr
+# is unavailable (or headless), fall back to the classic camera-sized layout.
+SCREEN_ARGS=()
+MODE=$(xrandr --current 2>/dev/null | awk '/\*/ {print $1; exit}')
+if [[ "${MODE:-}" =~ ^[0-9]+x[0-9]+$ ]]; then
+    echo "display mode detected: $MODE"
+    SCREEN_ARGS=(--screen "$MODE")
+fi
+
 # Serves the panel and shows the FLUORO window (no --no-window).
 # --host 127.0.0.1: only local cloudflared may connect (never expose :5000 on
 # the LAN — the app has no auth of its own; Cloudflare Access is the gate).
 # --http: cloudflared originates over plain HTTP; TLS terminates at the edge.
-exec python3 fluoro_web.py --host 127.0.0.1 --http
+exec python3 fluoro_web.py --host 127.0.0.1 --http "${SCREEN_ARGS[@]}" "$@"

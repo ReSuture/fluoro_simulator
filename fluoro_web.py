@@ -45,7 +45,13 @@ served over HTTPS (so browsers that force secure connections can reach it). Pass
 
 Usage:
     python fluoro_web.py [<video device number>] [--port 5000] [--host 0.0.0.0]
-                         [--no-window] [--http]
+                         [--no-window] [--http] [--screen WxH]
+
+``--screen 1024x600`` composes the fullscreen UI natively at the display's
+resolution (e.g. the WIMAXIT touch monitor): the video is letterboxed instead
+of stretched, buttons get real touch-sized hit areas, and tapping a text
+field pops an on-screen keyboard. launch_fluoro.sh auto-detects the attached
+display and passes this flag.
 
 Then open  https://<this-machine-ip>:<port>/  in a browser (http:// without a cert).
 
@@ -166,6 +172,11 @@ state = {
     "ui_view": "fluoro",    # which tab the FLUORO window shows: fluoro|remote|library
     "recording": False,     # session recording to ~/fluorosim_recordings
 }
+
+# Compose the fullscreen UI natively at this (width, height) instead of at the
+# camera frame's size — set by --screen for touch displays so the pixels (and
+# therefore the tap targets) map 1:1 onto the panel. None = classic behaviour.
+SCREEN_SIZE = None
 
 # Latest processed frame, JPEG-encoded, for the MJPEG preview stream.
 _latest_jpeg = None
@@ -592,6 +603,8 @@ ui = {
     "selected_secured": False,
     "net_page": 0,
     "email_editing": False, # entering/changing the registration email
+    "kb_shift": False,      # on-screen keyboard: next letter uppercase
+    "kb_sym": False,        # on-screen keyboard: symbols/digits page
 }
 
 
@@ -825,6 +838,100 @@ def render_control_bar(s, width, live):
         buttons.append((x, y, pw, bh, "pan", name))
         x += pw + gap
     return img, buttons
+
+
+def fit_frame(vid, W, H):
+    '''Letterbox a BGR frame onto a W×H canvas (aspect kept, black bars).'''
+    scale = min(W / float(vid.shape[1]), H / float(vid.shape[0]))
+    tw = max(1, int(vid.shape[1] * scale))
+    th = max(1, int(vid.shape[0] * scale))
+    canvas = np.zeros((H, W, 3), np.uint8)
+    x0, y0 = (W - tw) // 2, (H - th) // 2
+    canvas[y0:y0 + th, x0:x0 + tw] = cv.resize(vid, (tw, th))
+    return canvas
+
+
+# ── On-screen touch keyboard ──────────────────────────────────────────────────
+# Drawn across the bottom of the Remote Access view whenever a text field has
+# focus (i.e. it pops up the moment a field is tapped), so a touch display
+# needs no physical keyboard. Key taps feed the same ui[focus] buffer the
+# physical keyboard types into — both input paths work at once. An echo strip
+# above the keys always shows what's been typed, because the keyboard may
+# cover the focused field itself.
+
+KB_ROWS_ABC = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+KB_ROWS_SYM = ["1234567890", "@#$%&*-_+=", "!?/:;()'\""]
+
+
+def render_keyboard(W, value, masked):
+    '''Render the touch keyboard + echo strip. Returns (image, buttons).'''
+    gap = 6
+    row_h = max(40, min(56, W // 18))
+    echo_h = 36
+    img = np.full((echo_h + 4 * (row_h + gap) + gap, W, 3), C_BG, np.uint8)
+    cv.line(img, (0, 0), (W, 0), C_BTN_BD, 1, cv.LINE_AA)
+    buttons = []
+    font = cv.FONT_HERSHEY_SIMPLEX
+
+    shown = ("*" * len(value)) if masked else value
+    shown += "_"
+    while len(shown) > 1 and cv.getTextSize(shown, font, 0.6, 1)[0][0] > W - 28:
+        shown = shown[1:]  # keep the tail visible
+    cv.putText(img, shown, (14, 26), font, 0.6, C_ON_TX, 1, cv.LINE_AA)
+
+    def key_row(keys, y):
+        '''keys = [(label, name, weight, on)]; weights share the row's width.'''
+        kw = (W - gap * (len(keys) + 1)) / float(sum(k[2] for k in keys))
+        x = float(gap)
+        for label, name, weight, on in keys:
+            w = int(kw * weight)
+            draw_button(img, int(x), y, w, row_h, label, None, on)
+            buttons.append((int(x), y, w, row_h, "key", name))
+            x += w + gap
+
+    rows = KB_ROWS_SYM if ui["kb_sym"] else KB_ROWS_ABC
+    y = echo_h + gap
+    for r, chars in enumerate(rows):
+        keys = [("Shift", "shift", 1.4, ui["kb_shift"])] if r == 2 else []
+        for ch in chars:
+            label = ch.upper() if ui["kb_shift"] and not ui["kb_sym"] else ch
+            keys.append((label, "c:" + ch, 1.0, False))
+        if r == 2:
+            keys.append(("<--", "bksp", 1.4, False))
+        key_row(keys, y)
+        y += row_h + gap
+    key_row([("abc" if ui["kb_sym"] else "?123", "sym", 1.4, ui["kb_sym"]),
+             ("@", "c:@", 1.0, False), ("space", "space", 3.6, False),
+             (".", "c:.", 1.0, False), ("Done", "done", 1.6, True),
+             ("Hide", "hide", 1.2, False)], y)
+    return img, buttons
+
+
+def handle_key_button(name):
+    '''Apply an on-screen keyboard tap to the focused text field.'''
+    focus = ui["focus"]
+    if name == "hide":
+        ui["focus"] = None
+        return
+    if focus is None:
+        return
+    if name == "shift":
+        ui["kb_shift"] = not ui["kb_shift"]
+    elif name == "sym":
+        ui["kb_sym"] = not ui["kb_sym"]
+    elif name == "bksp":
+        ui[focus] = ui[focus][:-1]
+    elif name == "done":
+        ui["focus"] = None
+        submit_field(focus)
+    elif name == "space":
+        ui[focus] += " "
+    elif name.startswith("c:"):
+        ch = name[2:]
+        if ui["kb_shift"]:
+            ch = ch.upper()
+            ui["kb_shift"] = False  # one-shot, like a phone keyboard
+        ui[focus] += ch
 
 
 # ── Remote Access view ────────────────────────────────────────────────────────
@@ -1315,6 +1422,9 @@ def apply_button(kind, name):
     if kind == "focus":
         ui["focus"] = name
         return
+    if kind == "key":
+        handle_key_button(name)
+        return
     if kind in ("setup", "lib"):
         # Remote Access / Library view buttons — handled outside state_lock
         # (they talk to their own managers, which have their own locks).
@@ -1662,12 +1772,28 @@ def run_simulation(cam_index, show_window):
             # must never take down the sim: fall back to the Fluoro view.
             try:
                 fh, fw = res.shape[:2] if res is not None else (480, 640)
-                canvas_h = fh + (BAR_H if s["fullscreen"] else 0)
-                if view == "remote":
-                    canvas, vbtns = render_remote_view(s, fw, canvas_h)
+                if SCREEN_SIZE and s["fullscreen"]:
+                    vw, canvas_h = SCREEN_SIZE[0], SCREEN_SIZE[1] - TAB_H
                 else:
-                    canvas, vbtns = render_library_view(fw, canvas_h)
-                tab, tbtns = render_tab_bar(fw, view, rec_elapsed)
+                    vw, canvas_h = fw, fh + (BAR_H if s["fullscreen"] else 0)
+                if view == "remote":
+                    canvas, vbtns = render_remote_view(s, vw, canvas_h)
+                else:
+                    canvas, vbtns = render_library_view(vw, canvas_h)
+                if ui["focus"] and view == "remote":
+                    # A focused text field pops the on-screen keyboard over
+                    # the bottom of the view (its echo strip keeps the typed
+                    # text visible even when the field itself is covered).
+                    kb, kbtns = render_keyboard(
+                        vw, ui[ui["focus"]],
+                        ui["focus"] == "password" and not ui["show_pw"])
+                    kh = kb.shape[0]
+                    if kh < canvas.shape[0]:
+                        canvas[-kh:] = kb
+                        vbtns = list(vbtns) + [
+                            (x, y + canvas.shape[0] - kh, w, h, k, n)
+                            for (x, y, w, h, k, n) in kbtns]
+                tab, tbtns = render_tab_bar(vw, view, rec_elapsed)
                 tab_buttons[:] = tbtns
                 view_buttons[:] = [(x, y + TAB_H, w, h, k, n)
                                    for (x, y, w, h, k, n) in vbtns]
@@ -1682,6 +1808,12 @@ def run_simulation(cam_index, show_window):
                     state["ui_view"] = "fluoro"
         elif res is not None and show_window:
             vid = cv.cvtColor(res, cv.COLOR_GRAY2BGR) if res.ndim == 2 else res
+            if s["fullscreen"] and SCREEN_SIZE:
+                # Compose natively at the display resolution: the video is
+                # letterboxed (not stretched) between the tab bar and the
+                # control bar, and every pixel/tap maps 1:1 to the screen.
+                sw, sh = SCREEN_SIZE
+                vid = fit_frame(vid, sw, sh - TAB_H - BAR_H)
             tab, tbtns = render_tab_bar(vid.shape[1], view, rec_elapsed)
             tab_buttons[:] = tbtns
             if s["fullscreen"]:
@@ -1765,6 +1897,9 @@ if __name__ == "__main__":
             show_window = False; i += 1; continue
         if a == "--http":          # force plain HTTP even if a cert is present
             force_http = True; i += 1; continue
+        if a == "--screen":        # compose fullscreen natively at WxH (touch displays)
+            sw, sh = args[i + 1].lower().split("x")
+            SCREEN_SIZE = (int(sw), int(sh)); i += 2; continue
         cam_index = int(a); i += 1
 
     # Serve HTTPS with the self-signed cert if cert.pem/key.pem are present next to
