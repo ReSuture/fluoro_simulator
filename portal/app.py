@@ -69,6 +69,8 @@ def create_app():
                 return render_template(
                     "landing.html", apex_host=config.LANDING_APEX,
                     portal_host="portal.%s" % config.LANDING_APEX)
+            if request.path.startswith("/static/"):
+                return None  # the landing page's own logo/assets
             return redirect("/")
 
     # ── Customer pages ────────────────────────────────────────────────────────

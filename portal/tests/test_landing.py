@@ -31,6 +31,12 @@ def test_other_paths_on_apex_redirect_home(client):
         assert r.headers["Location"].endswith("/")
 
 
+def test_static_assets_load_on_landing_hosts(client):
+    # The hero logo must not be caught by the redirect-home rule.
+    r = client.get("/static/logosign_white.png", headers={"Host": "example.com"})
+    assert r.status_code == 200
+
+
 def test_apex_post_redirects(client):
     r = client.post("/api/device/status", headers={"Host": "www.example.com"})
     assert r.status_code == 302
