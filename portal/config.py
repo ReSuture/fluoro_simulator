@@ -54,6 +54,13 @@ SIM_DOMAIN_SUFFIX = _env("SIM_DOMAIN_SUFFIX", "")
 # Flask session signing (only used for the admin CSRF token cookie).
 FLASK_SECRET_KEY = _env("FLASK_SECRET_KEY")
 
+# Hosts that serve the public landing page instead of the portal app: the
+# device domain's apex and www (".resuture.io" → resuture.io, www.resuture.io).
+# The Access-gated portal stays on portal.<domain>; these hosts are public.
+_apex = SIM_DOMAIN_SUFFIX.lstrip(".")
+LANDING_HOSTS = frozenset({_apex, "www." + _apex}) if _apex else frozenset()
+LANDING_APEX = _apex
+
 # What each device's tunnel forwards to on the Pi.
 ORIGIN_SERVICE = "http://localhost:5000"
 

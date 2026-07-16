@@ -55,6 +55,22 @@ def create_app():
         if not hmac.compare_digest(sent, session.get("csrf", "-")):
             abort(400, description="Bad or missing CSRF token — reload the page.")
 
+    # ── Public landing page (device-domain apex) ─────────────────────────────
+    # https://<apex>/ serves a small public page in resuture.com's theme so
+    # the bare domain isn't an empty redirect-to-login (which is what tripped
+    # Google Safe Browsing). Any other path on these hosts bounces home, so
+    # no portal or API route is reachable through them.
+
+    @app.before_request
+    def apex_landing():
+        host = request.host.split(":")[0].lower()
+        if host in config.LANDING_HOSTS:
+            if request.path == "/" and request.method in ("GET", "HEAD"):
+                return render_template(
+                    "landing.html", apex_host=config.LANDING_APEX,
+                    portal_host="portal.%s" % config.LANDING_APEX)
+            return redirect("/")
+
     # ── Customer pages ────────────────────────────────────────────────────────
 
     def _device_cards(email):
