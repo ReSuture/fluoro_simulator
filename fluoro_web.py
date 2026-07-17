@@ -97,6 +97,28 @@ MASK_THRESHOLD = 220
 # working (vasculature/tool) areas — lower makes the anatomy more visible.
 WHITE_VIDEO_OPACITY = 0.40
 WORK_VIDEO_OPACITY = 0.50
+# A pixel only takes the white-background blend if the LIVE frame still reads
+# bright there. The bg mask may be stale (frozen while the scene was steady) or
+# missing thin structures (white_bg_mask median-blurs away 1-2 px lines), so
+# without this check a catheter advancing through the vasculature — or the
+# vasculature itself — can land in a "white" region and get washed out at
+# WHITE_VIDEO_OPACITY. Set comfortably below MASK_THRESHOLD so sensor noise on
+# genuinely white pixels can't flip them (which would defeat the mask freeze);
+# anything the camera reads below this is clearly an object, not background.
+WHITE_LIVE_MIN = 180
+# Device radiocontrast: camera pixels well darker than the scene (the tool /
+# wire / device) are rendered as a radiopaque object instead of the flat
+# WORK_VIDEO_OPACITY blend — the overlay is multiplied by the device's
+# transmission ((gray/255)^DEVICE_GAMMA), so the device always comes out darker
+# than both the raw video and the anatomy, i.e. the darkest thing on screen.
+# Device membership ramps smoothly with pixel gray level: <= DEVICE_DARK is
+# fully device, >= DEVICE_LIGHT is not device at all (avoids the hard-threshold
+# noise flicker the white mask needs freezing for). Raise DEVICE_LIGHT if the
+# device is only partially picked up; lower it if the vasculature model or
+# shadows are being darkened too. DEVICE_GAMMA > 1 deepens the contrast.
+DEVICE_DARK = 90
+DEVICE_LIGHT = 160
+DEVICE_GAMMA = 1.5
 # White-background-removal freeze: once the raw camera frame has stayed largely
 # the same for STABLE_FRAMES consecutive frames, the composite's white-background
 # mask is frozen so the exact same removal is applied to every following frame
@@ -538,11 +560,26 @@ def composite_overlay(gray, overlay, equalize, bg_mask=None):
     ov = overlay.astype(np.float32)
     fr = gray.astype(np.float32)
     result = ov.copy()
-    white = bg_mask == 0
+    # White region = masked as background AND still bright in the live frame,
+    # so a catheter (or vasculature) moving over a stale/imperfect mask falls
+    # through to the work blend + device pass instead of the white washout.
+    white = (bg_mask == 0) & (fr >= WHITE_LIVE_MIN)
     result[white] = (WHITE_VIDEO_OPACITY * fr[white]
                      + (1.0 - WHITE_VIDEO_OPACITY) * ov[white])
     result[~white] = (WORK_VIDEO_OPACITY * fr[~white]
                       + (1.0 - WORK_VIDEO_OPACITY) * ov[~white])
+
+    # Device pass: where the camera pixel is dark (the device), replace the
+    # flat blend with radiographic attenuation — overlay x transmission — so
+    # the device reads as the most radiopaque (darkest) object in the frame.
+    # ``strength`` ramps 1 -> 0 over DEVICE_DARK..DEVICE_LIGHT and is blurred
+    # slightly so the device edge shades off like a real radiograph.
+    strength = np.clip((DEVICE_LIGHT - fr) / float(DEVICE_LIGHT - DEVICE_DARK),
+                       0.0, 1.0)
+    strength = cv.GaussianBlur(strength, (5, 5), 0)
+    attenuated = ov * (fr / 255.0) ** DEVICE_GAMMA
+    result = strength * attenuated + (1.0 - strength) * result
+
     out = np.clip(result, 0, 255).astype(np.uint8)
 
     if equalize:
