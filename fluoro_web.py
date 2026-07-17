@@ -142,8 +142,16 @@ MASTER_IMAGE = os.path.join(BASE_DIR, "fulltorsofluoroimage.png")
 # MASTER_INVERT flips the master's polarity at load to match; MASTER_GAMMA is
 # then applied on the 0-1 scale to tune the bone/tissue separation (>1 deepens
 # bone and other dark structures, <1 lifts them, 1.0 = straight inversion).
+# 0.6: bone clearly lighter than the catheter and less etched, soft tissue
+# lifted, background bright — the classic dark-structures-over-light-field
+# fluoro look.
 MASTER_INVERT = True
-MASTER_GAMMA = 1.0
+MASTER_GAMMA = 0.6
+# Gaussian blur (sigma, px at master resolution) applied at load. Real fluoro
+# is softened by scatter; this takes the radiograph's crisp bone edges off.
+# The master is ~2x the frame width at the default zoom, so the visible blur
+# is about half this. 0 = off.
+MASTER_SOFTEN = 3.0
 # Brightness scale applied to the master at load. <1.0 darkens it (pulls the
 # bright/white areas down the most, since it's multiplicative); 1.0 = as-is.
 MASTER_BRIGHTNESS = 1.0
@@ -1610,6 +1618,8 @@ def run_simulation(cam_index, show_window):
         lut = (np.clip((np.arange(256) / 255.0) ** MASTER_GAMMA, 0.0, 1.0)
                * 255.0).astype(np.uint8)
         master = cv.LUT(master, lut)
+    if MASTER_SOFTEN > 0:
+        master = cv.GaussianBlur(master, (0, 0), MASTER_SOFTEN)
     if MASTER_BRIGHTNESS != 1.0:
         master = cv.convertScaleAbs(master, alpha=MASTER_BRIGHTNESS, beta=0)
 
