@@ -109,6 +109,10 @@ LOGO_IMAGE = os.path.join(BASE_DIR, "static", "logosign_white.png")
 # objects lose their interiors, at some CPU cost per frame.
 ILLUM_SPAN_PX = 41
 ILLUM_SIGMA = 21
+# The light field is smooth by construction, so it's estimated on a
+# 1/ILLUM_DOWNSCALE-size frame and upsampled — visually identical, ~16x
+# cheaper (matters on the Pi).
+ILLUM_DOWNSCALE = 4
 # Contrast curve applied to transmission (t ** ATTEN_GAMMA). >1 deepens the
 # dark end, separating the catheter from the vasculature model; 1.0 is
 # physically linear.
@@ -536,9 +540,16 @@ def estimate_illumination(gray):
     light field the flat-field division needs. float32, floored at 1 so the
     caller can divide by it.
     '''
-    k = cv.getStructuringElement(cv.MORPH_RECT, (ILLUM_SPAN_PX, ILLUM_SPAN_PX))
-    bright = cv.dilate(gray, k)
-    bright = cv.GaussianBlur(bright, (0, 0), ILLUM_SIGMA)
+    h, w = gray.shape
+    small = cv.resize(gray, (max(1, w // ILLUM_DOWNSCALE),
+                             max(1, h // ILLUM_DOWNSCALE)),
+                      interpolation=cv.INTER_AREA)
+    span = max(3, ILLUM_SPAN_PX // ILLUM_DOWNSCALE) | 1
+    k = cv.getStructuringElement(cv.MORPH_RECT, (span, span))
+    bright = cv.dilate(small, k)
+    bright = cv.GaussianBlur(bright, (0, 0),
+                             max(1.0, ILLUM_SIGMA / ILLUM_DOWNSCALE))
+    bright = cv.resize(bright, (w, h), interpolation=cv.INTER_LINEAR)
     return np.maximum(bright.astype(np.float32), 1.0)
 
 
