@@ -88,48 +88,31 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OVERLAY_IMAGE = os.path.join(BASE_DIR, "skel.jpg")
 LOGO_IMAGE = os.path.join(BASE_DIR, "static", "logosign_white.png")
 
-# Brightness threshold above which a pixel is treated as bright "white background"
-# and composited mostly from the overlay. (Mirrors fluoro_simulator (3).py.)
-MASK_THRESHOLD = 220
-# Composite blend weights: the video's share of each region (the rest is the
-# anatomy master). WHITE_VIDEO_OPACITY keeps the removed white background
-# faintly present instead of fully transparent; WORK_VIDEO_OPACITY is the
-# working (vasculature/tool) areas — lower makes the anatomy more visible.
-WHITE_VIDEO_OPACITY = 0.40
-WORK_VIDEO_OPACITY = 0.50
-# A pixel only takes the white-background blend if the LIVE frame still reads
-# bright there. The bg mask may be stale (frozen while the scene was steady) or
-# missing thin structures (white_bg_mask median-blurs away 1-2 px lines), so
-# without this check a catheter advancing through the vasculature — or the
-# vasculature itself — can land in a "white" region and get washed out at
-# WHITE_VIDEO_OPACITY. Set comfortably below MASK_THRESHOLD so sensor noise on
-# genuinely white pixels can't flip them (which would defeat the mask freeze);
-# anything the camera reads below this is clearly an object, not background.
-WHITE_LIVE_MIN = 180
-# Device radiocontrast: camera pixels well darker than the scene (the tool /
-# wire / device) are rendered as a radiopaque object instead of the flat
-# WORK_VIDEO_OPACITY blend — the overlay is multiplied by the device's
-# transmission ((gray/255)^DEVICE_GAMMA), so the device always comes out darker
-# than both the raw video and the anatomy, i.e. the darkest thing on screen.
-# Device membership ramps smoothly with pixel gray level: <= DEVICE_DARK is
-# fully device, >= DEVICE_LIGHT is not device at all (avoids the hard-threshold
-# noise flicker the white mask needs freezing for). Raise DEVICE_LIGHT if the
-# device is only partially picked up; lower it if the vasculature model or
-# shadows are being darkened too. DEVICE_GAMMA > 1 deepens the contrast.
-DEVICE_DARK = 90
-DEVICE_LIGHT = 160
-DEVICE_GAMMA = 1.5
-# White-background-removal freeze: once the raw camera frame has stayed largely
-# the same for STABLE_FRAMES consecutive frames, the composite's white-background
-# mask is frozen so the exact same removal is applied to every following frame
-# (re-thresholding each live frame otherwise flips pixels near MASK_THRESHOLD
-# between the two blend weights with sensor noise, making a steady scene pulse).
-# The freeze holds until the frame drifts from the frozen reference frame by more
-# than CHANGE_DIFF (camera pan, lighting change), then it can re-freeze once the
-# scene settles again. Both thresholds are mean gray levels per pixel (0-255).
-STABLE_FRAMES = 15
-STABLE_DIFF = 3.0
-CHANGE_DIFF = 10.0
+# ── Attenuation compositing ───────────────────────────────────────────────────
+# The composite models true fluoroscopy: every camera pixel is converted to a
+# TRANSMISSION factor (0 = radiopaque, 1 = unattenuated beam) and the anatomy
+# master is multiplied by it — exactly like stacking attenuators in an X-ray
+# beam. Transmission is the live pixel divided by an estimate of the external
+# illumination at that pixel (flat-field correction), so the light source —
+# gradients, hot spots — divides out entirely rather than being masked or
+# blended away: evenly-or-unevenly lit white background gives transmission ~1
+# and shows the pure anatomy; the vasculature model attenuates moderately; the
+# catheter attenuates hardest and is always the darkest object on screen
+# (multiplying the anatomy by t <= 1 can only darken it).
+#
+# The illumination field is estimated per frame by a grayscale dilation (the
+# local max rides over dark objects narrower than ILLUM_SPAN_PX and reads the
+# background brightness behind them) followed by a Gaussian blur (ILLUM_SIGMA)
+# that smooths it into a slowly-varying light field. Objects WIDER than
+# ILLUM_SPAN_PX (a hand laid flat over the scene) start being treated as
+# illumination and hollow out to their edges — raise ILLUM_SPAN_PX if large
+# objects lose their interiors, at some CPU cost per frame.
+ILLUM_SPAN_PX = 41
+ILLUM_SIGMA = 21
+# Contrast curve applied to transmission (t ** ATTEN_GAMMA). >1 deepens the
+# dark end, separating the catheter from the vasculature model; 1.0 is
+# physically linear.
+ATTEN_GAMMA = 1.6
 
 # ── Camera-position → viewport calibration ────────────────────────────────────
 # The full-resolution "master" background: a plain (NO-CONTRAST) radiograph of the
@@ -149,6 +132,14 @@ CHANGE_DIFF = 10.0
 # width ratio, so the default framing and pan feel are unchanged — the FOV is
 # anchored to the body width, not to true anatomical centimetres.)
 MASTER_IMAGE = os.path.join(BASE_DIR, "fulltorsofluoroimage.png")
+# The source radiograph is film-convention (dense = bright: white bones, dark
+# air). Attenuation-based fluoro display is the opposite — dense = dark, so
+# bone reads darker than tissue and the unattenuated background is bright.
+# MASTER_INVERT flips the master's polarity at load to match; MASTER_GAMMA is
+# then applied on the 0-1 scale to tune the bone/tissue separation (>1 deepens
+# bone and other dark structures, <1 lifts them, 1.0 = straight inversion).
+MASTER_INVERT = True
+MASTER_GAMMA = 1.0
 # Brightness scale applied to the master at load. <1.0 darkens it (pulls the
 # bright/white areas down the most, since it's multiplicative); 1.0 = as-is.
 MASTER_BRIGHTNESS = 1.0
@@ -536,51 +527,34 @@ def compute_viewport(master, x_cm, y_cm, z_cm=0.0):
     return master[y0:y0 + h, x0:x0 + w]
 
 
-def white_bg_mask(gray):
-    '''Mask of bright "white background" pixels (0 where white background).'''
-    _, m = cv.threshold(gray, MASK_THRESHOLD, 255, cv.THRESH_BINARY_INV)
-    return cv.medianBlur(m, 5)
+def estimate_illumination(gray):
+    '''Smooth estimate of the external light field across the camera frame.
 
-
-def composite_overlay(gray, overlay, equalize, bg_mask=None):
-    '''Composite the anatomy overlay onto a grayscale camera frame.
-
-    Per-region video share comes from WHITE_VIDEO_OPACITY (bright/white
-    background — reduced opacity, never fully transparent) and
-    WORK_VIDEO_OPACITY (vasculature/tool areas); the remainder is overlay.
-
-    ``bg_mask`` supplies a precomputed white-background mask (see white_bg_mask).
-    Pass the frozen mask while the scene is steady: thresholding each live frame
-    makes pixels near MASK_THRESHOLD flip between the two blend weights with
-    sensor noise, which pulses. None = threshold ``gray`` (scene changing).
+    Grayscale dilation takes the local max, so dark objects narrower than
+    ILLUM_SPAN_PX are ridden over and read the background brightness behind
+    them; the Gaussian blur then smooths the result into the slowly-varying
+    light field the flat-field division needs. float32, floored at 1 so the
+    caller can divide by it.
     '''
-    if bg_mask is None:
-        bg_mask = white_bg_mask(gray)
+    k = cv.getStructuringElement(cv.MORPH_RECT, (ILLUM_SPAN_PX, ILLUM_SPAN_PX))
+    bright = cv.dilate(gray, k)
+    bright = cv.GaussianBlur(bright, (0, 0), ILLUM_SIGMA)
+    return np.maximum(bright.astype(np.float32), 1.0)
 
-    ov = overlay.astype(np.float32)
-    fr = gray.astype(np.float32)
-    result = ov.copy()
-    # White region = masked as background AND still bright in the live frame,
-    # so a catheter (or vasculature) moving over a stale/imperfect mask falls
-    # through to the work blend + device pass instead of the white washout.
-    white = (bg_mask == 0) & (fr >= WHITE_LIVE_MIN)
-    result[white] = (WHITE_VIDEO_OPACITY * fr[white]
-                     + (1.0 - WHITE_VIDEO_OPACITY) * ov[white])
-    result[~white] = (WORK_VIDEO_OPACITY * fr[~white]
-                      + (1.0 - WORK_VIDEO_OPACITY) * ov[~white])
 
-    # Device pass: where the camera pixel is dark (the device), replace the
-    # flat blend with radiographic attenuation — overlay x transmission — so
-    # the device reads as the most radiopaque (darkest) object in the frame.
-    # ``strength`` ramps 1 -> 0 over DEVICE_DARK..DEVICE_LIGHT and is blurred
-    # slightly so the device edge shades off like a real radiograph.
-    strength = np.clip((DEVICE_LIGHT - fr) / float(DEVICE_LIGHT - DEVICE_DARK),
-                       0.0, 1.0)
-    strength = cv.GaussianBlur(strength, (5, 5), 0)
-    attenuated = ov * (fr / 255.0) ** DEVICE_GAMMA
-    result = strength * attenuated + (1.0 - strength) * result
+def composite_overlay(gray, overlay, equalize):
+    '''Composite the anatomy overlay with the camera frame by attenuation.
 
-    out = np.clip(result, 0, 255).astype(np.uint8)
+    Each camera pixel becomes a transmission factor — its brightness relative
+    to the estimated illumination at that pixel — contrast-shaped by
+    ATTEN_GAMMA, and the anatomy overlay is multiplied by it (see the
+    "Attenuation compositing" constants for the model). The upshot: the
+    external light source divides out, bone reads darker than tissue (from
+    the polarity-inverted master), and the device is darkest of all.
+    '''
+    trans = np.clip(gray.astype(np.float32) / estimate_illumination(gray),
+                    0.0, 1.0) ** ATTEN_GAMMA
+    out = (overlay.astype(np.float32) * trans).astype(np.uint8)
 
     if equalize:
         clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -1619,6 +1593,12 @@ def run_simulation(cam_index, show_window):
         if master is None:
             raise FileNotFoundError("Cannot load image: %s" % OVERLAY_IMAGE)
     master = cv.cvtColor(master, cv.COLOR_BGR2GRAY)
+    if MASTER_INVERT:
+        master = 255 - master
+    if MASTER_GAMMA != 1.0:
+        lut = (np.clip((np.arange(256) / 255.0) ** MASTER_GAMMA, 0.0, 1.0)
+               * 255.0).astype(np.uint8)
+        master = cv.LUT(master, lut)
     if MASTER_BRIGHTNESS != 1.0:
         master = cv.convertScaleAbs(master, alpha=MASTER_BRIGHTNESS, beta=0)
 
@@ -1644,10 +1624,6 @@ def run_simulation(cam_index, show_window):
     # The camera and the windows are opened lazily on the first running
     # iteration (and reopened after a standby stop) — see the loop below.
     cap = None
-    prev_raw = None            # previous raw gray frame (freeze stability check)
-    stable_count = 0           # consecutive largely-unchanged frames so far
-    frozen_bg = None           # frozen reference frame (None = watching for stability)
-    frozen_mask = None         # frozen white-background mask for the composite
     applied_fullscreen = None  # last fullscreen state pushed to the window (avoids redundant calls)
     res = None                 # last processed frame (shown + streamed)
     live = False               # True once a frame has been read (drives the status dot)
@@ -1675,8 +1651,6 @@ def run_simulation(cam_index, show_window):
                     cv.destroyAllWindows()
                     cv.waitKey(1)  # let the GUI process the window teardown
                 applied_fullscreen = None
-                prev_raw, stable_count = None, 0
-                frozen_bg = frozen_mask = None
                 res, live = None, False
             if stopped_buf is not None:
                 with _latest_lock:
@@ -1748,31 +1722,9 @@ def run_simulation(cam_index, show_window):
                                     s["pos_z_cm"])
             overlay_frame = cv.resize(crop, (frame_gray.shape[1], frame_gray.shape[0]))
 
-            # Freeze the white-background removal once the scene has been steady
-            # for STABLE_FRAMES frames; thaw it when the frame moves significantly
-            # away from the frozen reference (pan, lighting change, ...).
-            step = (cv.norm(frame_gray, prev_raw, cv.NORM_L1) / frame_gray.size
-                    if prev_raw is not None else 0.0)
-            if frozen_bg is None:
-                if prev_raw is not None:
-                    stable_count = stable_count + 1 if step < STABLE_DIFF else 0
-                if stable_count >= STABLE_FRAMES:
-                    # Steady scene: freeze the composite's white-background mask
-                    # on the current frame so the identical removal is applied
-                    # every frame (thresholding each live frame flips pixels near
-                    # MASK_THRESHOLD with sensor noise; see composite_overlay).
-                    frozen_bg = frame_gray.copy()
-                    frozen_mask = white_bg_mask(frame_gray)
-            elif cv.norm(frame_gray, frozen_bg, cv.NORM_L1) / frame_gray.size > CHANGE_DIFF:
-                frozen_bg = None
-                frozen_mask = None
-                stable_count = 0
-            prev_raw = frame_gray
-
             # Overlay off => show the full raw video (bright/white areas intact).
             if s["overlay"]:
-                res = composite_overlay(frame_gray, overlay_frame, s["equalize"],
-                                        frozen_mask)
+                res = composite_overlay(frame_gray, overlay_frame, s["equalize"])
             else:
                 res = frame_raw
 
