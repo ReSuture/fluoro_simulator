@@ -118,6 +118,19 @@ ILLUM_DOWNSCALE = 4
 # physically linear.
 ATTEN_GAMMA = 1.6
 
+# ── C-arm circular aperture ───────────────────────────────────────────────────
+# A real C-arm image intensifier / flat-panel detector has a round input face,
+# so the live image is a bright circle with black corners. We reproduce that by
+# masking the fluoro output to a centred disc. APERTURE_ON toggles the effect;
+# APERTURE_SCALE is the disc radius as a fraction of half the frame's SHORTER
+# side (1.0 makes the circle just touch the top and bottom edges — the classic
+# look, with black corners and, on a wide frame, black side bars).
+# APERTURE_FEATHER softens the rim by that fraction of the radius so the edge is
+# anti-aliased rather than a hard jagged circle (0 = crisp edge).
+APERTURE_ON = True
+APERTURE_SCALE = 0.92
+APERTURE_FEATHER = 0.015
+
 # ── Camera-position → viewport calibration ────────────────────────────────────
 # The full-resolution "master" background: a plain (NO-CONTRAST) radiograph of the
 # torso, roughly brachiocephalic → femoral. The live camera feed superimposes the
@@ -579,6 +592,42 @@ def composite_overlay(gray, overlay, equalize):
         clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         out = clahe.apply(out)
     return out
+
+
+# Feathered aperture masks are cached per frame-shape: the disc only depends on
+# the frame dimensions, so we build the float mask once and reuse it every frame.
+_aperture_cache = {}
+
+
+def aperture_mask(h, w):
+    '''Return a cached HxW float32 mask (1 inside the disc, 0 outside, feathered rim).'''
+    key = (h, w)
+    mask = _aperture_cache.get(key)
+    if mask is None:
+        cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+        radius = min(h, w) / 2.0 * APERTURE_SCALE
+        yy, xx = np.ogrid[:h, :w]
+        dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+        feather = max(1.0, radius * APERTURE_FEATHER)
+        # Ramp from 1 (inside) to 0 (outside) across the feather band at the rim.
+        mask = np.clip((radius - dist) / feather + 0.5, 0.0, 1.0).astype(np.float32)
+        _aperture_cache[key] = mask
+    return mask
+
+
+def apply_aperture(img):
+    '''Mask the fluoro output to a centred C-arm disc; black corners, feathered rim.
+
+    Works on both the single-channel composite and the 3-channel raw frame, and
+    returns a new array (the source frame is left untouched).
+    '''
+    if not APERTURE_ON:
+        return img
+    h, w = img.shape[:2]
+    mask = aperture_mask(h, w)
+    if img.ndim == 3:
+        mask = mask[:, :, None]
+    return (img.astype(np.float32) * mask).astype(np.uint8)
 
 
 def draw_str(dst, target, s):
@@ -1748,6 +1797,12 @@ def run_simulation(cam_index, show_window):
                 res = composite_overlay(frame_gray, overlay_frame, s["equalize"])
             else:
                 res = frame_raw
+
+            # Mask to the round C-arm field of view (black corners). Applied
+            # before the HUD so annotations remain legible over the black rim,
+            # and here (not just at display time) so the recording and the web
+            # preview carry the same circular field as the on-screen window.
+            res = apply_aperture(res)
 
             if s["hud"]:
                 draw_str(res, (20, 20), "Overlay:%s  Equalize:%s" %
