@@ -286,6 +286,17 @@ def list_cameras():
     return sorted(best.values(), key=lambda c: c["port"])
 
 
+def discovery_works():
+    '''True when this machine can be trusted to enumerate its own cameras.
+
+    Needs the V4L2 ioctl (Linux) and at least one video node to ask about. When
+    this is False - a non-Linux dev box, or a /dev with no video nodes at all -
+    the caller falls back to opening a device index blindly, as the simulator
+    always did.
+    '''
+    return fcntl is not None and bool(glob.glob("/dev/video*"))
+
+
 def read_camera_roles():
     '''The saved {"main": <port>, "lateral": <port>} assignment (may be empty).'''
     try:
@@ -1904,7 +1915,8 @@ def run_simulation(cam_index, show_window):
     reads the shared toggle state once per frame via get_state_snapshot(), so the
     web buttons and the keyboard shortcuts drive exactly the same behaviour.
 
-    cam_index   : int  — V4L2 camera device index
+    cam_index   : int | None — V4L2 device index named on the command line;
+                  None means "discover the cameras" (the normal case)
     show_window : bool — open the on-screen FLUORO window (False = web preview only)
     '''
     global _latest_jpeg
@@ -1938,10 +1950,13 @@ def run_simulation(cam_index, show_window):
         '''
         cams = list_cameras()
         main_cam, lateral_cam = resolve_cameras(cams)
-        if main_cam is None:
-            # Nothing discoverable (non-Linux, or an unreadable /dev): fall back
-            # to the index given on the command line, exactly as before.
-            main_cam = {"index": cam_index, "device": "video source %s" % cam_index,
+        if main_cam is None and (cam_index is not None or not discovery_works()):
+            # Either the operator named a device index on the command line, or
+            # this machine cannot enumerate its cameras - open one blindly, as
+            # the simulator always did. Where discovery does work, finding no
+            # camera is the answer: probing anyway just fills the log.
+            blind = 0 if cam_index is None else cam_index
+            main_cam = {"index": blind, "device": "video source %s" % blind,
                         "port": None, "name": "unidentified"}
         with state_lock:
             state["cameras"] = len(cams)
@@ -2398,7 +2413,7 @@ if __name__ == "__main__":
     port = 5000
     host = "0.0.0.0"
     show_window = True
-    cam_index = 0
+    cam_index = None     # None = discover; an explicit index opens that device
     force_http = False
     role_args = {}       # --main / --lateral: port, /dev path or index to save
 

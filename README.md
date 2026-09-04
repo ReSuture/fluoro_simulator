@@ -87,8 +87,9 @@ pip install flask
 python fluoro_web.py [<video device number>] [--port 5000] [--no-window] [--http]
 ```
 
-- `<video device number>` — camera index (default `0`), used only as a fallback
-  when no camera can be discovered (see **Two cameras** below).
+- `<video device number>` — open this V4L2 device index and nothing else.
+  Omit it (the normal case) to let the simulator discover its cameras and assign
+  them by port — see **Two cameras** below.
 - `--port` — web server port (default `5000`).
 - `--no-window` — run web-only, without the on-screen `FLUORO` window.
 - `--http` — force plain HTTP even if a TLS cert is present.
