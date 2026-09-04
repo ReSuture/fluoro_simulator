@@ -87,12 +87,59 @@ pip install flask
 python fluoro_web.py [<video device number>] [--port 5000] [--no-window] [--http]
 ```
 
-- `<video device number>` — camera index (default `0`).
+- `<video device number>` — camera index (default `0`), used only as a fallback
+  when no camera can be discovered (see **Two cameras** below).
 - `--port` — web server port (default `5000`).
 - `--no-window` — run web-only, without the on-screen `FLUORO` window.
 - `--http` — force plain HTTP even if a TLS cert is present.
+- `--list-cameras` — print the attached cameras, their USB ports and which view
+  each one drives, then exit.
+- `--main <port>` / `--lateral <port>` — bind a view to a USB port and save it.
 
 Then open `https://<this-machine-ip>:<port>/` in a browser (or `http://…` if running without a cert).
+
+### Two cameras: main and lateral view
+
+The simulator drives two views, mirroring a C-arm's frontal and lateral
+projections. With two cameras attached, a **Lateral view** button appears on the
+web panel, the on-screen control bar and the `CONTROLS` panel; it is dimmed and
+unpressable whenever fewer than two are attached. Selecting it releases the main
+camera and opens the lateral one — two USB cameras rarely have the bandwidth to
+stream at once, so the views take turns. The last frame stays up during the
+switch, and the image is marked `LATERAL` in the black rim outside the aperture
+so the two projections can never be confused.
+
+Which camera plays which role is decided by the **USB port it is plugged into**,
+not by its `/dev/videoN` number — Linux hands those out in probe order, so they
+shuffle between boots and replugs, while the port is a property of the bench.
+Ports come from V4L2's `bus_info`. To see what is attached:
+
+```bash
+python fluoro_web.py --list-cameras
+```
+
+```
+Cameras attached: 2
+  main     usb-3f980000.usb-1.4           /dev/video0   HD Pro Webcam C920
+  lateral  usb-3f980000.usb-1.2           /dev/video2   HD Pro Webcam C920
+```
+
+With nothing saved, the roles follow port order: first port = main, second =
+lateral. To pin them to specific ports (saved to
+`~/.config/fluorosim/cameras.json`, so it survives replugs and reboots):
+
+```bash
+python fluoro_web.py --main usb-3f980000.usb-1.2 --lateral usb-3f980000.usb-1.4
+```
+
+Cameras are re-inventoried every few seconds (`CAMERA_SCAN_SEC`), so plugging a
+second camera in offers the lateral view without a restart, and unplugging it
+returns to the main view on its own. A single camera always drives the main
+view, even if it sits in the port assigned to the lateral role.
+
+> **Note:** both views currently composite against the same frontal anatomy
+> master. A true lateral projection needs its own master image — that is a
+> separate change.
 
 ### No camera attached
 
@@ -102,8 +149,11 @@ A missing camera never stops the app. The simulator starts as usual — web pane
 banner under the preview. The camera index is retried every few seconds
 (`CAMERA_RETRY_SEC`), so plugging a camera in picks it up automatically with no
 restart, and a camera that is unplugged while running drops back to the same
-placeholder instead of freezing. Recording is unavailable without a camera: an
-in-progress recording is closed cleanly and the Record toggle switches itself off.
+placeholder instead of freezing. With the lateral view selected the screen reads
+**NO LATERAL CAMERA CONNECTED** instead. Recording is unavailable without a
+camera: an in-progress recording is closed cleanly and the Record toggle
+switches itself off (switching views mid-recording does not end it — the
+recording continues, scaled to the size the file was opened at).
 
 ### HTTPS (self-signed cert)
 

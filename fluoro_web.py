@@ -64,9 +64,17 @@ from __future__ import print_function
 
 import os
 import sys
+import glob
+import json
 import time
+import struct
 import threading
 import traceback
+
+try:
+    import fcntl          # Linux only: used to ask V4L2 what each device is
+except ImportError:       # pragma: no cover - non-Linux dev boxes
+    fcntl = None
 
 # Force OpenCV's Qt GUI onto the X11/XWayland backend. Under the native Wayland
 # Qt backend, cv.setWindowProperty(FULLSCREEN) is a no-op (it logs
@@ -192,6 +200,178 @@ FLIP_Z = 1.0
 PAN_STEP_CM = 5.0
 
 # ── Shared state ────────────────────────────────────────────────────────────────
+# ── Camera discovery and the main / lateral roles ─────────────────────────────
+# The simulator drives two views: the MAIN (frontal) camera and an optional
+# LATERAL one, mirroring a C-arm's AP and lateral projections. Which physical
+# camera plays which role is decided by the USB PORT it is plugged into, not by
+# the /dev/videoN number - Linux hands those out in probe order, so they shuffle
+# between boots and replugs, while the port is a property of the bench.
+#
+# V4L2 reports the port in a device's bus_info ("usb-3f980000.usb-1.4"), which is
+# what we key the roles on. The assignment lives in cameras.json next to the
+# device identity cache; with no file (or a port that is not plugged in right
+# now) the roles fall back to port order: first camera = main, second = lateral.
+CAMERA_CONFIG = os.path.join(device_setup.CACHE_DIR, "cameras.json")
+
+# VIDIOC_QUERYCAP: _IOR('V', 0, struct v4l2_capability) - asks a /dev/video*
+# node what it actually is. Necessary because a Pi exposes a dozen video nodes
+# and four of the bcm2835 ISP ones report "video capture": without this filter
+# the simulator would think it had four cameras attached and no camera at all.
+_VIDIOC_QUERYCAP = 0x80685600
+_V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+_V4L2_CAP_STREAMING = 0x04000000
+_V4L2_CAP_DEVICE_CAPS = 0x80000000
+
+# The Pi's own codec/ISP plumbing sits on these buses; real cameras never do.
+_NOT_A_CAMERA_BUS = ("platform:bcm2835",)
+
+
+def _querycap(path):
+    '''Ask one /dev/video* node what it is, or None if it will not answer.
+
+    Read-only: this works on a device another process is already streaming from,
+    so scanning never disturbs the running capture.
+    '''
+    if fcntl is None:
+        return None
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        buf = bytearray(104)
+        fcntl.ioctl(fd, _VIDIOC_QUERYCAP, buf)
+        driver, card, bus, _ver, caps, device_caps = struct.unpack(
+            "16s32s32sIII", bytes(buf[:92]))
+        text = lambda b: b.split(b"\x00")[0].decode("ascii", "replace").strip()
+        return {"driver": text(driver), "name": text(card), "port": text(bus),
+                "caps": device_caps if (caps & _V4L2_CAP_DEVICE_CAPS) else caps}
+    except (OSError, IOError, struct.error):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def list_cameras():
+    '''Every real capture camera attached right now, ordered by port.
+
+    Returns dicts of {device, index, port, name}. The order is stable for a
+    given set of ports (it is the sort order of the port strings, not the probe
+    order), so "first camera = main" means the same thing across reboots.
+    '''
+    cams = []
+    for path in glob.glob("/dev/video*"):
+        cap = _querycap(path)
+        if cap is None:
+            continue
+        if not (cap["caps"] & _V4L2_CAP_VIDEO_CAPTURE):
+            continue
+        if not (cap["caps"] & _V4L2_CAP_STREAMING):
+            continue
+        if cap["port"].startswith(_NOT_A_CAMERA_BUS):
+            continue
+        try:
+            index = int(path.rsplit("video", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        cams.append({"device": path, "index": index,
+                     "port": cap["port"], "name": cap["name"]})
+    # A camera with several nodes (capture + metadata) shares one port; keep the
+    # lowest-numbered node, which is the capture one.
+    best = {}
+    for cam in sorted(cams, key=lambda c: c["index"]):
+        best.setdefault(cam["port"], cam)
+    return sorted(best.values(), key=lambda c: c["port"])
+
+
+def read_camera_roles():
+    '''The saved {"main": <port>, "lateral": <port>} assignment (may be empty).'''
+    try:
+        with open(CAMERA_CONFIG, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return {k: data.get(k) for k in ("main", "lateral") if data.get(k)}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_camera_roles(roles):
+    '''Persist the port assignment so it survives restarts. -> ok bool.'''
+    try:
+        os.makedirs(device_setup.CACHE_DIR, exist_ok=True)
+        with open(CAMERA_CONFIG, "w", encoding="utf-8") as fh:
+            json.dump(roles, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        return True
+    except OSError as exc:
+        print("Could not save %s: %s" % (CAMERA_CONFIG, exc))
+        return False
+
+
+def match_camera(cams, spec):
+    '''Find the attached camera a spec names: a port, a /dev path, or an index.'''
+    if spec is None:
+        return None
+    spec = str(spec).strip()
+    for cam in cams:
+        if spec in (cam["port"], cam["device"], str(cam["index"])):
+            return cam
+    return None
+
+
+def resolve_cameras(cams):
+    '''Decide which attached camera drives each view.
+
+    Saved ports win; anything they do not answer for falls back to port order
+    (first = main, second = lateral). The two roles never collapse onto one
+    camera, and the main view is always filled first: with a single camera
+    attached there is no lateral view, even if that camera sits in the port
+    assigned to the lateral role - a working frontal view beats a black screen.
+
+    Returns (main, lateral) as camera records from list_cameras(), or None.
+    '''
+    if not cams:
+        return None, None
+    # Sorted here too, not just in list_cameras(): "first camera = main" is an
+    # invariant of the role assignment, so it must not depend on the caller
+    # handing them over in port order.
+    cams = sorted(cams, key=lambda c: c["port"])
+    roles = read_camera_roles()
+    main = match_camera(cams, roles.get("main"))
+    lateral = match_camera(cams, roles.get("lateral"))
+    if lateral is main:
+        lateral = None
+    spare = [c for c in cams if c is not main and c is not lateral]
+    if main is None:
+        main = spare.pop(0) if spare else None
+    if lateral is None:
+        lateral = spare.pop(0) if spare else None
+    if main is None:
+        main, lateral = lateral, None
+    return main, lateral
+
+
+def describe_cameras():
+    '''Human-readable inventory for --list-cameras.'''
+    cams = list_cameras()
+    roles = read_camera_roles()
+    main_cam, lateral_cam = resolve_cameras(cams)
+    lines = ["Cameras attached: %d" % len(cams)]
+    if not cams:
+        lines.append("  (none - the simulator will run with a NO CAMERA CONNECTED screen)")
+    for cam in cams:
+        role = ("main" if cam is main_cam else
+                "lateral" if cam is lateral_cam else "-")
+        lines.append("  %-8s %-30s %-13s %s"
+                     % (role, cam["port"], cam["device"], cam["name"]))
+    lines.append("")
+    lines.append("Roles from %s: %s"
+                 % (CAMERA_CONFIG, roles if roles else "(none saved - using port order)"))
+    lines.append("Assign with:  python fluoro_web.py --main <port> --lateral <port>")
+    return "\n".join(lines)
+
+
 # All values touched by both the processing loop and the web handlers live here,
 # guarded by `state_lock`. Booleans mirror the keyboard toggles of the original.
 state_lock = threading.Lock()
@@ -210,6 +390,9 @@ state = {
     "ui_view": "fluoro",    # which tab the FLUORO window shows: fluoro|remote|library
     "recording": False,     # session recording to ~/fluorosim_recordings
     "camera": False,        # read-only: a camera is open and delivering frames
+    "lateral": False,       # show the lateral camera instead of the main one
+    "cameras": 0,           # read-only: how many cameras are attached right now
+    "lateral_available": False,  # read-only: a distinct lateral camera is attached
 }
 
 # How often to retry opening the camera while none is attached (seconds). A
@@ -223,6 +406,28 @@ CAMERA_RETRY_SEC = 3.0
 # released, dropping back to the placeholder + retry path. A few dropped frames
 # are normal, so this is deliberately not 1.
 CAMERA_READ_FAIL_LIMIT = 30
+
+# How often to re-inventory the attached cameras (seconds), so a second camera
+# plugged in mid-session lights up "Lateral view" without a restart.
+CAMERA_SCAN_SEC = 3.0
+
+# After a deliberate view switch, keep showing the last frame for this long
+# while the other camera opens, so switching does not flash the black
+# placeholder for the second or so a USB camera takes to come up.
+CAMERA_SWITCH_HOLD_SEC = 2.0
+
+
+def set_lateral(on):
+    '''Switch the lateral view on/off, ignoring it when there is no second camera.
+
+    The single gate for every caller (web panel, on-screen button, key), so an
+    unavailable lateral view cannot be selected from any of them.
+    '''
+    with state_lock:
+        if on and not state["lateral_available"]:
+            return False
+        state["lateral"] = bool(on)
+        return True
 
 # Compose the fullscreen UI natively at this (width, height) instead of at the
 # camera frame's size — set by --screen for touch displays so the pixels (and
@@ -304,6 +509,8 @@ PAGE = """
   .hint { color: #7d8a99; font-size: 12px; margin: 14px 2px 0; }
   .warn { color: #ff9a9a; background: #2a1416; border: 1px solid #5b2327;
           border-radius: 8px; padding: 10px 12px; font-size: 13px; margin: 12px 0 0; }
+  .viewbtn { width: 100%; margin-top: 16px; }
+  .panel button[disabled] { opacity: 0.4; cursor: not-allowed; }
   .liblink { color: #7af0b6; font-size: 14px; font-weight: 600; text-decoration: none;
              border: 1px solid #26323f; border-radius: 999px; padding: 6px 16px; }
   .liblink:active { transform: translateY(1px); }
@@ -332,6 +539,10 @@ PAGE = """
       running without video. Plug one in and it is picked up automatically.</p>
 
     <div class="panel">
+      <button class="toggle viewbtn" data-toggle="lateral" id="lateralbtn">Lateral
+        view<span class="st">&mdash;</span></button>
+      <p class="hint" id="lateralhint">&nbsp;</p>
+
       <div class="grid" id="toggles">
         <button class="toggle" data-toggle="overlay">Overlay<span class="st">—</span></button>
         <button class="toggle" data-toggle="equalize">Equalize<span class="st">—</span></button>
@@ -374,7 +585,18 @@ function applyState(s) {
     b.classList.toggle('on', (b.dataset.run === '1') === !!s.running);
   });
   var warn = document.getElementById('camwarn');
-  if (warn) warn.hidden = !(s.running && !s.camera);
+  if (warn) {
+    warn.hidden = !(s.running && !s.camera);
+    warn.textContent = (s.lateral ? 'No lateral camera connected' : 'No camera connected')
+      + ' \u2014 the simulator is running without video. Plug one in and it is'
+      + ' picked up automatically.';
+  }
+  var lat = document.getElementById('lateralbtn');
+  if (lat) lat.disabled = !s.lateral_available;
+  var lathint = document.getElementById('lateralhint');
+  if (lathint) lathint.textContent = s.lateral_available
+    ? 'Two cameras attached \u2014 Lateral view switches to the second one.'
+    : (+s.cameras || 0) + ' camera(s) attached \u2014 Lateral view needs two.';
   var pos = document.getElementById('pos');
   if (pos) pos.textContent = 'Camera: x=' + (+s.pos_x_cm || 0).toFixed(1) +
                              '  y=' + (+s.pos_y_cm || 0).toFixed(1) +
@@ -472,6 +694,12 @@ def api_toggle(name):
     Only the known toggle names are accepted; anything else is ignored so an
     arbitrary key can't be injected into the state dict.
     '''
+    if name == "lateral":
+        # Gated: selecting a lateral view with no second camera does nothing.
+        with state_lock:
+            want = not state["lateral"]
+        set_lateral(want)
+        return jsonify(get_state_snapshot())
     with state_lock:
         if name in ("overlay", "equalize", "pedal_mode", "pedal_pressed", "hud",
                     "recording"):
@@ -742,8 +970,14 @@ def paste_rgba(dst, rgba, x, y, target_w):
 
 
 def draw_button(img, x, y, w, h, label, sub=None, on=False, variant="normal"):
-    '''Draw one themed button (fill + border + centred label, optional ON/OFF sub-label).'''
-    if variant == "quit":
+    '''Draw one themed button (fill + border + centred label, optional ON/OFF sub-label).
+
+    variant="disabled" dims the button; callers that pass it also leave the
+    button out of their hit-box list, so it cannot be pressed.
+    '''
+    if variant == "disabled":
+        bg, bd, tx = C_BG, C_BTN_BD, C_SUBTEXT
+    elif variant == "quit":
         bg, bd, tx = C_QUIT_BG, C_QUIT_BD, C_QUIT_TX
     elif on:
         bg, bd, tx = C_ON_BG, C_ON_BD, C_ON_TX
@@ -826,7 +1060,7 @@ def render_controls(s, logo, live):
     # rows: 3 toggle rows, then a location caption + nudge row, then Fullscreen/
     # Windowed, then Quit.
     H = (top_pad + lh + 14 + 26 + 14 + bt * 3 + gap * 3
-         + cap_h + gap + ba + gap + ba + gap + ba + 16)
+         + cap_h + gap + ba + gap + ba + gap + ba + gap + ba + 16)
 
     img = np.full((H, W, 3), C_BG, np.uint8)
     buttons = []
@@ -872,6 +1106,15 @@ def render_controls(s, logo, live):
         buttons.append((bx, y, pw, ba, "pan", name))
     y += ba + gap
 
+    # Lateral view: only pressable while a second camera is attached.
+    lat_ok = bool(s["lateral_available"])
+    draw_button(img, m, y, W - 2 * m, ba, "Lateral view",
+                None if lat_ok else "needs 2 cameras", bool(s["lateral"]),
+                "normal" if lat_ok else "disabled")
+    if lat_ok:
+        buttons.append((m, y, W - 2 * m, ba, "action", "lateral"))
+    y += ba + gap
+
     draw_button(img, m, y, cw, ba, "Fullscreen", None, s["fullscreen"])
     buttons.append((m, y, cw, ba, "action", "fullscreen"))
     draw_button(img, m + cw + gap, y, cw, ba, "Windowed", None, not s["fullscreen"])
@@ -913,13 +1156,18 @@ def render_control_bar(s, width, live):
         buttons.append((bx, y, cw, bh, "toggle", key))
 
     y += bh + gap
-    aw = (width - 2 * pad - 2 * gap) // 3
-    draw_button(img, pad, y, aw, bh, "Fullscreen", None, s["fullscreen"])
-    buttons.append((pad, y, aw, bh, "action", "fullscreen"))
-    draw_button(img, pad + aw + gap, y, aw, bh, "Windowed", None, not s["fullscreen"])
-    buttons.append((pad + aw + gap, y, aw, bh, "action", "windowed"))
-    draw_button(img, pad + 2 * (aw + gap), y, aw, bh, "Stop simulator", None, False, "quit")
-    buttons.append((pad + 2 * (aw + gap), y, aw, bh, "action", "stop"))
+    aw = (width - 2 * pad - 3 * gap) // 4
+    lat_ok = bool(s["lateral_available"])
+    draw_button(img, pad, y, aw, bh, "Lateral view", None, bool(s["lateral"]),
+                "normal" if lat_ok else "disabled")
+    if lat_ok:
+        buttons.append((pad, y, aw, bh, "action", "lateral"))
+    draw_button(img, pad + aw + gap, y, aw, bh, "Fullscreen", None, s["fullscreen"])
+    buttons.append((pad + aw + gap, y, aw, bh, "action", "fullscreen"))
+    draw_button(img, pad + 2 * (aw + gap), y, aw, bh, "Windowed", None, not s["fullscreen"])
+    buttons.append((pad + 2 * (aw + gap), y, aw, bh, "action", "windowed"))
+    draw_button(img, pad + 3 * (aw + gap), y, aw, bh, "Stop simulator", None, False, "quit")
+    buttons.append((pad + 3 * (aw + gap), y, aw, bh, "action", "stop"))
 
     # Row 3: background-location readout + nudge buttons (X−/X+/Y−/Y+/Z−/Z+).
     y += bh + gap
@@ -1528,6 +1776,11 @@ def apply_button(kind, name):
         # (they talk to their own managers, which have their own locks).
         handle_view_button(kind, name)
         return
+    if name == "lateral":
+        with state_lock:
+            want = not state["lateral"]
+        set_lateral(want)
+        return
     with state_lock:
         if kind == "toggle":
             state[name] = not state[name]
@@ -1656,13 +1909,15 @@ def run_simulation(cam_index, show_window):
     '''
     global _latest_jpeg
 
-    def open_camera():
-        '''Open the capture device, or return None when there is no camera.
+    def open_camera(cam):
+        '''Open one camera record, or None if it will not open.
 
+        Opens by V4L2 device index, which is what the backend has always been
+        given here; the port -> index lookup already happened in the scan.
         Returning None rather than a dead VideoCapture lets the loop fall
         through to the "no camera" placeholder and retry the open later.
         '''
-        c = cv.VideoCapture(cam_index, cv.CAP_V4L2)
+        c = cv.VideoCapture(cam["index"], cv.CAP_V4L2)
         if not c.isOpened():
             c.release()
             return None
@@ -1671,7 +1926,29 @@ def run_simulation(cam_index, show_window):
     def publish_camera(ok):
         '''Mirror camera presence into the shared state (read by the web panel).'''
         with state_lock:
-            state["camera"] = ok
+            if state["camera"] != ok:
+                state["camera"] = ok
+
+    def rescan_cameras():
+        '''Re-inventory the attached cameras and re-resolve the two roles.
+
+        Publishes the count and whether a lateral view is on offer, and drops
+        back to the main view if the lateral camera has been unplugged.
+        -> (main_spec, lateral_spec)
+        '''
+        cams = list_cameras()
+        main_cam, lateral_cam = resolve_cameras(cams)
+        if main_cam is None:
+            # Nothing discoverable (non-Linux, or an unreadable /dev): fall back
+            # to the index given on the command line, exactly as before.
+            main_cam = {"index": cam_index, "device": "video source %s" % cam_index,
+                        "port": None, "name": "unidentified"}
+        with state_lock:
+            state["cameras"] = len(cams)
+            state["lateral_available"] = lateral_cam is not None
+            if state["lateral"] and lateral_cam is None:
+                state["lateral"] = False
+        return main_cam, lateral_cam
 
     # Placeholder frame published to the preview while the sim is in standby.
     stopped_img = np.full((480, 640), 16, np.uint8)
@@ -1680,20 +1957,27 @@ def run_simulation(cam_index, show_window):
     ok, _stopped_jpg = cv.imencode(".jpg", stopped_img, [cv.IMWRITE_JPEG_QUALITY, 80])
     stopped_buf = _stopped_jpg.tobytes() if ok else None
 
-    # Frame shown in place of the video whenever no camera is attached: a plain
-    # black screen with the message. It is the same shape as an ordinary
-    # processed frame, so the tab bar, the control bar, the Library tab and the
-    # web preview all lay out exactly as they do with a live feed.
-    no_camera_img = np.zeros((480, 640), np.uint8)
-    _font = cv.FONT_HERSHEY_SIMPLEX
-    for _text, _size, _thick, _grey, _y in (
-            ("NO CAMERA CONNECTED", 0.9, 2, 235, 232),
-            ("connect a camera - it is picked up automatically", 0.45, 1, 130, 262)):
-        (_tw, _), _ = cv.getTextSize(_text, _font, _size, _thick)
-        cv.putText(no_camera_img, _text, ((640 - _tw) // 2, _y), _font, _size,
-                   _grey, _thick, cv.LINE_AA)
-    ok, _no_cam_jpg = cv.imencode(".jpg", no_camera_img, [cv.IMWRITE_JPEG_QUALITY, 80])
-    no_camera_buf = _no_cam_jpg.tobytes() if ok else None
+    # Frame shown in place of the video whenever the camera for the current view
+    # is not attached: a plain black screen with the message. It is the same
+    # shape as an ordinary processed frame, so the tab bar, the control bar, the
+    # Library tab and the web preview all lay out exactly as with a live feed.
+    # One per view, so a missing lateral camera says so.
+    def build_placeholder(head):
+        img = np.zeros((480, 640), np.uint8)
+        font = cv.FONT_HERSHEY_SIMPLEX
+        for text, size, thick, grey, ty in (
+                (head, 0.9, 2, 235, 232),
+                ("connect a camera - it is picked up automatically", 0.45, 1, 130, 262)):
+            (tw, _), _ = cv.getTextSize(text, font, size, thick)
+            cv.putText(img, text, ((640 - tw) // 2, ty), font, size, grey, thick,
+                       cv.LINE_AA)
+        enc_ok, jpg = cv.imencode(".jpg", img, [cv.IMWRITE_JPEG_QUALITY, 80])
+        return img, (jpg.tobytes() if enc_ok else None)
+
+    no_camera_img, no_camera_buf = {}, {}
+    for _role, _head in (("main", "NO CAMERA CONNECTED"),
+                         ("lateral", "NO LATERAL CAMERA CONNECTED")):
+        no_camera_img[_role], no_camera_buf[_role] = build_placeholder(_head)
 
     # Full-resolution "master" anatomy background, kept untouched at full res so we
     # can crop a fresh viewport out of it every frame (see compute_viewport). Falls
@@ -1741,7 +2025,13 @@ def run_simulation(cam_index, show_window):
     cap = None
     windows_open = False       # FLUORO window currently created (independent of the camera)
     next_cam_retry = 0.0       # monotonic deadline for the next camera open attempt
+    next_cam_scan = 0.0        # monotonic deadline for the next camera inventory
     read_fails = 0             # consecutive failed reads (camera unplugged?)
+    active_role = None         # which view the open `cap` belongs to: main|lateral
+    role = "main"              # view selected for this iteration
+    main_cam = lateral_cam = None     # camera records the two roles resolve to
+    hold_until = 0.0           # keep the last frame up while switching views
+    rec_shape = None           # frame shape the running recording was opened at
     applied_fullscreen = None  # last fullscreen state pushed to the window (avoids redundant calls)
     res = None                 # last processed frame (shown + streamed)
     live = False               # True once a frame has been read (drives the status dot)
@@ -1772,7 +2062,10 @@ def run_simulation(cam_index, show_window):
                 res, live = None, False
             windows_open = False
             next_cam_retry = 0.0
+            next_cam_scan = 0.0
             read_fails = 0
+            active_role = None
+            hold_until = 0.0
             publish_camera(False)
             if stopped_buf is not None:
                 with _latest_lock:
@@ -1787,19 +2080,48 @@ def run_simulation(cam_index, show_window):
             show_fluoro_window()
             windows_open = True
 
+        # Re-inventory the attached cameras on a timer, so a second one plugged
+        # in mid-session offers the lateral view (and one pulled out withdraws
+        # it) without a restart.
+        if time.monotonic() >= next_cam_scan:
+            next_cam_scan = time.monotonic() + CAMERA_SCAN_SEC
+            main_cam, lateral_cam = rescan_cameras()
+            s = get_state_snapshot()   # the rescan may have cleared "lateral"
+
+        # Which camera this view wants. Flipping the Lateral view button drops
+        # the current camera and opens the other one: two USB cameras rarely
+        # have the bandwidth to stream at once, so the views take turns.
+        role = "lateral" if s["lateral"] else "main"
+        if role != active_role:
+            if cap is not None:
+                cap.release()
+                cap = None
+                read_fails = 0
+                # Hold the last frame briefly so a switch does not flash black
+                # for the second a USB camera takes to come up.
+                hold_until = time.monotonic() + CAMERA_SWITCH_HOLD_SEC
+            next_cam_retry = 0.0
+            active_role = role
+        want = lateral_cam if role == "lateral" else main_cam
+
         # (Re)open the camera. A missing one is not fatal - the capture section
         # below stands the "NO CAMERA CONNECTED" frame in for the video - so we
         # keep retrying on a timer and pick up a camera plugged in later.
-        if cap is None and time.monotonic() >= next_cam_retry:
+        if cap is None and want is None:
+            publish_camera(False)
+        elif cap is None and time.monotonic() >= next_cam_retry:
             first_try = next_cam_retry == 0.0
             next_cam_retry = time.monotonic() + CAMERA_RETRY_SEC
-            cap = open_camera()
+            cap = open_camera(want)
             read_fails = 0
             if cap is not None:
-                print("Camera %s connected." % cam_index)
+                print("%s camera connected: %s (%s)"
+                      % (role.capitalize(), want["device"], want["name"]))
+                hold_until = 0.0
             elif first_try:
-                print("No camera on video source %s - running without video "
-                      "(retrying every %.0fs)." % (cam_index, CAMERA_RETRY_SEC))
+                print("No %s camera at %s - running without video "
+                      "(retrying every %.0fs)."
+                      % (role, want["device"], CAMERA_RETRY_SEC))
             publish_camera(cap is not None)
 
         # Keep the OpenCV window's fullscreen state in sync with the toggle, and
@@ -1846,10 +2168,13 @@ def run_simulation(cam_index, show_window):
                        and not lib_playing and cap is not None)
 
         if cap is None:
-            # No camera: publish the placeholder as this frame's output so the
-            # window, the tab bar and the Library keep rendering, and idle a
-            # little so an unattended simulator does not spin a core.
-            res, live = no_camera_img, False
+            # No camera for this view: publish the placeholder as this frame's
+            # output so the window, the tab bar and the Library keep rendering,
+            # and idle a little so an unattended simulator does not spin a core.
+            # Mid-switch the last frame stays up until hold_until passes.
+            live = False
+            if res is None or time.monotonic() >= hold_until:
+                res = no_camera_img[role]
             time.sleep(0.03)
         elif capture_now:
             ret, frame = cap.read()
@@ -1859,8 +2184,8 @@ def run_simulation(cam_index, show_window):
                 # find it again (the placeholder shows in the meantime).
                 read_fails += 1
                 if read_fails >= CAMERA_READ_FAIL_LIMIT:
-                    print("Camera %s stopped delivering frames - released."
-                          % cam_index)
+                    print("%s camera stopped delivering frames - released."
+                          % role.capitalize())
                     cap.release()
                     cap = None
                     read_fails = 0
@@ -1899,14 +2224,25 @@ def run_simulation(cam_index, show_window):
                          (s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"]))
             if pedal_down:
                 draw_str(res, (20, 80), "PEDAL ACTIVE")
+            if s["lateral"]:
+                # Which projection you are looking at, in the black rim outside
+                # the C-arm aperture. Not gated on the HUD toggle: mistaking a
+                # lateral image for a frontal one is exactly the confusion the
+                # simulator should never create.
+                (mw, mh), _ = cv.getTextSize("LATERAL", cv.FONT_HERSHEY_SIMPLEX,
+                                             0.6, 2)
+                cv.putText(res, "LATERAL", (res.shape[1] - mw - 20, mh + 16),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.6, 235, 2, cv.LINE_AA)
 
         # Recording needs a live camera: if it disappears mid-session, close the
         # file cleanly and flip the toggle off instead of filling the recording
-        # with the placeholder frame.
-        if s["recording"] and cap is None:
+        # with the placeholder frame. The hold window covers a view switch, so
+        # toggling Lateral view mid-recording does not end the recording.
+        if s["recording"] and cap is None and time.monotonic() >= hold_until:
             if recorder.active:
                 recorder.stop()
                 uploads.poke()
+                rec_shape = None
             library.error = "Recording needs a camera - none is connected."
             with state_lock:
                 state["recording"] = False
@@ -1917,15 +2253,25 @@ def run_simulation(cam_index, show_window):
         # off and surfaces its error on the Library tab.
         if s["recording"] and res is not None:
             if recorder.ensure_started(res.shape):
+                if rec_shape is None:
+                    rec_shape = res.shape
                 if capture_now:
-                    recorder.submit(res)
+                    # The writer is fixed at the size it opened with, so a view
+                    # switch to a camera of a different resolution is scaled to
+                    # match rather than silently corrupting the file.
+                    frame_out = res
+                    if res.shape[:2] != rec_shape[:2]:
+                        frame_out = cv.resize(res, (rec_shape[1], rec_shape[0]))
+                    recorder.submit(frame_out)
             else:
                 with state_lock:
                     state["recording"] = False
                 library.error = recorder.error
+                rec_shape = None
         elif not s["recording"] and recorder.active:
             recorder.stop()
             uploads.poke()
+            rec_shape = None
 
         rec_elapsed = recorder.elapsed_str() if recorder.active else None
 
@@ -1993,11 +2339,11 @@ def run_simulation(cam_index, show_window):
                 ctrl_buttons[:] = btns
                 cv.imshow("CONTROLS", panel)
                 cv.imshow("FLUORO", np.vstack([tab, vid]))
-        if res is no_camera_img and no_camera_buf is not None:
+        if res is no_camera_img.get(role) and no_camera_buf.get(role) is not None:
             # Static placeholder: publish the pre-encoded copy rather than
             # re-encoding the same image on every iteration.
             with _latest_lock:
-                _latest_jpeg = no_camera_buf
+                _latest_jpeg = no_camera_buf[role]
         elif res is not None:
             # The web MJPEG preview always streams the clean frame (the browser has
             # its own HTML buttons), so encode `res`, not the composited view.
@@ -2054,6 +2400,7 @@ if __name__ == "__main__":
     show_window = True
     cam_index = 0
     force_http = False
+    role_args = {}       # --main / --lateral: port, /dev path or index to save
 
     i = 0
     while i < len(args):
@@ -2069,7 +2416,33 @@ if __name__ == "__main__":
         if a == "--screen":        # compose fullscreen natively at WxH (touch displays)
             sw, sh = args[i + 1].lower().split("x")
             SCREEN_SIZE = (int(sw), int(sh)); i += 2; continue
+        if a == "--list-cameras":  # show what is attached, and which port is which
+            print(describe_cameras()); sys.exit(0)
+        if a in ("--main", "--lateral"):
+            role_args[a[2:]] = args[i + 1]; i += 2; continue
         cam_index = int(a); i += 1
+
+    # --main/--lateral bind a view to the USB PORT a camera is plugged into and
+    # save it, so the assignment survives replugs, reboots and /dev/videoN
+    # renumbering. Ports come from --list-cameras.
+    if role_args:
+        attached = list_cameras()
+        roles = read_camera_roles()
+        for role, spec in role_args.items():
+            cam = match_camera(attached, spec)
+            if cam is None:
+                print("No camera attached matching %r - saving it for the %s view "
+                      "anyway (plug it in and it will be picked up)." % (spec, role))
+                roles[role] = spec
+            else:
+                roles[role] = cam["port"]
+                print("%s view: %s  (%s, %s)"
+                      % (role.capitalize(), cam["port"], cam["device"], cam["name"]))
+        if roles.get("main") and roles.get("main") == roles.get("lateral"):
+            print("Both views point at the same port - refusing to save.")
+            sys.exit(1)
+        if write_camera_roles(roles):
+            print("Saved to %s" % CAMERA_CONFIG)
 
     # Serve HTTPS with the self-signed cert if cert.pem/key.pem are present next to
     # this script (so browsers that force secure connections can reach the panel).
