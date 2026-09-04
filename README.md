@@ -104,11 +104,15 @@ Then open `https://<this-machine-ip>:<port>/` in a browser (or `http://…` if r
 The simulator drives two views, mirroring a C-arm's frontal and lateral
 projections. With two cameras attached, a **Lateral view** button appears on the
 web panel, the on-screen control bar and the `CONTROLS` panel; it is dimmed and
-unpressable whenever fewer than two are attached. Selecting it releases the main
-camera and opens the lateral one — two USB cameras rarely have the bandwidth to
-stream at once, so the views take turns. The last frame stays up during the
-switch, and the image is marked `LATERAL` in the black rim outside the aperture
-so the two projections can never be confused.
+unpressable whenever fewer than two are attached.
+
+Selecting it puts **both projections on screen side by side**, each with its own
+circular field, captioned `FRONTAL` and `LATERAL` in the outer bottom corners so
+the two can never be confused. Both cameras stay open together while the split
+view is on, so toggling it never interrupts the frontal image; turning it off
+closes the lateral camera again rather than hold USB bandwidth it is not using.
+If one camera drops out, its half shows that half's "no camera" screen and the
+other keeps running.
 
 Which camera plays which role is decided by the **USB port it is plugged into**,
 not by its `/dev/videoN` number — Linux hands those out in probe order, so they
@@ -138,9 +142,32 @@ second camera in offers the lateral view without a restart, and unplugging it
 returns to the main view on its own. A single camera always drives the main
 view, even if it sits in the port assigned to the lateral role.
 
-> **Note:** both views currently composite against the same frontal anatomy
-> master. A true lateral projection needs its own master image — that is a
-> separate change.
+#### The lateral anatomy background
+
+The lateral view composites against `lateral_master.png` next to the script.
+That file does not exist yet, so the simulator builds an obvious placeholder
+instead — a plain light field captioned `LATERAL MASTER / PLACEHOLDER - NO IMAGE
+YET`, repeated often enough that any pan position lands on a caption. It is
+deliberately not anatomy: the lateral half works today without pretending to be
+a real projection.
+
+Drop a real image in at `lateral_master.png` and it is used on the next start,
+no code change. It should have the **same pixel dimensions as
+`fulltorsofluoroimage.png`** (3691 × 1340), because the cm → pixel pan/zoom
+calibration is expressed in that image's pixels; a mismatch is logged at
+startup and the two views will not pan alike. It goes through the same tone
+mapping as the frontal master (`MASTER_INVERT`, `MASTER_GAMMA`,
+`MASTER_SOFTEN`), so supply it in the same polarity as the frontal one.
+
+#### Frame rate
+
+The attenuation composite is the expensive part of a frame and split screen runs
+it twice, so each half is composited at `SPLIT_WORK_MAX_W` (480px) wide and
+scaled into place rather than at the camera's full resolution. Measured on the
+Pi 3 B+ in the bench unit: **18.7 fps single view, 13.6 fps split** — both
+inside the 7.5–15 pulses/sec range real fluoroscopy runs at. Raise
+`SPLIT_WORK_MAX_W` for a sharper split at a lower rate, or lower it for the
+reverse.
 
 ### No camera attached
 

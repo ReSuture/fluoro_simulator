@@ -11,7 +11,7 @@ which port each camera sits on. Everything after that stubs the hardware -
 these tests must pass on a bench with no cameras attached at all, which is
 exactly when the no-camera and lateral-availability paths matter most.
 
-The capture-loop section (7) drives the real run_simulation() with a fake
+The capture-loop section (8) drives the real run_simulation() with a fake
 VideoCapture, so it takes ~20s. It calls os._exit at the end because
 run_simulation owns the process by design.
 '''
@@ -181,7 +181,40 @@ check("the panel page carries the Lateral view button",
       'data-toggle="lateral"' in client.get("/").get_data(as_text=True))
 
 
-print("\n7. Live switching inside the real capture loop")
+print("\n7. Masters and the attenuation composite")
+check("a missing master file loads as None",
+      f.load_master(os.path.join(tempfile.gettempdir(), "nope-no-such.png")) is None)
+frontal = f.load_master(f.MASTER_IMAGE)
+check("the frontal master loads", frontal is not None and frontal.ndim == 2)
+filler = f.build_filler_master(frontal.shape)
+check("the lateral filler matches the frontal master's pixel dimensions",
+      filler.shape == frontal.shape[:2],
+      "%s vs %s" % (filler.shape, frontal.shape))
+check("the filler is a light field (it attenuates little)", filler.mean() > 150,
+      filler.mean())
+# Any viewport crop must land on a caption, so the filler can never be mistaken
+# for real anatomy however the operator pans.
+crop = f.compute_viewport(filler, 0, 0, 0)
+check("a viewport crop of the filler contains its caption",
+      crop.min() < 175, "darkest pixel in crop: %d" % crop.min())
+
+# composite_overlay runs its transmission curve through a LUT rather than a
+# float power. Guard that against the reference maths it replaced.
+_g = np.full((240, 320), 170, np.uint8)
+cv_ = f.cv
+cv_.circle(_g, (150, 120), 60, 60, -1)
+_g = cv_.GaussianBlur(_g, (0, 0), 3)
+_over = cv_.resize(f.compute_viewport(frontal, 0, 0, 0), (320, 240))
+_ref = (_over.astype(np.float32) * np.clip(
+    _g.astype(np.float32) / f.estimate_illumination(_g), 0.0, 1.0) ** f.ATTEN_GAMMA
+        ).astype(np.uint8)
+_got = f.composite_overlay(_g, _over, False)
+_diff = np.abs(_ref.astype(np.int16) - _got.astype(np.int16))
+check("the LUT composite matches the float reference within 1 level",
+      _diff.max() <= 1, "max difference %d" % _diff.max())
+
+
+print("\n8. Split screen in the real capture loop")
 STUB = {"cams": [A], "dead": set()}
 LEVEL = {0: 100, 2: 200}      # the two cameras differ only in brightness
 
@@ -215,19 +248,25 @@ with f.state_lock:
                     "running": True, "quit": False})
 
 
-def preview_mean():
-    '''Mean brightness of the frame currently on the web preview.'''
+def preview_image():
+    '''The frame currently on the web preview, decoded.'''
     with f._latest_lock:
         buf = f._latest_jpeg
     if not buf:
         return None
-    img = f.cv.imdecode(np.frombuffer(buf, np.uint8), f.cv.IMREAD_GRAYSCALE)
+    return f.cv.imdecode(np.frombuffer(buf, np.uint8), f.cv.IMREAD_GRAYSCALE)
+
+
+def preview_mean():
+    '''Mean brightness of the frame currently on the web preview.'''
+    img = preview_image()
     return None if img is None else round(float(img.mean()), 1)
 
 
 threading.Thread(target=lambda: f.run_simulation(None, False), daemon=True).start()
 
 time.sleep(4)
+single = preview_image()
 main_level = preview_mean()
 # The circular C-arm aperture blacks out the corners, so a uniform frame of
 # level L reads back at roughly 0.5*L. What matters is that each view tracks
@@ -244,11 +283,26 @@ check("a second camera appears -> lateral becomes available",
 
 f.set_lateral(True)
 time.sleep(4)
-lateral_level = preview_mean()
-check("switching to lateral shows the OTHER camera",
-      lateral_level is not None and main_level is not None
-      and lateral_level > 1.7 * main_level,
-      "main=%s lateral=%s" % (main_level, lateral_level))
+split = preview_image()
+single_aspect = single.shape[1] / float(single.shape[0])
+split_aspect = split.shape[1] / float(split.shape[0])
+check("selecting Lateral view puts two views on screen (frame ~twice as wide)",
+      split_aspect > 1.8 * single_aspect,
+      "aspect %.2f -> %.2f" % (single_aspect, split_aspect))
+
+# The two stub cameras differ only in brightness, so each half must track its
+# own camera: left the frontal one, right the lateral one.
+mid = split.shape[1] // 2
+left_half = split[:, :mid - 6].mean()
+right_half = split[:, mid + 6:].mean()
+check("the left half is the frontal camera",
+      abs(left_half - main_level) < 8,
+      "single view %.1f, left half %.1f" % (main_level, left_half))
+check("the right half is the lateral camera (2x the brightness)",
+      right_half > 1.7 * left_half,
+      "left %.1f right %.1f" % (left_half, right_half))
+check("the frontal camera was never dropped for the switch",
+      f.state["camera"] is True)
 
 STUB["cams"] = [A]                         # the lateral camera is pulled out
 STUB["dead"].add(2)
@@ -260,6 +314,9 @@ check("the main view is live again after the fallback",
       back_level is not None and main_level is not None
       and abs(back_level - main_level) < 5,
       "was %s, now %s" % (main_level, back_level))
+check("the frame is back to a single view",
+      abs(preview_image().shape[1] / float(preview_image().shape[0])
+          - single_aspect) < 0.2)
 
 
 print("\n%d passed, %d failed" % (len(PASSED), len(FAILED)))

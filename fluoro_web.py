@@ -157,6 +157,14 @@ APERTURE_FEATHER = 0.015
 # width ratio, so the default framing and pan feel are unchanged — the FOV is
 # anchored to the body width, not to true anatomical centimetres.)
 MASTER_IMAGE = os.path.join(BASE_DIR, "fulltorsofluoroimage.png")
+
+# The lateral view's anatomy background. Optional: with no file here the
+# simulator builds an obvious placeholder field instead (build_filler_master),
+# so the lateral half works before the real image exists. Drop a file in at
+# this path and it is used instead, no code change — it should have the same
+# pixel dimensions as MASTER_IMAGE, since the cm -> pixel pan/zoom calibration
+# below is expressed in that image's pixels.
+LATERAL_MASTER_IMAGE = os.path.join(BASE_DIR, "lateral_master.png")
 # The source radiograph is film-convention (dense = bright: white bones, dark
 # air). Attenuation-based fluoro display is the opposite — dense = dark, so
 # bone reads darker than tissue and the unattenuated background is bright.
@@ -425,7 +433,15 @@ CAMERA_SCAN_SEC = 3.0
 # After a deliberate view switch, keep showing the last frame for this long
 # while the other camera opens, so switching does not flash the black
 # placeholder for the second or so a USB camera takes to come up.
-CAMERA_SWITCH_HOLD_SEC = 2.0
+# Split screen: each half is composited at no more than this width before
+# being scaled into place. The pipeline costs ~60ms per view at 640x480 on a
+# Pi 3, so compositing both halves at full capture resolution would put the
+# split view into single-figure frame rates. The single frontal view is
+# untouched and still composites at the camera's own resolution.
+SPLIT_WORK_MAX_W = 480
+
+# Width of the dark seam drawn between the two halves.
+SPLIT_DIVIDER_PX = 3
 
 
 def set_lateral(on):
@@ -598,15 +614,14 @@ function applyState(s) {
   var warn = document.getElementById('camwarn');
   if (warn) {
     warn.hidden = !(s.running && !s.camera);
-    warn.textContent = (s.lateral ? 'No lateral camera connected' : 'No camera connected')
-      + ' \u2014 the simulator is running without video. Plug one in and it is'
-      + ' picked up automatically.';
+    warn.textContent = 'No camera connected \u2014 the simulator is'
+      + ' running without video. Plug one in and it is picked up automatically.';
   }
   var lat = document.getElementById('lateralbtn');
   if (lat) lat.disabled = !s.lateral_available;
   var lathint = document.getElementById('lateralhint');
   if (lathint) lathint.textContent = s.lateral_available
-    ? 'Two cameras attached \u2014 Lateral view switches to the second one.'
+    ? 'Two cameras attached \u2014 Lateral view shows both projections side by side.'
     : (+s.cameras || 0) + ' camera(s) attached \u2014 Lateral view needs two.';
   var pos = document.getElementById('pos');
   if (pos) pos.textContent = 'Camera: x=' + (+s.pos_x_cm || 0).toFixed(1) +
@@ -832,6 +847,16 @@ def estimate_illumination(gray):
     return np.maximum(bright.astype(np.float32), 1.0)
 
 
+# Transmission curve as a 256-entry table. The maths is t**ATTEN_GAMMA applied
+# per pixel; done as a float power over a 300k-element array it cost ~30ms a
+# frame on a Pi 3, which is most of a frame budget and twice that in split
+# screen. Through a LUT in OpenCV's vectorised C it is the same curve at 8-bit
+# precision: measured against the float version on the device, the largest
+# difference anywhere in the image is 1 level out of 255.
+_ATTEN_LUT = np.clip((np.arange(256) / 255.0) ** ATTEN_GAMMA * 255.0,
+                     0, 255).astype(np.uint8)
+
+
 def composite_overlay(gray, overlay, equalize):
     '''Composite the anatomy overlay with the camera frame by attenuation.
 
@@ -842,9 +867,12 @@ def composite_overlay(gray, overlay, equalize):
     external light source divides out, bone reads darker than tissue (from
     the polarity-inverted master), and the device is darkest of all.
     '''
-    trans = np.clip(gray.astype(np.float32) / estimate_illumination(gray),
-                    0.0, 1.0) ** ATTEN_GAMMA
-    out = (overlay.astype(np.float32) * trans).astype(np.uint8)
+    # Transmission as 0-255, then shaped through _ATTEN_LUT; cv.divide's scale
+    # puts the ratio on the 8-bit scale and saturates rather than wrapping.
+    ratio = cv.divide(gray.astype(np.float32), estimate_illumination(gray),
+                      scale=255.0)
+    trans = cv.LUT(np.clip(ratio, 0, 255).astype(np.uint8), _ATTEN_LUT)
+    out = cv.multiply(overlay, trans, scale=1.0 / 255.0, dtype=cv.CV_8U)
 
     if equalize:
         clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -886,6 +914,115 @@ def apply_aperture(img):
     if img.ndim == 3:
         mask = mask[:, :, None]
     return (img.astype(np.float32) * mask).astype(np.uint8)
+
+
+def load_master(path):
+    '''Load an anatomy master and tone-map it into the compositing space.
+
+    Returns None if the file is missing. The tone mapping (polarity, gamma,
+    soften, brightness) is the tuned look — every master goes through it, so
+    the frontal and lateral backgrounds match.
+    '''
+    img = cv.imread(path)
+    if img is None:
+        return None
+    img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+    if MASTER_INVERT:
+        img = 255 - img
+    if MASTER_GAMMA != 1.0:
+        lut = (np.clip((np.arange(256) / 255.0) ** MASTER_GAMMA, 0.0, 1.0)
+               * 255.0).astype(np.uint8)
+        img = cv.LUT(img, lut)
+    if MASTER_SOFTEN > 0:
+        img = cv.GaussianBlur(img, (0, 0), MASTER_SOFTEN)
+    if MASTER_BRIGHTNESS != 1.0:
+        img = cv.convertScaleAbs(img, alpha=MASTER_BRIGHTNESS, beta=0)
+    return img
+
+
+def build_filler_master(shape, label="LATERAL MASTER"):
+    '''Stand-in background for a view whose master image does not exist yet.
+
+    Deliberately not anatomy: a plain light field, captioned often enough that
+    any viewport crop lands on a caption, so nobody can mistake the filler for
+    a real projection. Built at the same pixel dimensions as the frontal
+    master so the cm -> pixel pan/zoom calibration applies unchanged, and
+    already in the post-tone-mapping space that load_master returns.
+    '''
+    h, w = shape[:2]
+    # Light field = little attenuation, so the camera image reads through it.
+    yy, xx = np.ogrid[:h, :w]
+    vignette = np.sqrt(((yy - h / 2.0) / (h / 2.0)) ** 2
+                       + ((xx - w / 2.0) / (w / 2.0)) ** 2)
+    img = (206 * np.clip(1.0 - 0.10 * vignette, 0.0, 1.0)).astype(np.uint8)
+
+    font = cv.FONT_HERSHEY_SIMPLEX
+    step = 520          # < the shortest viewport crop, so a caption is always in shot
+    for cy in range(step // 2, h, step):
+        for row, (text, scale, thick) in enumerate(
+                ((label, 1.5, 3), ("PLACEHOLDER - NO IMAGE YET", 0.8, 2))):
+            (tw, th), _ = cv.getTextSize(text, font, scale, thick)
+            cv.putText(img, text, ((w - tw) // 2, cy + row * 58), font, scale,
+                       150, thick, cv.LINE_AA)
+    return img
+
+
+def render_fluoro_view(frame, master, s, work_w=None):
+    '''One camera frame + its anatomy master -> a finished fluoro image.
+
+    The per-view half of the pipeline, shared by the single and split views:
+    greyscale, pan the anatomy to the current position, composite by
+    attenuation, and mask to the round C-arm field. No annotations - the
+    caller draws those on the finished (possibly composed) image.
+
+    ``work_w`` caps the width the compositing runs at; None = the camera's own
+    resolution, which is what the single frontal view uses.
+    '''
+    gray = cv.cvtColor(frame, cv.COLOR_RGB2GRAY)
+    if work_w and gray.shape[1] > work_w:
+        scale = float(work_w) / gray.shape[1]
+        gray = cv.resize(gray, (work_w, max(1, int(round(gray.shape[0] * scale)))))
+    if not s["overlay"]:
+        # Overlay off => the full raw video (bright/white areas intact).
+        return apply_aperture(gray)
+    crop = compute_viewport(master, s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"])
+    overlay_frame = cv.resize(crop, (gray.shape[1], gray.shape[0]))
+    return apply_aperture(composite_overlay(gray, overlay_frame, s["equalize"]))
+
+
+def compose_split(left, right):
+    '''Lay two finished views side by side with a seam between them.
+
+    Both halves are brought to a common height so the pair reads as one image
+    even when the two cameras run at different resolutions.
+    '''
+    h = max(left.shape[0], right.shape[0])
+    halves = []
+    for img in (left, right):
+        if img.shape[0] != h:
+            w = max(1, int(round(img.shape[1] * float(h) / img.shape[0])))
+            img = cv.resize(img, (w, h))
+        halves.append(img)
+    seam = np.full((h, SPLIT_DIVIDER_PX), 45, np.uint8)
+    return np.hstack([halves[0], seam, halves[1]])
+
+
+def label_split(img, left_text, right_text):
+    '''Caption each half in its own bottom outer corner.
+
+    Outside the aperture disc, so the labels never sit over anatomy, and at
+    opposite edges so the two can never be read against the wrong half. Not
+    gated on the HUD toggle: mistaking a lateral image for a frontal one is
+    exactly the confusion the simulator must never create.
+    '''
+    font, scale, thick = cv.FONT_HERSHEY_SIMPLEX, 0.6, 2
+    h, w = img.shape[:2]
+    (lw, lh), _ = cv.getTextSize(left_text, font, scale, thick)
+    cv.putText(img, left_text, (16, h - 14), font, scale, 235, thick, cv.LINE_AA)
+    (rw, _rh), _ = cv.getTextSize(right_text, font, scale, thick)
+    cv.putText(img, right_text, (w - rw - 16, h - 14), font, scale, 235, thick,
+               cv.LINE_AA)
+    return img
 
 
 def draw_str(dst, target, s):
@@ -1993,28 +2130,40 @@ def run_simulation(cam_index, show_window):
     for _role, _head in (("main", "NO CAMERA CONNECTED"),
                          ("lateral", "NO LATERAL CAMERA CONNECTED")):
         no_camera_img[_role], no_camera_buf[_role] = build_placeholder(_head)
+    # Both halves missing, in split screen: composed once here rather than
+    # every frame while the simulator sits waiting for cameras.
+    no_camera_img["split"] = label_split(
+        compose_split(no_camera_img["main"], no_camera_img["lateral"]),
+        "FRONTAL", "LATERAL")
+    _ok, _split_jpg = cv.imencode(".jpg", no_camera_img["split"],
+                                  [cv.IMWRITE_JPEG_QUALITY, 80])
+    no_camera_buf["split"] = _split_jpg.tobytes() if _ok else None
 
     # Full-resolution "master" anatomy background, kept untouched at full res so we
     # can crop a fresh viewport out of it every frame (see compute_viewport). Falls
     # back to the static skel.jpg (shown whole, no panning) if the master is absent.
-    master = cv.imread(MASTER_IMAGE)
+    master = load_master(MASTER_IMAGE)
     if master is None:
         print("Master image not found at %s — falling back to %s (no panning)"
               % (MASTER_IMAGE, OVERLAY_IMAGE))
-        master = cv.imread(OVERLAY_IMAGE)
+        master = load_master(OVERLAY_IMAGE)
         if master is None:
             raise FileNotFoundError("Cannot load image: %s" % OVERLAY_IMAGE)
-    master = cv.cvtColor(master, cv.COLOR_BGR2GRAY)
-    if MASTER_INVERT:
-        master = 255 - master
-    if MASTER_GAMMA != 1.0:
-        lut = (np.clip((np.arange(256) / 255.0) ** MASTER_GAMMA, 0.0, 1.0)
-               * 255.0).astype(np.uint8)
-        master = cv.LUT(master, lut)
-    if MASTER_SOFTEN > 0:
-        master = cv.GaussianBlur(master, (0, 0), MASTER_SOFTEN)
-    if MASTER_BRIGHTNESS != 1.0:
-        master = cv.convertScaleAbs(master, alpha=MASTER_BRIGHTNESS, beta=0)
+
+    # The lateral view's background. Until a real lateral master exists, an
+    # obvious placeholder field stands in so the split view works today; drop
+    # a file in at LATERAL_MASTER_IMAGE and it is picked up on next start.
+    lateral_master = load_master(LATERAL_MASTER_IMAGE)
+    if lateral_master is None:
+        print("No lateral master at %s — using a placeholder background for "
+              "the lateral view." % LATERAL_MASTER_IMAGE)
+        lateral_master = build_filler_master(master.shape)
+    elif lateral_master.shape != master.shape:
+        print("Note: lateral master is %s but the frontal master is %s — the "
+              "pan/zoom calibration is expressed in the frontal master's "
+              "pixels, so the two views will not pan alike."
+              % (lateral_master.shape, master.shape))
+    masters = {"main": master, "lateral": lateral_master}
 
     # On-screen control panel: the logo image and a helper to (re)open the
     # separate CONTROLS window used in windowed mode.
@@ -2037,15 +2186,18 @@ def run_simulation(cam_index, show_window):
 
     # The camera and the windows are opened lazily on the first running
     # iteration (and reopened after a standby stop) — see the loop below.
-    cap = None
+    # Both cameras can be open at once (split screen); each carries its own
+    # retry deadline and failure count so one going away never disturbs the
+    # other. The lateral camera is only held open while the split view is on.
+    caps = {"main": None, "lateral": None}
+    cam_fails = {"main": 0, "lateral": 0}
+    next_open = {"main": 0.0, "lateral": 0.0}
+    missing_logged = {"main": False, "lateral": False}
     windows_open = False       # FLUORO window currently created (independent of the camera)
-    next_cam_retry = 0.0       # monotonic deadline for the next camera open attempt
     next_cam_scan = 0.0        # monotonic deadline for the next camera inventory
-    read_fails = 0             # consecutive failed reads (camera unplugged?)
-    active_role = None         # which view the open `cap` belongs to: main|lateral
-    role = "main"              # view selected for this iteration
     main_cam = lateral_cam = None     # camera records the two roles resolve to
-    hold_until = 0.0           # keep the last frame up while switching views
+    split = False              # showing both views side by side this iteration
+    placeholder_key = None     # which prebuilt placeholder `res` currently is
     rec_shape = None           # frame shape the running recording was opened at
     applied_fullscreen = None  # last fullscreen state pushed to the window (avoids redundant calls)
     res = None                 # last processed frame (shown + streamed)
@@ -2066,9 +2218,11 @@ def run_simulation(cam_index, show_window):
                 uploads.poke()
                 with state_lock:
                     state["recording"] = False
-            if cap is not None:
-                cap.release()
-                cap = None
+            if any(c is not None for c in caps.values()):
+                for _role in caps:
+                    if caps[_role] is not None:
+                        caps[_role].release()
+                        caps[_role] = None
                 if show_window:
                     library.stop_playback()
                     cv.destroyAllWindows()
@@ -2076,11 +2230,12 @@ def run_simulation(cam_index, show_window):
                 applied_fullscreen = None
                 res, live = None, False
             windows_open = False
-            next_cam_retry = 0.0
             next_cam_scan = 0.0
-            read_fails = 0
-            active_role = None
-            hold_until = 0.0
+            for _role in caps:
+                cam_fails[_role] = 0
+                next_open[_role] = 0.0
+                missing_logged[_role] = False
+            placeholder_key = None
             publish_camera(False)
             if stopped_buf is not None:
                 with _latest_lock:
@@ -2103,41 +2258,44 @@ def run_simulation(cam_index, show_window):
             main_cam, lateral_cam = rescan_cameras()
             s = get_state_snapshot()   # the rescan may have cleared "lateral"
 
-        # Which camera this view wants. Flipping the Lateral view button drops
-        # the current camera and opens the other one: two USB cameras rarely
-        # have the bandwidth to stream at once, so the views take turns.
-        role = "lateral" if s["lateral"] else "main"
-        if role != active_role:
-            if cap is not None:
-                cap.release()
-                cap = None
-                read_fails = 0
-                # Hold the last frame briefly so a switch does not flash black
-                # for the second a USB camera takes to come up.
-                hold_until = time.monotonic() + CAMERA_SWITCH_HOLD_SEC
-            next_cam_retry = 0.0
-            active_role = role
-        want = lateral_cam if role == "lateral" else main_cam
+        # Selecting the lateral view puts both projections on screen side by
+        # side, so both cameras stay open together; the frontal-only view
+        # closes the lateral camera rather than hold USB bandwidth it is not
+        # using. The frontal camera is never dropped for a switch, so toggling
+        # the split view never interrupts the main image.
+        split = bool(s["lateral"])
+        specs = {"main": main_cam, "lateral": lateral_cam}
+        wanted = ("main", "lateral") if split else ("main",)
+        for _role in ("main", "lateral"):
+            if _role not in wanted and caps[_role] is not None:
+                caps[_role].release()
+                caps[_role] = None
+                cam_fails[_role] = 0
 
-        # (Re)open the camera. A missing one is not fatal - the capture section
-        # below stands the "NO CAMERA CONNECTED" frame in for the video - so we
-        # keep retrying on a timer and pick up a camera plugged in later.
-        if cap is None and want is None:
-            publish_camera(False)
-        elif cap is None and time.monotonic() >= next_cam_retry:
-            first_try = next_cam_retry == 0.0
-            next_cam_retry = time.monotonic() + CAMERA_RETRY_SEC
-            cap = open_camera(want)
-            read_fails = 0
-            if cap is not None:
+        # (Re)open what this view needs. A missing camera is not fatal - the
+        # capture section below stands a "NO CAMERA CONNECTED" frame in for
+        # that half - so we keep retrying on a timer and pick up a camera
+        # plugged in later.
+        now = time.monotonic()
+        for _role in wanted:
+            if caps[_role] is not None or specs[_role] is None:
+                continue
+            if now < next_open[_role]:
+                continue
+            next_open[_role] = now + CAMERA_RETRY_SEC
+            caps[_role] = open_camera(specs[_role])
+            cam_fails[_role] = 0
+            if caps[_role] is not None:
                 print("%s camera connected: %s (%s)"
-                      % (role.capitalize(), want["device"], want["name"]))
-                hold_until = 0.0
-            elif first_try:
-                print("No %s camera at %s - running without video "
+                      % (_role.capitalize(), specs[_role]["device"],
+                         specs[_role]["name"]))
+                missing_logged[_role] = False
+            elif not missing_logged[_role]:
+                missing_logged[_role] = True
+                print("No %s camera at %s - running without it "
                       "(retrying every %.0fs)."
-                      % (role, want["device"], CAMERA_RETRY_SEC))
-            publish_camera(cap is not None)
+                      % (_role, specs[_role]["device"], CAMERA_RETRY_SEC))
+        publish_camera(any(caps[r] is not None for r in wanted))
 
         # Keep the OpenCV window's fullscreen state in sync with the toggle, and
         # move the on-screen controls between the separate CONTROLS window
@@ -2173,63 +2331,73 @@ def run_simulation(cam_index, show_window):
         with state_lock:
             view = state["ui_view"]
         lib_playing = show_window and view == "library" and library.playing
-        if lib_playing and cap is not None:
-            cap.grab()
+        if lib_playing:
+            for _role in wanted:
+                if caps[_role] is not None:
+                    caps[_role].grab()
 
         # In pedal mode, only grab a frame while the pedal/'b' is held; otherwise
         # capture continuously.
         pedal_down = s["pedal_pressed"] or key_pedal
+        any_open = any(caps[r] is not None for r in wanted)
         capture_now = ((pedal_down or not s["pedal_mode"])
-                       and not lib_playing and cap is not None)
+                       and not lib_playing and any_open)
 
-        if cap is None:
-            # No camera for this view: publish the placeholder as this frame's
-            # output so the window, the tab bar and the Library keep rendering,
-            # and idle a little so an unattended simulator does not spin a core.
-            # Mid-switch the last frame stays up until hold_until passes.
+        if not any_open:
+            # Nothing to show: publish the prebuilt placeholder so the window,
+            # the tab bar and the Library keep rendering, and idle a little so
+            # an unattended simulator does not spin a core.
             live = False
-            if res is None or time.monotonic() >= hold_until:
-                res = no_camera_img[role]
+            placeholder_key = "split" if split else "main"
+            res = no_camera_img[placeholder_key]
             time.sleep(0.03)
         elif capture_now:
-            ret, frame = cap.read()
-            if not ret:
-                # A few dropped frames are normal; a steady stream of them means
-                # the camera went away, so release it and let the retry above
-                # find it again (the placeholder shows in the meantime).
-                read_fails += 1
-                if read_fails >= CAMERA_READ_FAIL_LIMIT:
-                    print("%s camera stopped delivering frames - released."
-                          % role.capitalize())
-                    cap.release()
-                    cap = None
-                    read_fails = 0
-                    next_cam_retry = time.monotonic() + CAMERA_RETRY_SEC
-                    publish_camera(False)
+            # Read every camera this view needs, and turn each frame into a
+            # finished view. In split screen the halves are composited at a
+            # reduced working width (SPLIT_WORK_MAX_W): the pipeline is the
+            # expensive part of the frame and it runs twice here.
+            views = {}
+            work_w = SPLIT_WORK_MAX_W if split else None
+            for _role in wanted:
+                camera = caps[_role]
+                if camera is None:
+                    continue
+                ret, frame = camera.read()
+                if not ret:
+                    # A few dropped frames are normal; a steady stream of them
+                    # means that camera went away, so release it and let the
+                    # retry above find it again.
+                    cam_fails[_role] += 1
+                    if cam_fails[_role] >= CAMERA_READ_FAIL_LIMIT:
+                        print("%s camera stopped delivering frames - released."
+                              % _role.capitalize())
+                        camera.release()
+                        caps[_role] = None
+                        cam_fails[_role] = 0
+                        next_open[_role] = time.monotonic() + CAMERA_RETRY_SEC
+                    continue
+                cam_fails[_role] = 0
+                views[_role] = render_fluoro_view(frame, masters[_role], s, work_w)
+
+            if not views:
                 time.sleep(0.01)
-                continue
-            read_fails = 0
+                continue     # transient: keep the previous frame on screen
             live = True
+            placeholder_key = None
 
-            frame_gray = cv.cvtColor(frame, cv.COLOR_RGB2GRAY)
-            frame_raw = frame_gray.copy()  # untouched copy shown when the overlay is off
-            # Pan the anatomy: crop the viewport at the current camera position and
-            # scale it to the frame. This is the background the vasculature sits on.
-            crop = compute_viewport(master, s["pos_x_cm"], s["pos_y_cm"],
-                                    s["pos_z_cm"])
-            overlay_frame = cv.resize(crop, (frame_gray.shape[1], frame_gray.shape[0]))
-
-            # Overlay off => show the full raw video (bright/white areas intact).
-            if s["overlay"]:
-                res = composite_overlay(frame_gray, overlay_frame, s["equalize"])
+            if split:
+                # A half with no camera shows that half's placeholder, so one
+                # camera dropping out never takes the working view with it.
+                halves = []
+                for _role in ("main", "lateral"):
+                    half = views.get(_role)
+                    if half is None:
+                        half = no_camera_img[_role]
+                    halves.append(half)
+                res = label_split(compose_split(halves[0], halves[1]),
+                                  "FRONTAL", "LATERAL")
             else:
-                res = frame_raw
-
-            # Mask to the round C-arm field of view (black corners). Applied
-            # before the HUD so annotations remain legible over the black rim,
-            # and here (not just at display time) so the recording and the web
-            # preview carry the same circular field as the on-screen window.
-            res = apply_aperture(res)
+                res = views["main"]
 
             if s["hud"]:
                 draw_str(res, (20, 20), "Overlay:%s  Equalize:%s" %
@@ -2239,21 +2407,12 @@ def run_simulation(cam_index, show_window):
                          (s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"]))
             if pedal_down:
                 draw_str(res, (20, 80), "PEDAL ACTIVE")
-            if s["lateral"]:
-                # Which projection you are looking at, in the black rim outside
-                # the C-arm aperture. Not gated on the HUD toggle: mistaking a
-                # lateral image for a frontal one is exactly the confusion the
-                # simulator should never create.
-                (mw, mh), _ = cv.getTextSize("LATERAL", cv.FONT_HERSHEY_SIMPLEX,
-                                             0.6, 2)
-                cv.putText(res, "LATERAL", (res.shape[1] - mw - 20, mh + 16),
-                           cv.FONT_HERSHEY_SIMPLEX, 0.6, 235, 2, cv.LINE_AA)
 
         # Recording needs a live camera: if it disappears mid-session, close the
         # file cleanly and flip the toggle off instead of filling the recording
         # with the placeholder frame. The hold window covers a view switch, so
         # toggling Lateral view mid-recording does not end the recording.
-        if s["recording"] and cap is None and time.monotonic() >= hold_until:
+        if s["recording"] and not any_open:
             if recorder.active:
                 recorder.stop()
                 uploads.poke()
@@ -2354,11 +2513,11 @@ def run_simulation(cam_index, show_window):
                 ctrl_buttons[:] = btns
                 cv.imshow("CONTROLS", panel)
                 cv.imshow("FLUORO", np.vstack([tab, vid]))
-        if res is no_camera_img.get(role) and no_camera_buf.get(role) is not None:
+        if placeholder_key and no_camera_buf.get(placeholder_key) is not None:
             # Static placeholder: publish the pre-encoded copy rather than
             # re-encoding the same image on every iteration.
             with _latest_lock:
-                _latest_jpeg = no_camera_buf[role]
+                _latest_jpeg = no_camera_buf[placeholder_key]
         elif res is not None:
             # The web MJPEG preview always streams the clean frame (the browser has
             # its own HTML buttons), so encode `res`, not the composited view.
@@ -2369,8 +2528,9 @@ def run_simulation(cam_index, show_window):
 
     recorder.stop(wait=True)  # finalize the .avi before os._exit
     library.stop_playback()
-    if cap is not None:
-        cap.release()
+    for _role in caps:
+        if caps[_role] is not None:
+            caps[_role].release()
     cv.destroyAllWindows()
     # Stop the process so the Flask daemon thread exits too.
     os._exit(0)
