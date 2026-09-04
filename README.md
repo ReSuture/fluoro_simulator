@@ -94,6 +94,17 @@ python fluoro_web.py [<video device number>] [--port 5000] [--no-window] [--http
 
 Then open `https://<this-machine-ip>:<port>/` in a browser (or `http://…` if running without a cert).
 
+### No camera attached
+
+A missing camera never stops the app. The simulator starts as usual — web panel,
+`FLUORO` window, tab bar, Remote Access and Library all work — and shows a black
+**NO CAMERA CONNECTED** screen where the video would be; the web panel adds a
+banner under the preview. The camera index is retried every few seconds
+(`CAMERA_RETRY_SEC`), so plugging a camera in picks it up automatically with no
+restart, and a camera that is unplugged while running drops back to the same
+placeholder instead of freezing. Recording is unavailable without a camera: an
+in-progress recording is closed cleanly and the Record toggle switches itself off.
+
 ### HTTPS (self-signed cert)
 
 Some browsers force `https://`. If `cert.pem` and `key.pem` are present next to the script, the panel is served over HTTPS automatically. Generate a self-signed cert (valid ~2 years) with:

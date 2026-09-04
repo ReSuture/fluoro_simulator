@@ -209,7 +209,20 @@ state = {
     "pos_z_cm": 0.0,        # camera Z position (cm from nominal height) — drives the zoom
     "ui_view": "fluoro",    # which tab the FLUORO window shows: fluoro|remote|library
     "recording": False,     # session recording to ~/fluorosim_recordings
+    "camera": False,        # read-only: a camera is open and delivering frames
 }
+
+# How often to retry opening the camera while none is attached (seconds). A
+# missing camera is never fatal - the simulator starts anyway and stands a black
+# "NO CAMERA CONNECTED" frame in for the video, so the control panel, the tabs
+# and the Library stay usable - and a camera plugged in later is picked up on
+# its own at the next retry.
+CAMERA_RETRY_SEC = 3.0
+
+# Consecutive failed reads before a camera is treated as gone (unplugged) and
+# released, dropping back to the placeholder + retry path. A few dropped frames
+# are normal, so this is deliberately not 1.
+CAMERA_READ_FAIL_LIMIT = 30
 
 # Compose the fullscreen UI natively at this (width, height) instead of at the
 # camera frame's size — set by --screen for touch displays so the pixels (and
@@ -289,6 +302,8 @@ PAGE = """
   button.quit { background: #2a1416; border-color: #5b2327; color: #ff9a9a; }
   button.quit.on { background: #3b1013; border-color: #f04438; }
   .hint { color: #7d8a99; font-size: 12px; margin: 14px 2px 0; }
+  .warn { color: #ff9a9a; background: #2a1416; border: 1px solid #5b2327;
+          border-radius: 8px; padding: 10px 12px; font-size: 13px; margin: 12px 0 0; }
   .liblink { color: #7af0b6; font-size: 14px; font-weight: 600; text-decoration: none;
              border: 1px solid #26323f; border-radius: 999px; padding: 6px 16px; }
   .liblink:active { transform: translateY(1px); }
@@ -313,6 +328,8 @@ PAGE = """
 <main>
   <div class="stage" id="stage">
     <div class="preview"><img id="feed" src="/video_feed" alt="live preview"></div>
+    <p class="warn" id="camwarn" hidden>No camera connected &mdash; the simulator is
+      running without video. Plug one in and it is picked up automatically.</p>
 
     <div class="panel">
       <div class="grid" id="toggles">
@@ -356,6 +373,8 @@ function applyState(s) {
   document.querySelectorAll('.runbtn').forEach(function (b) {
     b.classList.toggle('on', (b.dataset.run === '1') === !!s.running);
   });
+  var warn = document.getElementById('camwarn');
+  if (warn) warn.hidden = !(s.running && !s.camera);
   var pos = document.getElementById('pos');
   if (pos) pos.textContent = 'Camera: x=' + (+s.pos_x_cm || 0).toFixed(1) +
                              '  y=' + (+s.pos_y_cm || 0).toFixed(1) +
@@ -1638,10 +1657,21 @@ def run_simulation(cam_index, show_window):
     global _latest_jpeg
 
     def open_camera():
+        '''Open the capture device, or return None when there is no camera.
+
+        Returning None rather than a dead VideoCapture lets the loop fall
+        through to the "no camera" placeholder and retry the open later.
+        '''
         c = cv.VideoCapture(cam_index, cv.CAP_V4L2)
         if not c.isOpened():
-            print("Warning: unable to open video source:", cam_index)
+            c.release()
+            return None
         return c
+
+    def publish_camera(ok):
+        '''Mirror camera presence into the shared state (read by the web panel).'''
+        with state_lock:
+            state["camera"] = ok
 
     # Placeholder frame published to the preview while the sim is in standby.
     stopped_img = np.full((480, 640), 16, np.uint8)
@@ -1649,6 +1679,21 @@ def run_simulation(cam_index, show_window):
     draw_str(stopped_img, (150, 260), "press Start simulator on the control panel")
     ok, _stopped_jpg = cv.imencode(".jpg", stopped_img, [cv.IMWRITE_JPEG_QUALITY, 80])
     stopped_buf = _stopped_jpg.tobytes() if ok else None
+
+    # Frame shown in place of the video whenever no camera is attached: a plain
+    # black screen with the message. It is the same shape as an ordinary
+    # processed frame, so the tab bar, the control bar, the Library tab and the
+    # web preview all lay out exactly as they do with a live feed.
+    no_camera_img = np.zeros((480, 640), np.uint8)
+    _font = cv.FONT_HERSHEY_SIMPLEX
+    for _text, _size, _thick, _grey, _y in (
+            ("NO CAMERA CONNECTED", 0.9, 2, 235, 232),
+            ("connect a camera - it is picked up automatically", 0.45, 1, 130, 262)):
+        (_tw, _), _ = cv.getTextSize(_text, _font, _size, _thick)
+        cv.putText(no_camera_img, _text, ((640 - _tw) // 2, _y), _font, _size,
+                   _grey, _thick, cv.LINE_AA)
+    ok, _no_cam_jpg = cv.imencode(".jpg", no_camera_img, [cv.IMWRITE_JPEG_QUALITY, 80])
+    no_camera_buf = _no_cam_jpg.tobytes() if ok else None
 
     # Full-resolution "master" anatomy background, kept untouched at full res so we
     # can crop a fresh viewport out of it every frame (see compute_viewport). Falls
@@ -1694,6 +1739,9 @@ def run_simulation(cam_index, show_window):
     # The camera and the windows are opened lazily on the first running
     # iteration (and reopened after a standby stop) — see the loop below.
     cap = None
+    windows_open = False       # FLUORO window currently created (independent of the camera)
+    next_cam_retry = 0.0       # monotonic deadline for the next camera open attempt
+    read_fails = 0             # consecutive failed reads (camera unplugged?)
     applied_fullscreen = None  # last fullscreen state pushed to the window (avoids redundant calls)
     res = None                 # last processed frame (shown + streamed)
     live = False               # True once a frame has been read (drives the status dot)
@@ -1722,18 +1770,37 @@ def run_simulation(cam_index, show_window):
                     cv.waitKey(1)  # let the GUI process the window teardown
                 applied_fullscreen = None
                 res, live = None, False
+            windows_open = False
+            next_cam_retry = 0.0
+            read_fails = 0
+            publish_camera(False)
             if stopped_buf is not None:
                 with _latest_lock:
                     _latest_jpeg = stopped_buf
             time.sleep(0.2)
             continue
 
-        # (Re)open the camera and windows on the first running iteration and
-        # when resuming from standby.
-        if cap is None:
+        # (Re)open the windows on the first running iteration and when resuming
+        # from standby. This no longer waits on the camera: the simulator runs,
+        # and shows its tabs, with or without one.
+        if show_window and not windows_open:
+            show_fluoro_window()
+            windows_open = True
+
+        # (Re)open the camera. A missing one is not fatal - the capture section
+        # below stands the "NO CAMERA CONNECTED" frame in for the video - so we
+        # keep retrying on a timer and pick up a camera plugged in later.
+        if cap is None and time.monotonic() >= next_cam_retry:
+            first_try = next_cam_retry == 0.0
+            next_cam_retry = time.monotonic() + CAMERA_RETRY_SEC
             cap = open_camera()
-            if show_window:
-                show_fluoro_window()
+            read_fails = 0
+            if cap is not None:
+                print("Camera %s connected." % cam_index)
+            elif first_try:
+                print("No camera on video source %s - running without video "
+                      "(retrying every %.0fs)." % (cam_index, CAMERA_RETRY_SEC))
+            publish_camera(cap is not None)
 
         # Keep the OpenCV window's fullscreen state in sync with the toggle, and
         # move the on-screen controls between the separate CONTROLS window
@@ -1775,13 +1842,33 @@ def run_simulation(cam_index, show_window):
         # In pedal mode, only grab a frame while the pedal/'b' is held; otherwise
         # capture continuously.
         pedal_down = s["pedal_pressed"] or key_pedal
-        capture_now = (pedal_down or not s["pedal_mode"]) and not lib_playing
+        capture_now = ((pedal_down or not s["pedal_mode"])
+                       and not lib_playing and cap is not None)
 
-        if capture_now:
+        if cap is None:
+            # No camera: publish the placeholder as this frame's output so the
+            # window, the tab bar and the Library keep rendering, and idle a
+            # little so an unattended simulator does not spin a core.
+            res, live = no_camera_img, False
+            time.sleep(0.03)
+        elif capture_now:
             ret, frame = cap.read()
             if not ret:
+                # A few dropped frames are normal; a steady stream of them means
+                # the camera went away, so release it and let the retry above
+                # find it again (the placeholder shows in the meantime).
+                read_fails += 1
+                if read_fails >= CAMERA_READ_FAIL_LIMIT:
+                    print("Camera %s stopped delivering frames - released."
+                          % cam_index)
+                    cap.release()
+                    cap = None
+                    read_fails = 0
+                    next_cam_retry = time.monotonic() + CAMERA_RETRY_SEC
+                    publish_camera(False)
                 time.sleep(0.01)
                 continue
+            read_fails = 0
             live = True
 
             frame_gray = cv.cvtColor(frame, cv.COLOR_RGB2GRAY)
@@ -1812,6 +1899,18 @@ def run_simulation(cam_index, show_window):
                          (s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"]))
             if pedal_down:
                 draw_str(res, (20, 80), "PEDAL ACTIVE")
+
+        # Recording needs a live camera: if it disappears mid-session, close the
+        # file cleanly and flip the toggle off instead of filling the recording
+        # with the placeholder frame.
+        if s["recording"] and cap is None:
+            if recorder.active:
+                recorder.stop()
+                uploads.poke()
+            library.error = "Recording needs a camera - none is connected."
+            with state_lock:
+                state["recording"] = False
+            s["recording"] = False
 
         # Session recording: feed the processed frame to the recorder while
         # the toggle is on; a writer that fails to open flips the toggle back
@@ -1894,7 +1993,12 @@ def run_simulation(cam_index, show_window):
                 ctrl_buttons[:] = btns
                 cv.imshow("CONTROLS", panel)
                 cv.imshow("FLUORO", np.vstack([tab, vid]))
-        if res is not None:
+        if res is no_camera_img and no_camera_buf is not None:
+            # Static placeholder: publish the pre-encoded copy rather than
+            # re-encoding the same image on every iteration.
+            with _latest_lock:
+                _latest_jpeg = no_camera_buf
+        elif res is not None:
             # The web MJPEG preview always streams the clean frame (the browser has
             # its own HTML buttons), so encode `res`, not the composited view.
             ok, jpg = cv.imencode(".jpg", res, [cv.IMWRITE_JPEG_QUALITY, 80])
