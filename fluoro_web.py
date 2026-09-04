@@ -923,6 +923,11 @@ def load_master(path):
     soften, brightness) is the tuned look — every master goes through it, so
     the frontal and lateral backgrounds match.
     '''
+    # Checked before imread: the lateral master is optional, and imread logs a
+    # "can't open/read file" warning of its own for a file that is simply not
+    # there yet, which reads like a fault in the launch log.
+    if not os.path.exists(path):
+        return None
     img = cv.imread(path)
     if img is None:
         return None
