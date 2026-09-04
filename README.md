@@ -156,6 +156,21 @@ camera: an in-progress recording is closed cleanly and the Record toggle
 switches itself off (switching views mid-recording does not end it — the
 recording continues, scaled to the size the file was opened at).
 
+### Tests
+
+```bash
+python3 test_cameras.py
+```
+
+Covers camera discovery, the port-based main/lateral role assignment, the
+Lateral view gate, the on-screen and web buttons, and live switching inside the
+real capture loop. Camera hardware is stubbed, so it runs on a bench with
+nothing plugged in — which is when the no-camera paths matter most. The first
+section runs the discovery filter against the machine's real `/dev` and prints
+what it found, so it is worth running on the Pi with cameras attached to confirm
+each one is seen on the port you expect. Takes about 20 seconds; exits non-zero
+on failure.
+
 ### HTTPS (self-signed cert)
 
 Some browsers force `https://`. If `cert.pem` and `key.pem` are present next to the script, the panel is served over HTTPS automatically. Generate a self-signed cert (valid ~2 years) with:
