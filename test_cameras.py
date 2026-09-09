@@ -216,28 +216,48 @@ check("the LUT composite matches the float reference within 1 level",
 
 print("\n8. Split screen in the real capture loop")
 STUB = {"cams": [A], "dead": set()}
-LEVEL = {0: 100, 2: 200}      # the two cameras differ only in brightness
+OPEN_NODES = set()            # device indexes this process currently holds
+# Brightness identifies the physical camera (by port, not by /dev node), so a
+# renumbered camera is still recognisable in the frame.
+LEVEL_BY_PORT = {"usb-port-A": 100, "usb-port-B": 200}
+
+
+def level_for(index):
+    for c in STUB["cams"]:
+        if c["index"] == index:
+            return LEVEL_BY_PORT.get(c["port"], 128)
+    return 128
 
 
 class FakeCap(object):
-    '''Stands in for cv.VideoCapture: a uniform frame per device index.'''
+    '''Stands in for cv.VideoCapture: a uniform frame per physical camera.
+
+    Enforces what a real V4L2 node enforces - a device already held cannot be
+    opened again - so a handle left on the wrong node blocks the other view
+    exactly as it does on the device.
+    '''
 
     def __init__(self, index):
         self.index = index
+        self.held = index not in STUB["dead"] and index not in OPEN_NODES
+        if self.held:
+            OPEN_NODES.add(index)
 
     def isOpened(self):
-        return self.index not in STUB["dead"]
+        return self.held and self.index not in STUB["dead"]
 
     def read(self):
-        if self.index in STUB["dead"]:
+        if not self.held or self.index in STUB["dead"]:
             return False, None
-        return True, np.full((480, 640, 3), LEVEL[self.index], np.uint8)
+        return True, np.full((480, 640, 3), level_for(self.index), np.uint8)
 
     def grab(self):
-        return True
+        return self.held
 
     def release(self):
-        pass
+        if self.held:
+            OPEN_NODES.discard(self.index)
+            self.held = False
 
 
 f.list_cameras = lambda: list(STUB["cams"])
@@ -317,6 +337,34 @@ check("the main view is live again after the fallback",
 check("the frame is back to a single view",
       abs(preview_image().shape[1] / float(preview_image().shape[0])
           - single_aspect) < 0.2)
+
+
+print("\n9. Cameras renumbered while running")
+# A replug, or a second camera appearing, can move a camera to a different
+# /dev node. A handle left open on the old node is both the wrong camera and
+# holds the node the other role now wants - which is how a lateral camera that
+# is plugged in, discovered, and shown as available still fails to open.
+STUB["dead"].clear()
+STUB["cams"] = [cam(2, "usb-port-A"),      # same cameras, nodes swapped
+                cam(0, "usb-port-B")]
+time.sleep(10)
+check("after renumbering, both cameras are still discovered",
+      f.state["cameras"] == 2 and f.state["lateral_available"] is True,
+      "cameras=%s available=%s" % (f.state["cameras"], f.state["lateral_available"]))
+
+f.set_lateral(True)
+time.sleep(9)
+moved = preview_image()
+mid = moved.shape[1] // 2
+left_moved = moved[:, :mid - 6].mean()
+right_moved = moved[:, mid + 6:].mean()
+check("the lateral camera opens on its new node (no stale handle blocking it)",
+      right_moved > 1.7 * left_moved,
+      "left %.1f right %.1f - equal halves mean the lateral node was still held"
+      % (left_moved, right_moved))
+check("the frontal half is still the same physical camera after renumbering",
+      abs(left_moved - main_level) < 8,
+      "was %.1f, now %.1f" % (main_level, left_moved))
 
 
 print("\n%d passed, %d failed" % (len(PASSED), len(FAILED)))

@@ -2195,6 +2195,7 @@ def run_simulation(cam_index, show_window):
     # retry deadline and failure count so one going away never disturbs the
     # other. The lateral camera is only held open while the split view is on.
     caps = {"main": None, "lateral": None}
+    opened_as = {"main": None, "lateral": None}   # the camera record each handle holds
     cam_fails = {"main": 0, "lateral": 0}
     next_open = {"main": 0.0, "lateral": 0.0}
     missing_logged = {"main": False, "lateral": False}
@@ -2237,6 +2238,7 @@ def run_simulation(cam_index, show_window):
             windows_open = False
             next_cam_scan = 0.0
             for _role in caps:
+                opened_as[_role] = None
                 cam_fails[_role] = 0
                 next_open[_role] = 0.0
                 missing_logged[_role] = False
@@ -2275,7 +2277,33 @@ def run_simulation(cam_index, show_window):
             if _role not in wanted and caps[_role] is not None:
                 caps[_role].release()
                 caps[_role] = None
+                opened_as[_role] = None
                 cam_fails[_role] = 0
+
+        # Reconcile every open camera against what its role resolves to NOW.
+        # USB renumbering moves a camera to a different /dev node - a replug, or
+        # simply a second camera appearing and the kernel handing out nodes in a
+        # different order - and a handle left on the old node is both the wrong
+        # camera and holds the node the other role now wants. That is how a
+        # lateral camera which is plugged in, discovered, and offered on the
+        # button still fails to open, while the frontal view quietly shows the
+        # lateral camera's picture.
+        for _role in ("main", "lateral"):
+            if caps[_role] is None:
+                continue
+            now_at, was = specs[_role], opened_as[_role]
+            if now_at is not None and was is not None and (
+                    (now_at["port"], now_at["index"]) == (was["port"], was["index"])):
+                continue
+            print("%s camera moved from %s to %s - reopening."
+                  % (_role.capitalize(),
+                     was["device"] if was else "?",
+                     now_at["device"] if now_at else "nothing"))
+            caps[_role].release()
+            caps[_role] = None
+            opened_as[_role] = None
+            cam_fails[_role] = 0
+            next_open[_role] = 0.0     # reopen immediately, not on the next tick
 
         # (Re)open what this view needs. A missing camera is not fatal - the
         # capture section below stands a "NO CAMERA CONNECTED" frame in for
@@ -2290,6 +2318,7 @@ def run_simulation(cam_index, show_window):
             next_open[_role] = now + CAMERA_RETRY_SEC
             caps[_role] = open_camera(specs[_role])
             cam_fails[_role] = 0
+            opened_as[_role] = specs[_role] if caps[_role] is not None else None
             if caps[_role] is not None:
                 print("%s camera connected: %s (%s)"
                       % (_role.capitalize(), specs[_role]["device"],
@@ -2378,6 +2407,7 @@ def run_simulation(cam_index, show_window):
                               % _role.capitalize())
                         camera.release()
                         caps[_role] = None
+                        opened_as[_role] = None
                         cam_fails[_role] = 0
                         next_open[_role] = time.monotonic() + CAMERA_RETRY_SEC
                     continue
@@ -2573,6 +2603,15 @@ def _handle_key(key):
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print(__doc__)
+
+    # Line-buffered, so launch.log shows what the simulator is doing while it
+    # is doing it: under block buffering the camera diagnostics sat unwritten
+    # in a 4KB buffer for hours, which is precisely when they are wanted.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
 
     args = sys.argv[1:]
     port = 5000
