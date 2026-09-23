@@ -66,6 +66,7 @@ from __future__ import print_function
 import os
 import sys
 import glob
+import functools
 import json
 import time
 import struct
@@ -1263,9 +1264,42 @@ def draw_button(img, x, y, w, h, label, sub=None, on=False, variant="normal"):
                    tx if on else C_SUBTEXT, 1, cv.LINE_AA)
 
 
+def _render_key(arg):
+    '''A comparable stand-in for one render argument (see cache_last_render).'''
+    if isinstance(arg, dict):
+        return tuple(sorted(arg.items()))
+    if isinstance(arg, np.ndarray):
+        return id(arg)          # the logo: loaded once and never modified
+    return arg
+
+
+def cache_last_render(fn):
+    '''Redraw a UI strip only when its inputs change; reuse the last image otherwise.
+
+    The bars are drawn from a handful of flags that change a few times a
+    minute, but used to be redrawn every frame - ~28ms a frame at 1920 wide on
+    a Pi 3, more than the whole frame budget at 30 fps. The state snapshot is
+    part of the key, so any flag change redraws. The image comes back
+    read-only: it is shared between frames, so drawing on it would be a bug.
+    '''
+    last = {"key": None, "out": None}
+
+    @functools.wraps(fn)
+    def wrapper(*args):
+        key = tuple(_render_key(a) for a in args)
+        if last["out"] is None or key != last["key"]:
+            img, buttons = fn(*args)
+            img.flags.writeable = False
+            last["key"], last["out"] = key, (img, tuple(buttons))
+        img, buttons = last["out"]
+        return img, list(buttons)
+    return wrapper
+
+
 TAB_H = 44  # height of the persistent tab bar stacked on top of the FLUORO frame
 
 
+@cache_last_render
 def render_tab_bar(width, active_view, rec_elapsed=None):
     '''Render the persistent Fluoro / Remote Access / Library tab bar.
 
@@ -1312,6 +1346,7 @@ def draw_text_field(img, x, y, w, h, text, focused=False, masked=False,
     cv.putText(img, shown, (x + 10, y + (h + th) // 2), font, 0.55, color, 1, cv.LINE_AA)
 
 
+@cache_last_render
 def render_controls(s, logo, live):
     '''Render the vertical control panel (logo + button grid) for the CONTROLS window.
 
@@ -1398,6 +1433,7 @@ BAR_PAD, BAR_GAP, BAR_BH = 6, 6, 34
 BAR_H = BAR_PAD + 3 * BAR_BH + 2 * BAR_GAP + BAR_PAD  # 3 rows: toggles, actions, location
 
 
+@cache_last_render
 def render_control_bar(s, width, live):
     '''Render a short, full-width control strip stacked below the video in fullscreen.
 
