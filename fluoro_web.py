@@ -29,9 +29,10 @@ Architecture
 The capture + processing loop and the OpenCV ``FLUORO`` window run on the main
 thread (OpenCV's GUI must run on the main thread). Flask runs in a background
 daemon thread. The two communicate only through a small ``state`` dict guarded
-by ``state_lock`` (the toggle flags) and the JPEG buffer ``_latest_jpeg`` guarded
-by ``_latest_lock`` (the latest frame for the preview). The web handlers never
-touch OpenCV directly — they just flip flags that the main loop reads each frame.
+by ``state_lock`` (the toggle flags) and the preview frame (``publish_preview`` /
+``latest_preview``, guarded by ``_latest_lock``). The web handlers never touch
+the camera or the windows — they just flip flags that the main loop reads each
+frame, and JPEG-encode the preview frame the loop hands over.
 
 HTTPS
 -----
@@ -430,6 +431,68 @@ CAMERA_READ_FAIL_LIMIT = 30
 # plugged in mid-session lights up "Lateral view" without a restart.
 CAMERA_SCAN_SEC = 3.0
 
+# How long a read waits for a frame newer than the last one handed out before
+# counting as a failed read (seconds). A healthy camera delivers one every
+# ~33ms, so this only trips on a stalled or vanished camera.
+CAMERA_FRAME_TIMEOUT_SEC = 0.5
+
+
+class LatestFrameCapture(object):
+    '''A VideoCapture that always hands back the newest frame, never a queued one.
+
+    V4L2 queues several frames inside the driver, and the pipeline is slower
+    than the camera (~19 fps against 30), so a plain read() returns the oldest
+    frame in that queue - the picture lags the bench by the whole queue, about
+    200ms on a Pi 3. Worse in pedal mode: nothing is read while the pedal is up,
+    so the first frames after a press show the moment it was last released.
+
+    A daemon thread reads the camera continuously and keeps only the latest
+    frame; read() returns that one, waiting briefly if the caller has already
+    had it so no frame is processed twice. In split screen the two cameras are
+    also read in parallel rather than one after the other.
+    '''
+
+    def __init__(self, cap):
+        self._cap = cap
+        self._cond = threading.Condition()
+        self._ok, self._frame = False, None
+        self._seq = 0          # bumped for every read the thread completes
+        self._taken = 0        # the seq last handed out by read()
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop:
+            ok, frame = self._cap.read()
+            with self._cond:
+                self._ok, self._frame = ok, frame
+                self._seq += 1
+                self._cond.notify_all()
+            if not ok:
+                time.sleep(0.01)   # a dead camera fails instantly; do not spin
+
+    def isOpened(self):
+        return self._cap.isOpened()
+
+    def read(self):
+        with self._cond:
+            if not self._cond.wait_for(lambda: self._seq != self._taken,
+                                       CAMERA_FRAME_TIMEOUT_SEC):
+                return False, None
+            self._taken = self._seq
+            return self._ok, self._frame
+
+    def grab(self):
+        return True            # the thread keeps the camera drained
+
+    def release(self):
+        self._stop = True
+        # Let a read in progress finish first: releasing a VideoCapture that
+        # another thread is reading from is not safe in OpenCV.
+        self._thread.join(timeout=2.0)
+        self._cap.release()
+
 # After a deliberate view switch, keep showing the last frame for this long
 # while the other camera opens, so switching does not flash the black
 # placeholder for the second or so a USB camera takes to come up.
@@ -461,9 +524,43 @@ def set_lateral(on):
 # therefore the tap targets) map 1:1 onto the panel. None = classic behaviour.
 SCREEN_SIZE = None
 
-# Latest processed frame, JPEG-encoded, for the MJPEG preview stream.
+# Latest processed frame for the MJPEG preview stream. The main loop only hands
+# the frame over (publish_preview); it is JPEG-encoded on first request, in the
+# web thread, so the capture loop never pays for encoding - and nothing is
+# encoded at all while nobody is watching. _latest_seq identifies the frame so
+# the stream sends each one once.
 _latest_jpeg = None
+_latest_frame = None
+_latest_seq = 0
 _latest_lock = threading.Lock()
+
+# Minimum gap between preview frames (seconds): caps the stream at ~20 fps to
+# keep the bandwidth sane over the tunnel.
+PREVIEW_MIN_INTERVAL = 0.05
+
+
+def publish_preview(frame=None, jpeg=None):
+    '''Make a frame the current preview: a raw image, or an already-encoded JPEG.'''
+    global _latest_jpeg, _latest_frame, _latest_seq
+    with _latest_lock:
+        if jpeg is not None and jpeg is _latest_jpeg:
+            return     # the same static placeholder again: not a new frame
+        _latest_frame, _latest_jpeg = frame, jpeg
+        _latest_seq += 1
+
+
+def latest_preview():
+    '''The current preview frame as JPEG bytes. -> (seq, jpeg | None)'''
+    global _latest_jpeg
+    with _latest_lock:
+        seq, frame, jpeg = _latest_seq, _latest_frame, _latest_jpeg
+    if jpeg is None and frame is not None:
+        ok, enc = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 80])
+        jpeg = enc.tobytes() if ok else None
+        with _latest_lock:
+            if _latest_seq == seq:     # still current: share it with other viewers
+                _latest_jpeg = jpeg
+    return seq, jpeg
 
 
 def get_state_snapshot():
@@ -784,20 +881,36 @@ def api_position():
 
 
 def mjpeg_generator():
-    '''Yield the latest processed frame as a multipart MJPEG stream.'''
-    boundary = b"--frame"
+    '''Yield the latest processed frame as a multipart MJPEG stream.
+
+    Only new frames are sent (plus a resend once a second so an idle stream is
+    not dropped as dead). Re-sending an unchanged frame just queues bytes in
+    front of the next real one on a slow link. Each part is followed at once
+    by the next boundary: browsers display a part only when they see the
+    boundary that closes it, so sending it up front would hold every frame
+    back until the next one arrived.
+    '''
+    yield b"--frame\r\n"
+    sent_seq, sent_at = None, 0.0
     while True:
-        with _latest_lock:
-            buf = _latest_jpeg
-        if buf is not None:
-            yield boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n" + buf + b"\r\n"
-        time.sleep(0.05)  # ~20 fps cap for the preview
+        wait = sent_at + PREVIEW_MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        seq, buf = latest_preview()
+        if buf is None or (seq == sent_seq and time.monotonic() - sent_at < 1.0):
+            time.sleep(0.01)
+            continue
+        sent_seq, sent_at = seq, time.monotonic()
+        yield (b"Content-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(buf)
+               + buf + b"\r\n--frame\r\n")
 
 
 @app.route("/video_feed")
 def video_feed():
     return Response(mjpeg_generator(),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+                    mimetype="multipart/x-mixed-replace; boundary=frame",
+                    headers={"Cache-Control": "no-cache, no-store",
+                             "X-Accel-Buffering": "no"})
 
 
 # ── Image processing ────────────────────────────────────────────────────────────
@@ -2052,8 +2165,8 @@ def run_simulation(cam_index, show_window):
     '''Main capture/process/display loop — runs on the main thread until quit.
 
     Each iteration: read a frame, apply the overlay composite (optional), draw
-    the HUD, then both show it in the FLUORO window and JPEG-encode it into
-    ``_latest_jpeg`` for the web preview. The loop
+    the HUD, then both show it in the FLUORO window and hand it to
+    publish_preview() for the web preview. The loop
     reads the shared toggle state once per frame via get_state_snapshot(), so the
     web buttons and the keyboard shortcuts drive exactly the same behaviour.
 
@@ -2061,8 +2174,6 @@ def run_simulation(cam_index, show_window):
                   None means "discover the cameras" (the normal case)
     show_window : bool — open the on-screen FLUORO window (False = web preview only)
     '''
-    global _latest_jpeg
-
     def open_camera(cam):
         '''Open one camera record, or None if it will not open.
 
@@ -2075,7 +2186,7 @@ def run_simulation(cam_index, show_window):
         if not c.isOpened():
             c.release()
             return None
-        return c
+        return LatestFrameCapture(c)
 
     def publish_camera(ok):
         '''Mirror camera presence into the shared state (read by the web panel).'''
@@ -2245,8 +2356,7 @@ def run_simulation(cam_index, show_window):
             placeholder_key = None
             publish_camera(False)
             if stopped_buf is not None:
-                with _latest_lock:
-                    _latest_jpeg = stopped_buf
+                publish_preview(jpeg=stopped_buf)
             time.sleep(0.2)
             continue
 
@@ -2360,15 +2470,11 @@ def run_simulation(cam_index, show_window):
 
         # Which tab is showing (read after waitKey so a click this iteration
         # counts). While a Library recording is actually playing, skip the
-        # live processing so the CPU goes to decoding — one grab() keeps the
-        # camera's buffer fresh so switching back to Fluoro is instant.
+        # live processing so the CPU goes to decoding — each camera's reader
+        # thread keeps it drained, so switching back to Fluoro is instant.
         with state_lock:
             view = state["ui_view"]
         lib_playing = show_window and view == "library" and library.playing
-        if lib_playing:
-            for _role in wanted:
-                if caps[_role] is not None:
-                    caps[_role].grab()
 
         # In pedal mode, only grab a frame while the pedal/'b' is held; otherwise
         # capture continuously.
@@ -2551,15 +2657,13 @@ def run_simulation(cam_index, show_window):
         if placeholder_key and no_camera_buf.get(placeholder_key) is not None:
             # Static placeholder: publish the pre-encoded copy rather than
             # re-encoding the same image on every iteration.
-            with _latest_lock:
-                _latest_jpeg = no_camera_buf[placeholder_key]
-        elif res is not None:
+            publish_preview(jpeg=no_camera_buf[placeholder_key])
+        elif res is not None and capture_now:
             # The web MJPEG preview always streams the clean frame (the browser has
-            # its own HTML buttons), so encode `res`, not the composited view.
-            ok, jpg = cv.imencode(".jpg", res, [cv.IMWRITE_JPEG_QUALITY, 80])
-            if ok:
-                with _latest_lock:
-                    _latest_jpeg = jpg.tobytes()
+            # its own HTML buttons), so publish `res`, not the composited view.
+            # Only a newly captured frame is published: it is never drawn on
+            # again after this, so the web thread can encode it unlocked.
+            publish_preview(frame=res)
 
     recorder.stop(wait=True)  # finalize the .avi before os._exit
     library.stop_playback()

@@ -247,6 +247,7 @@ class FakeCap(object):
         return self.held and self.index not in STUB["dead"]
 
     def read(self):
+        time.sleep(0.03)   # a real camera blocks until its next frame (~30 fps)
         if not self.held or self.index in STUB["dead"]:
             return False, None
         return True, np.full((480, 640, 3), level_for(self.index), np.uint8)
@@ -270,8 +271,7 @@ with f.state_lock:
 
 def preview_image():
     '''The frame currently on the web preview, decoded.'''
-    with f._latest_lock:
-        buf = f._latest_jpeg
+    _seq, buf = f.latest_preview()
     if not buf:
         return None
     return f.cv.imdecode(np.frombuffer(buf, np.uint8), f.cv.IMREAD_GRAYSCALE)
