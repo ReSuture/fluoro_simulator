@@ -32,8 +32,23 @@ export DISPLAY="${DISPLAY:-:0}"
 # app composes natively at that resolution — letterboxed video, touch-sized
 # buttons, and the on-screen keyboard laid out for the real panel. If xrandr
 # is unavailable (or headless), fall back to the classic camera-sized layout.
+#
+# Right after boot the desktop's output manager (kanshi, ~/.config/kanshi/config)
+# may still be switching the mode - the bench monitor is set to 720p there,
+# because the Pi 3 paints 1080p too slowly - and a mode read mid-switch lays
+# the UI out for the wrong resolution. So early on, wait for the mode to hold
+# steady (and for xrandr to answer at all) before trusting it.
+current_mode() { xrandr --current 2>/dev/null | awk '/\*/ {print $1; exit}'; }
 SCREEN_ARGS=()
-MODE=$(xrandr --current 2>/dev/null | awk '/\*/ {print $1; exit}')
+MODE=$(current_mode)
+if (( $(cut -d. -f1 /proc/uptime) < 180 )); then
+    for _ in 1 2 3 4 5 6; do
+        sleep 3
+        NEXT=$(current_mode)
+        [[ -n "$NEXT" && "$NEXT" == "$MODE" ]] && break
+        MODE=$NEXT
+    done
+fi
 if [[ "${MODE:-}" =~ ^[0-9]+x[0-9]+$ ]]; then
     echo "display mode detected: $MODE"
     SCREEN_ARGS=(--screen "$MODE")
