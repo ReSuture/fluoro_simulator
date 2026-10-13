@@ -153,43 +153,42 @@ APERTURE_FEATHER = 0.015
 # controller) is not this module's concern — it's pushed in via POST /api/position
 # and lives in state["pos_x_cm"] / state["pos_y_cm"].
 #
-# Calibrated against fulltorsofluoroimage.png (1340×3691), a plain no-contrast
-# full-torso radiograph. Retune these four values if the master image changes.
-# (PX_PER_CM carries the previous master's by-eye tuning forward, scaled by the
-# width ratio, so the default framing and pan feel are unchanged — the FOV is
-# anchored to the body width, not to true anatomical centimetres.)
-MASTER_IMAGE = os.path.join(BASE_DIR, "fulltorsofluoroimage.png")
+# Calibrated against frontal_master.png (867×1275), a plain no-contrast frontal
+# torso projection, shoulders → proximal femurs. Retune these four values if
+# the master image changes. (PX_PER_CM is scaled from the previous master's
+# by-eye tuning by the anatomy's size in pixels, so the default framing and
+# pan feel carry over — the FOV is anchored to the body width, not to true
+# anatomical centimetres.)
+MASTER_IMAGE = os.path.join(BASE_DIR, "frontal_master.png")
 
-# The lateral view's anatomy background. Optional: with no file here the
-# simulator builds an obvious placeholder field instead (build_filler_master),
-# so the lateral half works before the real image exists. Drop a file in at
-# this path and it is used instead, no code change — it should have the same
+# The lateral view's anatomy background, a lateral projection of the same
+# torso. Optional: with no file here the simulator builds an obvious
+# placeholder field instead (build_filler_master). It must have the same
 # pixel dimensions as MASTER_IMAGE, since the cm -> pixel pan/zoom calibration
 # below is expressed in that image's pixels.
 LATERAL_MASTER_IMAGE = os.path.join(BASE_DIR, "lateral_master.png")
-# The source radiograph is film-convention (dense = bright: white bones, dark
-# air). Attenuation-based fluoro display is the opposite — dense = dark, so
-# bone reads darker than tissue and the unattenuated background is bright.
-# MASTER_INVERT flips the master's polarity at load to match; MASTER_GAMMA is
-# then applied on the 0-1 scale to tune the bone/tissue separation (>1 deepens
-# bone and other dark structures, <1 lifts them, 1.0 = straight inversion).
-# 0.75: bone clearly lighter than the catheter and less etched, soft tissue
-# lifted, background bright — the classic dark-structures-over-light-field
-# fluoro look. (0.6 read too light on-device, 1.0 too dark.)
-MASTER_INVERT = True
-MASTER_GAMMA = 0.75
+# Attenuation-based fluoro display is dense = dark: bone reads darker than
+# tissue and the unattenuated background is bright. The masters are supplied
+# in that polarity already (white air, dark bone), so they load as-is.
+# MASTER_INVERT flips a film-convention radiograph (white bone, dark air) at
+# load instead; MASTER_GAMMA is then applied on the 0-1 scale to tune the
+# bone/tissue separation (>1 deepens bone and other dark structures, <1 lifts
+# them, 1.0 = unchanged). The previous film radiograph used invert + 0.75; on
+# these masters 0.75 washes the frontal spine out, so they are left untouched.
+MASTER_INVERT = False
+MASTER_GAMMA = 1.0
 # Gaussian blur (sigma, px at master resolution) applied at load. Real fluoro
-# is softened by scatter; this takes the radiograph's crisp bone edges off.
-# The master is ~2x the frame width at the default zoom, so the visible blur
-# is about half this. 0 = off. (3.0 read too soft on-device.)
-MASTER_SOFTEN = 1.5
+# is softened by scatter; this takes a crisp radiograph's bone edges off. The
+# masters are already soft and are about the frame width at the default zoom,
+# so any blur here shows nearly 1:1. 0 = off.
+MASTER_SOFTEN = 0.0
 # Brightness scale applied to the master at load. <1.0 darkens it (pulls the
 # bright/white areas down the most, since it's multiplicative); 1.0 = as-is.
 MASTER_BRIGHTNESS = 1.0
 # Master-image pixels per real centimetre of anatomy.
-PX_PER_CM = 14.2
+PX_PER_CM = 7.0
 # The master pixel that camera coordinate (0, 0) maps to (viewport centre at origin).
-ORIGIN_PX = (670, 1845)         # centre of the 1340×3691 master
+ORIGIN_PX = (433, 637)          # centre of the 867×1275 master (~T12/L1)
 # Physical area the detector sees at once, (width_cm, height_cm). Keep 4:3 to match
 # the camera frame. This is the ZOOM knob: larger = zoomed out (more anatomy shown),
 # smaller = zoomed in. Widened from (80, 60) by 1.17 — the old view at z=+8.5 —
@@ -1030,13 +1029,16 @@ def apply_aperture(img):
     return (img.astype(np.float32) * mask).astype(np.uint8)
 
 
-def load_master(path):
+def load_master(path, invert=None):
     '''Load an anatomy master and tone-map it into the compositing space.
 
     Returns None if the file is missing. The tone mapping (polarity, gamma,
     soften, brightness) is the tuned look — every master goes through it, so
-    the frontal and lateral backgrounds match.
+    the frontal and lateral backgrounds match. ``invert`` overrides
+    MASTER_INVERT for an image supplied in the other polarity.
     '''
+    if invert is None:
+        invert = MASTER_INVERT
     # Checked before imread: the lateral master is optional, and imread logs a
     # "can't open/read file" warning of its own for a file that is simply not
     # there yet, which reads like a fault in the launch log.
@@ -1046,7 +1048,7 @@ def load_master(path):
     if img is None:
         return None
     img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-    if MASTER_INVERT:
+    if invert:
         img = 255 - img
     if MASTER_GAMMA != 1.0:
         lut = (np.clip((np.arange(256) / 255.0) ** MASTER_GAMMA, 0.0, 1.0)
@@ -1076,7 +1078,9 @@ def build_filler_master(shape, label="LATERAL MASTER"):
     img = (206 * np.clip(1.0 - 0.10 * vignette, 0.0, 1.0)).astype(np.uint8)
 
     font = cv.FONT_HERSHEY_SIMPLEX
-    step = 520          # < the shortest viewport crop, so a caption is always in shot
+    # About half the default viewport crop's height, so a caption is always in
+    # shot even zoomed in to half the field.
+    step = max(120, int(0.52 * FOV_CM[1] * PX_PER_CM))
     for cy in range(step // 2, h, step):
         for row, (text, scale, thick) in enumerate(
                 ((label, 1.5, 3), ("PLACEHOLDER - NO IMAGE YET", 0.8, 2))):
@@ -2298,13 +2302,13 @@ def run_simulation(cam_index, show_window):
     if master is None:
         print("Master image not found at %s — falling back to %s (no panning)"
               % (MASTER_IMAGE, OVERLAY_IMAGE))
-        master = load_master(OVERLAY_IMAGE)
+        # skel.jpg is a film-convention radiograph (white bone, dark air).
+        master = load_master(OVERLAY_IMAGE, invert=True)
         if master is None:
             raise FileNotFoundError("Cannot load image: %s" % OVERLAY_IMAGE)
 
-    # The lateral view's background. Until a real lateral master exists, an
-    # obvious placeholder field stands in so the split view works today; drop
-    # a file in at LATERAL_MASTER_IMAGE and it is picked up on next start.
+    # The lateral view's background. If the lateral master is missing, an
+    # obvious placeholder field stands in so the split view still works.
     lateral_master = load_master(LATERAL_MASTER_IMAGE)
     if lateral_master is None:
         print("No lateral master at %s — using a placeholder background for "

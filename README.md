@@ -142,22 +142,24 @@ second camera in offers the lateral view without a restart, and unplugging it
 returns to the main view on its own. A single camera always drives the main
 view, even if it sits in the port assigned to the lateral role.
 
-#### The lateral anatomy background
+#### The anatomy backgrounds
 
-The lateral view composites against `lateral_master.png` next to the script.
-That file does not exist yet, so the simulator builds an obvious placeholder
-instead — a plain light field captioned `LATERAL MASTER / PLACEHOLDER - NO IMAGE
-YET`, repeated often enough that any pan position lands on a caption. It is
-deliberately not anatomy: the lateral half works today without pretending to be
-a real projection.
+The two views composite against `frontal_master.png` and `lateral_master.png`
+next to the script: frontal and lateral projections of the same torso,
+shoulders to proximal femurs, each 867 × 1275. They are in fluoro polarity
+(white air, dark bone) and load as-is: `MASTER_INVERT` is off, and
+`MASTER_GAMMA` / `MASTER_SOFTEN` are at their neutral values.
 
-Drop a real image in at `lateral_master.png` and it is used on the next start,
-no code change. It should have the **same pixel dimensions as
-`fulltorsofluoroimage.png`** (3691 × 1340), because the cm → pixel pan/zoom
-calibration is expressed in that image's pixels; a mismatch is logged at
-startup and the two views will not pan alike. It goes through the same tone
-mapping as the frontal master (`MASTER_INVERT`, `MASTER_GAMMA`,
-`MASTER_SOFTEN`), so supply it in the same polarity as the frontal one.
+To swap in different images, keep the two the **same pixel dimensions**, because
+the cm → pixel pan/zoom calibration (`PX_PER_CM`, `ORIGIN_PX`) is expressed in
+the frontal master's pixels. A mismatch is logged at startup, and the two views
+will not pan alike. Both go through the same tone mapping, so supply them in the
+same polarity. Retune `PX_PER_CM` and `ORIGIN_PX` if the new frontal image has a
+different scale or crop.
+
+If `lateral_master.png` is missing, the simulator builds an obvious placeholder
+instead: a plain light field captioned `LATERAL MASTER / PLACEHOLDER - NO IMAGE
+YET`, repeated often enough that any pan position lands on a caption.
 
 #### Frame rate
 
