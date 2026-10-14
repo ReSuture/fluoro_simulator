@@ -6,6 +6,8 @@ Comment=Launch the FluoroSim simulation window with the web control panel
 # Goes through systemd so the sim is supervised: it auto-restarts if it
 # crashes, and "restart" makes the button work whether it's stopped or wedged.
 # Requires ~/.config/systemd/user/fluorosim.service (see README).
+# pi_setup/provision_pi.py installs this to ~/Desktop with the paths below
+# rewritten for the Pi's own home directory.
 Exec=systemctl --user restart fluorosim.service
 Icon=/home/benknapp95/fluoro_simulator/static/logosign_white.png
 Path=/home/benknapp95/fluoro_simulator

@@ -149,6 +149,21 @@ def install_fluorosim_service():
                     os.path.join(unit_dir, unit))
     run(["systemctl", "--user", "daemon-reload"])
     run(["systemctl", "--user", "enable", "--now"] + USER_UNITS)
+    install_desktop_shortcut()
+
+
+def install_desktop_shortcut():
+    """The FluoroSim desktop button. The repo copy names the bench Pi's home
+    directory; .desktop files cannot expand ~, so it is rewritten here."""
+    with open(os.path.join(REPO_DIR, "FluoroSim.desktop"), encoding="utf-8") as fh:
+        text = fh.read().replace("/home/benknapp95/fluoro_simulator", REPO_DIR)
+    desktop = os.path.expanduser("~/Desktop")
+    os.makedirs(desktop, exist_ok=True)
+    path = os.path.join(desktop, "FluoroSim.desktop")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(path, 0o755)
+    log("desktop shortcut: %s" % path)
     # Let the user services run without an interactive login.
     run(["sudo", "loginctl", "enable-linger", os.environ.get("USER", "")])
 
