@@ -55,12 +55,37 @@ real = f.list_cameras()
 print("     %d video node(s) present; list_cameras() -> %s"
       % (len(glob.glob("/dev/video*")),
          [(c["device"], c["port"], c["name"]) for c in real] or "[]"))
-# A Pi exposes a dozen video nodes and four of its bcm2835 ISP ones report
+# A Pi exposes a dozen or more video nodes and several of its ISP ones report
 # video-capture + streaming, so without the bus filter this returns phantoms.
 check("no phantom cameras from platform codec/ISP nodes",
-      all(not c["port"].startswith("platform:bcm2835") for c in real))
+      all(c["port"].startswith("usb-") for c in real))
 check("one entry per port (a camera's extra nodes are collapsed)",
       len({c["port"] for c in real}) == len(real))
+
+# The same filter against a Pi 5's node layout, so it is checked on any
+# machine. The decoder and pispbe caps are what a Pi 5 reported (multi-planar,
+# so the caps check drops them); the CSI receiver node is single-planar
+# capture on a platform bus, the case only the bus rule catches; plus one UVC
+# camera with its metadata node.
+_CAP, _STREAM, _META = 0x00000001, 0x04000000, 0x00800000
+_pi5 = {"/dev/video19": ("rpi-hevc-dec", "platform:rpi-hevc-dec", 0x04204000)}
+for _n in range(20, 36):
+    _pi5["/dev/video%d" % _n] = ("pispbe", "platform:1000880000.pisp_be",
+                                 (0x04202000, 0x04201000, 0x0c200000)[_n % 3])
+_pi5["/dev/video2"] = ("rp1-cfe", "platform:1f00128000.csi", _CAP | _STREAM)
+_pi5["/dev/video0"] = ("uvcvideo", "usb-xhci-hcd.0-1", _CAP | _STREAM)
+_pi5["/dev/video1"] = ("uvcvideo", "usb-xhci-hcd.0-1", _META | _STREAM)
+_real_glob, _real_querycap = f.glob.glob, f._querycap
+f.glob.glob = lambda pattern: sorted(_pi5)
+f._querycap = lambda path: {"driver": _pi5[path][0], "name": "Fake",
+                            "port": _pi5[path][1], "caps": _pi5[path][2]}
+try:
+    _found = f.list_cameras()
+finally:
+    f.glob.glob, f._querycap = _real_glob, _real_querycap
+check("Pi 5: only the USB camera is found among the ISP/codec nodes",
+      [(c["device"], c["port"]) for c in _found] == [("/dev/video0", "usb-xhci-hcd.0-1")],
+      _found)
 
 
 print("\n2. Role resolution")

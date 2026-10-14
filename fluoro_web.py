@@ -46,13 +46,15 @@ served over HTTPS (so browsers that force secure connections can reach it). Pass
 
 Usage:
     python fluoro_web.py [<video device number>] [--port 5000] [--host 0.0.0.0]
-                         [--no-window] [--http] [--screen WxH]
+                         [--no-window] [--http] [--screen WxH[+X+Y]]
 
 ``--screen 1024x600`` composes the fullscreen UI natively at the display's
 resolution (e.g. the WIMAXIT touch monitor): the video is letterboxed instead
 of stretched, buttons get real touch-sized hit areas, and tapping a text
-field pops an on-screen keyboard. launch_fluoro.sh auto-detects the attached
-display and passes this flag.
+field pops an on-screen keyboard. ``--screen 1024x600+1920+0`` also says where
+that display sits in the desktop, so the window lands on it when a second
+monitor is attached. launch_fluoro.sh finds the touch display (displays.py)
+and passes this flag.
 
 Then open  https://<this-machine-ip>:<port>/  in a browser (http:// without a cert).
 
@@ -68,6 +70,7 @@ import sys
 import glob
 import functools
 import json
+import re
 import time
 import struct
 import threading
@@ -223,16 +226,21 @@ PAN_STEP_CM = 5.0
 CAMERA_CONFIG = os.path.join(device_setup.CACHE_DIR, "cameras.json")
 
 # VIDIOC_QUERYCAP: _IOR('V', 0, struct v4l2_capability) - asks a /dev/video*
-# node what it actually is. Necessary because a Pi exposes a dozen video nodes
-# and four of the bcm2835 ISP ones report "video capture": without this filter
-# the simulator would think it had four cameras attached and no camera at all.
+# node what it actually is. Necessary because a Pi exposes a dozen or more
+# video nodes and some report "video capture" - four of the bcm2835 ISP ones
+# on a Pi 3: without this filter the simulator would think it had four cameras
+# attached and no camera at all. (A Pi 5's pispbe ISP nodes report the
+# multi-planar capture capability instead, so the caps check drops them.)
 _VIDIOC_QUERYCAP = 0x80685600
 _V4L2_CAP_VIDEO_CAPTURE = 0x00000001
 _V4L2_CAP_STREAMING = 0x04000000
 _V4L2_CAP_DEVICE_CAPS = 0x80000000
 
-# The Pi's own codec/ISP plumbing sits on these buses; real cameras never do.
-_NOT_A_CAMERA_BUS = ("platform:bcm2835",)
+# The cameras are USB (UVC) webcams, whose bus_info always starts "usb-". The
+# Pi's own codec/ISP plumbing reports "platform:..." (bcm2835-isp on a Pi 3;
+# pispbe, rpi-hevc-dec and the CSI receiver on a Pi 5), so keeping only USB
+# nodes filters it out on every model without listing each driver.
+_CAMERA_BUS = "usb-"
 
 
 def _querycap(path):
@@ -279,7 +287,7 @@ def list_cameras():
             continue
         if not (cap["caps"] & _V4L2_CAP_STREAMING):
             continue
-        if cap["port"].startswith(_NOT_A_CAMERA_BUS):
+        if not cap["port"].startswith(_CAMERA_BUS):
             continue
         try:
             index = int(path.rsplit("video", 1)[1])
@@ -523,6 +531,11 @@ def set_lateral(on):
 # camera frame's size — set by --screen for touch displays so the pixels (and
 # therefore the tap targets) map 1:1 onto the panel. None = classic behaviour.
 SCREEN_SIZE = None
+# Where that display sits in the desktop layout, (x, y) — from --screen's
+# "+X+Y" part. With a second monitor attached (a Pi 5 mirroring the touch
+# panel) the FLUORO window is placed here before going fullscreen, so it
+# fills the touch panel rather than whichever output the desktop picked.
+SCREEN_POS = None
 
 # Latest processed frame for the MJPEG preview stream. The main loop only hands
 # the frame over (publish_preview); it is JPEG-encoded on first request, in the
@@ -2333,6 +2346,8 @@ def run_simulation(cam_index, show_window):
     def show_fluoro_window():
         cv.namedWindow("FLUORO", cv.WND_PROP_FULLSCREEN)
         cv.setWindowProperty("FLUORO", cv.WND_PROP_ASPECT_RATIO, cv.WINDOW_KEEPRATIO)
+        if SCREEN_POS:
+            cv.moveWindow("FLUORO", *SCREEN_POS)
         # Clicks on the FLUORO window only matter in fullscreen, where the control
         # bar is stacked below the video (see overlay_buttons).
         cv.setMouseCallback("FLUORO", on_mouse_fluoro)
@@ -2485,6 +2500,11 @@ def run_simulation(cam_index, show_window):
         # move the on-screen controls between the separate CONTROLS window
         # (windowed) and a bar stacked below the video (fullscreen).
         if show_window and s["fullscreen"] != applied_fullscreen:
+            if s["fullscreen"] and SCREEN_POS and applied_fullscreen is not None:
+                # Back onto the touch panel first: fullscreen fills whichever
+                # output the window is on, and windowed it may have been
+                # dragged onto the other monitor.
+                cv.moveWindow("FLUORO", *SCREEN_POS)
             cv.setWindowProperty(
                 "FLUORO", cv.WND_PROP_FULLSCREEN,
                 cv.WINDOW_FULLSCREEN if s["fullscreen"] else cv.WINDOW_NORMAL)
@@ -2776,9 +2796,14 @@ if __name__ == "__main__":
             show_window = False; i += 1; continue
         if a == "--http":          # force plain HTTP even if a cert is present
             force_http = True; i += 1; continue
-        if a == "--screen":        # compose fullscreen natively at WxH (touch displays)
-            sw, sh = args[i + 1].lower().split("x")
-            SCREEN_SIZE = (int(sw), int(sh)); i += 2; continue
+        if a == "--screen":        # compose fullscreen natively at WxH[+X+Y] (touch displays)
+            m = re.match(r"^(\d+)x(\d+)(?:\+(\d+)\+(\d+))?$", args[i + 1].lower())
+            if not m:
+                sys.exit("--screen wants WxH or WxH+X+Y, e.g. 1024x600+0+0")
+            SCREEN_SIZE = (int(m.group(1)), int(m.group(2)))
+            if m.group(3) is not None:
+                SCREEN_POS = (int(m.group(3)), int(m.group(4)))
+            i += 2; continue
         if a == "--list-cameras":  # show what is attached, and which port is which
             print(describe_cameras()); sys.exit(0)
         if a in ("--main", "--lateral"):

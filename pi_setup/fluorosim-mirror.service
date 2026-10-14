@@ -1,0 +1,17 @@
+[Unit]
+Description=FluoroSim: mirror the touch panel onto a second monitor
+# Needs the desktop session up so wl-mirror can open on the display.
+After=graphical-session.target
+# Never stop retrying (see Restart below), so it comes up as soon as the
+# session is ready however long that takes.
+StartLimitIntervalSec=0
+
+[Service]
+# Idles until a second monitor is attached; turn mirroring off with MIRROR=off
+# in ~/.config/fluorosim/display.conf (see displays.py).
+ExecStart=/usr/bin/python3 %h/fluoro_simulator/displays.py mirror
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

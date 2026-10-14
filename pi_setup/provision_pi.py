@@ -88,12 +88,17 @@ def install_cloudflared():
     os.remove(deb)
 
 
-def install_ffmpeg():
-    """The Library auto-upload transcodes recordings to MP4 with ffmpeg."""
-    if shutil.which("ffmpeg"):
-        log("ffmpeg already installed")
-        return
-    run(["sudo", "apt-get", "install", "-y", "ffmpeg"])
+# From apt, not pip: Raspberry Pi OS refuses system-wide pip installs, and
+# apt's OpenCV is the build the sim runs on. ffmpeg transcodes recordings for
+# the Library auto-upload; wl-mirror and wlr-randr mirror the touch panel onto
+# a second monitor (displays.py).
+APT_PACKAGES = ["python3-opencv", "python3-numpy", "python3-flask", "ffmpeg",
+                "wl-mirror", "wlr-randr"]
+
+
+def install_packages():
+    run(["sudo", "apt-get", "update"])
+    run(["sudo", "apt-get", "install", "-y"] + APT_PACKAGES)
 
 
 # ── Portal registration ───────────────────────────────────────────────────────
@@ -133,13 +138,17 @@ def install_tunnel_service(tunnel_token):
     run(["sudo", "systemctl", "enable", "--now", "cloudflared"])
 
 
+USER_UNITS = ["fluorosim.service", "fluorosim-mirror.service"]
+
+
 def install_fluorosim_service():
-    unit_src = os.path.join(REPO_DIR, "pi_setup", "fluorosim.service")
     unit_dir = os.path.expanduser("~/.config/systemd/user")
     os.makedirs(unit_dir, exist_ok=True)
-    shutil.copy(unit_src, os.path.join(unit_dir, "fluorosim.service"))
+    for unit in USER_UNITS:
+        shutil.copy(os.path.join(REPO_DIR, "pi_setup", unit),
+                    os.path.join(unit_dir, unit))
     run(["systemctl", "--user", "daemon-reload"])
-    run(["systemctl", "--user", "enable", "--now", "fluorosim.service"])
+    run(["systemctl", "--user", "enable", "--now"] + USER_UNITS)
     # Let the user services run without an interactive login.
     run(["sudo", "loginctl", "enable-linger", os.environ.get("USER", "")])
 
@@ -230,8 +239,8 @@ def main():
     device_id = (args.device_id or default_device_id()).lower()
     log("device id: %s" % device_id)
 
+    install_packages()
     install_cloudflared()
-    install_ffmpeg()
 
     result = register_with_portal(args, device_id)
     hostname = result["hostname"]

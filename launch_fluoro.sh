@@ -27,18 +27,20 @@ export QT_QPA_PLATFORM=xcb
 # session; fall back to :0 so the FLUORO window can open.
 export DISPLAY="${DISPLAY:-:0}"
 
-# Size the fullscreen UI to the attached display (e.g. a 1024x600 touch
-# monitor): ask xrandr for the current mode and pass it as --screen so the
-# app composes natively at that resolution — letterboxed video, touch-sized
-# buttons, and the on-screen keyboard laid out for the real panel. If xrandr
-# is unavailable (or headless), fall back to the classic camera-sized layout.
+# Size the fullscreen UI to the touch panel (e.g. the 1024x600 WIMAXIT):
+# displays.py finds it by its EDID name and prints its size and position, and
+# that goes to --screen so the app composes natively at that resolution -
+# letterboxed video, touch-sized buttons, the on-screen keyboard laid out for
+# the real panel - on the panel itself even with a mirror monitor attached.
+# If it cannot tell (headless, no xrandr), fall back to the classic
+# camera-sized layout.
 #
 # Right after boot the desktop's output manager (kanshi, ~/.config/kanshi/config)
-# may still be switching the mode - the bench monitor is set to 720p there,
-# because the Pi 3 paints 1080p too slowly - and a mode read mid-switch lays
-# the UI out for the wrong resolution. So early on, wait for the mode to hold
-# steady (and for xrandr to answer at all) before trusting it.
-current_mode() { xrandr --current 2>/dev/null | awk '/\*/ {print $1; exit}'; }
+# may still be switching the mode - the Pi 3's bench monitor is set to 720p
+# there, because a Pi 3 paints 1080p too slowly - and a mode read mid-switch
+# lays the UI out for the wrong resolution. So early on, wait for the mode to
+# hold steady (and for xrandr to answer at all) before trusting it.
+current_mode() { python3 displays.py screen-arg 2>/dev/null; }
 SCREEN_ARGS=()
 MODE=$(current_mode)
 if (( $(cut -d. -f1 /proc/uptime) < 180 )); then
@@ -49,7 +51,7 @@ if (( $(cut -d. -f1 /proc/uptime) < 180 )); then
         MODE=$NEXT
     done
 fi
-if [[ "${MODE:-}" =~ ^[0-9]+x[0-9]+$ ]]; then
+if [[ "${MODE:-}" =~ ^[0-9]+x[0-9]+(\+[0-9]+\+[0-9]+)?$ ]]; then
     echo "display mode detected: $MODE"
     SCREEN_ARGS=(--screen "$MODE")
 fi

@@ -129,6 +129,9 @@ Cameras attached: 2
   lateral  usb-3f980000.usb-1.2           /dev/video2   HD Pro Webcam C920
 ```
 
+(That is a Pi 3. On a Pi 5 the ports read like `usb-xhci-hcd.0-1`.) Only USB
+cameras count: the Pi's own codec and ISP video nodes are skipped.
+
 With nothing saved, the roles follow port order: first port = main, second =
 lateral. To pin them to specific ports (saved to
 `~/.config/fluorosim/cameras.json`, so it survives replugs and reboots):
@@ -170,6 +173,36 @@ Pi 3 B+ in the bench unit: **18.7 fps single view, 13.6 fps split** — both
 inside the 7.5–15 pulses/sec range real fluoroscopy runs at. Raise
 `SPLIT_WORK_MAX_W` for a sharper split at a lower rate, or lower it for the
 reverse.
+
+A Pi 5 runs the same pipeline about 11× faster: 4.6 ms a frame single view and
+6.4 ms split (50 and 75 ms on the Pi 3), so on a Pi 5 the processing no
+longer limits the frame rate.
+
+### Touch panel and a mirror monitor
+
+The fullscreen UI is laid out for the touch panel (the 1024×600 WIMAXIT).
+`displays.py` finds it by its EDID name, so it can go in either of a Pi 5's
+HDMI ports, and `launch_fluoro.sh` passes its size and position to
+`--screen`. The panel's touch cable must go to one of the Pi's USB ports: the
+HDMI cable carries the picture only.
+
+Plug a monitor into the other HDMI port and it shows the same picture as the
+panel. `fluorosim-mirror.service` notices the new monitor within a second and
+runs `wl-mirror` fullscreen on it, scaled to fit. Unplugging the monitor stops
+the mirror, and the panel is unaffected either way. The service also keeps
+touch input mapped to the panel (one marked line in `~/.config/labwc/rc.xml`).
+Without that mapping, a second monitor would stretch the touch area across
+both screens and taps would land in the wrong place.
+
+Settings go in `~/.config/fluorosim/display.conf`, and both are optional:
+
+```
+TOUCH_DISPLAY=WIMAXIT   # matched against each output's name, make and model
+MIRROR=on               # off = a second monitor stays an ordinary desktop
+```
+
+`python3 displays.py status` shows what is attached and which output is the
+panel.
 
 ### No camera attached
 
@@ -226,10 +259,13 @@ Install on a new machine:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp pi_setup/fluorosim.service ~/.config/systemd/user/
+cp pi_setup/fluorosim.service pi_setup/fluorosim-mirror.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now fluorosim.service
+systemctl --user enable --now fluorosim.service fluorosim-mirror.service
 ```
+
+`fluorosim-mirror.service` is the second-monitor mirror (see **Touch panel and
+a mirror monitor**); it idles when there is only one display.
 
 Manage it with `systemctl --user {start,stop,restart,status} fluorosim`. The
 app's output goes to `launch.log` in this directory (via `launch_fluoro.sh`),

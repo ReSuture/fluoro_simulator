@@ -7,12 +7,28 @@ Cloudflare Access (only the assigned customer + ReSuture admins can open it).
 
 ## Prerequisites
 
-- Raspberry Pi OS with desktop autologin (standard image), camera attached.
-- This repo cloned at `~/fluoro_simulator`.
-- App dependencies: `pip install opencv-python numpy flask`.
-- `ffmpeg` for the Library auto-upload (the provision script installs it).
+- Raspberry Pi OS 64-bit with desktop autologin (standard image), camera
+  attached. Runs on a Pi 3 B+ or a Pi 5.
+- This repo cloned at `~/fluoro_simulator`
+  (`git clone https://github.com/ReSuture/fluoro_simulator.git`).
+- The provision script installs the app's packages from apt:
+  `python3-opencv python3-numpy python3-flask ffmpeg wl-mirror wlr-randr`. Do not
+  `pip install` them: Raspberry Pi OS blocks system-wide pip installs.
 - From the portal operator (see `portal/README.md`): the portal URL, the
   `PROVISION_TOKEN`, and the Access service-token id/secret for the bench.
+
+### Pi 5 hardware
+
+- **USB power.** Use the official 27 W (5 A) supply. On a weaker supply the
+  Pi 5 caps all four USB ports at 600 mA combined, and two cameras plus the
+  touch panel and pedal can exceed that, so cameras drop out. To lift the cap
+  on a supply you trust, set `usb_max_current_enable=1` in
+  `/boot/firmware/config.txt`.
+- **Touch panel.** Either HDMI port works, because the panel is found by its EDID
+  name. Its touch cable goes to a Pi USB port; that is what makes touch work.
+- **Second monitor (optional).** Plug it into the other HDMI port and it mirrors
+  the panel (see the main README, *Touch panel and a mirror monitor*).
+- Fit the active cooler.
 
 ## Provision
 
@@ -29,13 +45,14 @@ What it does:
 
 1. Derives the **device id** from the Pi's CPU serial (last 6 hex chars —
    stable across re-imaging). Print it on the case sticker.
-2. Installs `cloudflared` if missing.
+2. Installs the app's apt packages, and `cloudflared` if missing.
 3. Registers the device with the portal, which creates the tunnel, DNS record
    and Access application **in that order's safe variant** (Access gate first),
    and returns a token scoped to this one tunnel.
 4. Installs the `cloudflared` system service with that token.
-5. Installs `fluorosim.service` as a user service (auto-start + crash restart)
-   and enables lingering so it runs from boot.
+5. Installs `fluorosim.service` (auto-start + crash restart) and
+   `fluorosim-mirror.service` (second-monitor mirror) as user services, and
+   enables lingering so they run from boot.
 6. Verifies `https://sim-<id>.<device-domain>/` answers with a redirect to the
    Access login. **If it answers 200 without a login, do not ship** — the gate
    is missing.
