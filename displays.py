@@ -40,7 +40,10 @@ END_MARK = "<!-- FluoroSim: end of displays.py settings -->"
 
 POLL_SEC = 1.0              # how quickly a plugged/unplugged monitor is noticed
 MIRROR_RETRY_SEC = 5.0      # wait before restarting a wl-mirror that died
-MIRROR_TITLE = "FluoroSim mirror"   # wl-mirror's window title; labwc's focus rule matches it
+MIRROR_TITLE = "FluoroSim mirror"   # wl-mirror's window title
+# labwc's focus rule matches wl-mirror by app_id: it only checks a rule as a
+# window first opens, and wl-mirror sets its --title after that.
+MIRROR_APP_ID = "at.yrlf.wl_mirror"
 
 # While mirroring, the monitor sits this far right of the panel in the desktop
 # layout. The compositor keeps the pointer on the nearest output, so a gap wider
@@ -176,11 +179,11 @@ def map_input(output, path=LABWC_RC):
     entry = ('%s\n'
              '  <touch mapToOutput="%s" />\n'
              '  <windowRules>\n'
-             '    <windowRule title="%s">\n'
+             '    <windowRule identifier="%s">\n'
              '      <action name="FocusOutput" output="%s" />\n'
              '    </windowRule>\n'
              '  </windowRules>\n'
-             '  %s') % (TOUCH_MARK, output, MIRROR_TITLE, output, END_MARK)
+             '  %s') % (TOUCH_MARK, output, MIRROR_APP_ID, output, END_MARK)
     try:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
