@@ -12,7 +12,7 @@ while the monitor shows the fluoro view.
 
 The web panel exposes the on/off toggles only (no numeric tuning sliders):
 
-    Overlay, Equalize, Pedal mode, Pedal press, HUD, Record,
+    Overlay, Equalize, Pedal mode, HUD, Record,
     plus Fullscreen / Windowed / Start / Stop actions and a live preview.
     Stop puts the simulation into standby (camera released, FLUORO window
     closed) while this web server keeps running, so Start can bring it back
@@ -406,8 +406,7 @@ state_lock = threading.Lock()
 state = {
     "overlay": True,        # (2/5) anatomy overlay; off => full raw video
     "equalize": False,      # (6) CLAHE histogram equalisation
-    "pedal_mode": False,    # (space) only capture while the pedal is pressed
-    "pedal_pressed": False, # web stand-in for holding the foot pedal / 'b' key
+    "pedal_mode": False,    # (space) only capture while the foot pedal ('b') is held
     "hud": True,            # (7) on-screen text HUD
     "fullscreen": True,     # (3/4) FLUORO window fullscreen vs. windowed
     "running": True,        # simulation active; False = standby (web server stays up)
@@ -630,9 +629,12 @@ PAGE = """
       grid-template-columns: repeat(4, 1fr); margin-top: 8px; }
   .stage:fullscreen .panel button, .stage:-webkit-full-screen .panel button {
       padding: 10px 8px; font-size: 14px; }
-  .stage:fullscreen .panel button.quit, .stage:-webkit-full-screen .panel button.quit {
+  .stage:fullscreen .panel button.quit, .stage:-webkit-full-screen .panel button.quit,
+  .stage:fullscreen .panel button.rec, .stage:-webkit-full-screen .panel button.rec {
       grid-column: auto; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
+  /* Five toggles in two columns: Record, the odd one out, takes the last row. */
+  .grid button.rec { grid-column: 1 / -1; }
   button { font-size: 16px; padding: 16px 12px; border-radius: 12px; border: 1px solid #26323f;
            background: #131a22; color: #e7edf3; cursor: pointer; font-weight: 600;
            transition: background .12s, border-color .12s; }
@@ -685,7 +687,6 @@ PAGE = """
         <button class="toggle" data-toggle="equalize">Equalize<span class="st">—</span></button>
         <button class="toggle" data-toggle="hud">HUD<span class="st">—</span></button>
         <button class="toggle" data-toggle="pedal_mode">Pedal mode<span class="st">—</span></button>
-        <button class="toggle" data-toggle="pedal_pressed">Pedal press<span class="st">—</span></button>
         <button class="toggle rec" data-toggle="recording">Record<span class="st">—</span></button>
       </div>
 
@@ -705,7 +706,7 @@ PAGE = """
     <button id="gopos" type="button">Pan</button>
   </div>
   <p class="hint" id="pos">Camera: —</p>
-  <p class="hint">Overlay off shows the full raw video. Pedal press only matters when Pedal mode is on.</p>
+  <p class="hint">Overlay off shows the full raw video. In Pedal mode the picture only updates while the foot pedal is held.</p>
 </main>
 
 <script>
@@ -837,8 +838,7 @@ def api_toggle(name):
         set_lateral(want)
         return jsonify(get_state_snapshot())
     with state_lock:
-        if name in ("overlay", "equalize", "pedal_mode", "pedal_pressed", "hud",
-                    "recording"):
+        if name in ("overlay", "equalize", "pedal_mode", "hud", "recording"):
             state[name] = not state[name]
         snap = dict(state)
     return jsonify(snap)
@@ -1399,15 +1399,17 @@ def render_controls(s, logo, live):
     cw = (W - 2 * m - gap) // 2
     toggles = [("Overlay", "overlay"), ("Equalize", "equalize"),
                ("HUD", "hud"), ("Pedal mode", "pedal_mode"),
-               ("Pedal press", "pedal_pressed"), ("Record", "recording")]
+               ("Record", "recording")]
     for i, (label, key) in enumerate(toggles):
         col, row = i % 2, i // 2
         bx = m + col * (cw + gap)
         by = y + row * (bt + gap)
+        # Record, the odd one out, takes the whole last row.
+        bw = W - 2 * m if key == "recording" else cw
         on = bool(s[key])
-        draw_button(img, bx, by, cw, bt, label, "ON" if on else "OFF", on,
+        draw_button(img, bx, by, bw, bt, label, "ON" if on else "OFF", on,
                     "quit" if key == "recording" and on else "normal")
-        buttons.append((bx, by, cw, bt, "toggle", key))
+        buttons.append((bx, by, bw, bt, "toggle", key))
     y += 3 * (bt + gap)
 
     # Background-location readout + nudge buttons (X−/X+/Y−/Y+/Z−/Z+).
@@ -1464,8 +1466,8 @@ def render_control_bar(s, width, live):
 
     toggles = [("Overlay", "overlay"), ("Equalize", "equalize"),
                ("HUD", "hud"), ("Pedal mode", "pedal_mode"),
-               ("Pedal press", "pedal_pressed"), ("Record", "recording")]
-    cw = (width - 2 * pad - 5 * gap) // 6
+               ("Record", "recording")]
+    cw = (width - 2 * pad - 4 * gap) // 5
     y = pad
     for i, (label, key) in enumerate(toggles):
         bx = pad + i * (cw + gap)
@@ -2520,7 +2522,8 @@ def run_simulation(cam_index, show_window):
         # unconsumed keys keep their existing shortcut meaning on the Fluoro view.
         key = (cv.waitKey(1) & 0xFF) if show_window else 0xFF
         consumed = handle_ui_key(key) if key != 0xFF else False
-        key_pedal = not consumed and key == ord('b')
+        # The foot pedal types 'b' (a keyboard 'b' does the same).
+        pedal_down = not consumed and key == ord('b')
         if key != 0xFF and not consumed:
             _handle_key(key)
         if key == 27 and not consumed:  # ESC (on the Fluoro view) exits
@@ -2538,7 +2541,6 @@ def run_simulation(cam_index, show_window):
 
         # In pedal mode, only grab a frame while the pedal/'b' is held; otherwise
         # capture continuously.
-        pedal_down = s["pedal_pressed"] or key_pedal
         any_open = any(caps[r] is not None for r in wanted)
         capture_now = ((pedal_down or not s["pedal_mode"])
                        and not lib_playing and any_open)

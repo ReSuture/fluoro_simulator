@@ -57,7 +57,7 @@ Make sure `skel.jpg` is in the same folder as the script before running, or it w
 | `5`       | Toggle the anatomy overlay (off = full raw video)   |
 | `6`       | Toggle histogram equalization                       |
 | `7`       | Toggle the HUD (on-screen text display)             |
-| `b`       | Acts as the pedal press (keyboard stand-in)         |
+| `b`       | The foot pedal types `b`; hold it to capture        |
 
 > When **pedal mode** is on, frames are only captured while the pedal is held (or the `b` key is pressed). When it's off, the simulator captures continuously.
 >
@@ -70,7 +70,7 @@ Make sure `skel.jpg` is in the same folder as the script before running, or it w
 ### What it provides
 
 - A **live preview** (MJPEG stream) of the processed feed.
-- On/off **toggle buttons** mirroring the keyboard shortcuts: Subtraction, Overlay, Equalize, Pedal mode, Pedal press, and HUD. Toggles stay in sync whether you use the web buttons or the keyboard.
+- On/off **toggle buttons** mirroring the keyboard shortcuts: Overlay, Equalize, HUD, Pedal mode, and Record. Toggles stay in sync whether you use the web buttons or the keyboard.
 - **Fullscreen / Windowed** buttons that control both the `FLUORO` popup window on the computer **and** the live preview in your browser, plus a **Quit** button.
 
 ### Requirements
