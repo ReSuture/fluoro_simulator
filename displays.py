@@ -5,6 +5,8 @@ The fullscreen UI is laid out for the touch panel (fluoro_web.py --screen), so
 with two monitors attached it has to know which one that is. A Pi 5 has two
 HDMI ports: plug a monitor into the one the panel is not using and it shows
 the same picture as the panel, via wl-mirror; unplug it and nothing changes.
+The monitor is only ever a picture of the panel: touch, the pointer and the
+keyboard (so the foot pedal) all stay with the panel.
 
     python3 displays.py screen-arg   # "1024x600+0+0", for launch_fluoro.sh
     python3 displays.py status       # what is attached, and which is the panel
@@ -34,9 +36,17 @@ DEFAULTS = {"TOUCH_DISPLAY": "WIMAXIT", "MIRROR": "on"}
 # lines FluoroSim adds; the system defaults in /etc/xdg/labwc still apply.
 LABWC_RC = os.path.expanduser("~/.config/labwc/rc.xml")
 TOUCH_MARK = "<!-- FluoroSim: touch input follows the touch panel (displays.py) -->"
+END_MARK = "<!-- FluoroSim: end of displays.py settings -->"
 
 POLL_SEC = 1.0              # how quickly a plugged/unplugged monitor is noticed
 MIRROR_RETRY_SEC = 5.0      # wait before restarting a wl-mirror that died
+MIRROR_TITLE = "FluoroSim mirror"   # wl-mirror's window title; labwc's focus rule matches it
+
+# While mirroring, the monitor sits this far right of the panel in the desktop
+# layout. The compositor keeps the pointer on the nearest output, so a gap wider
+# than any single mouse movement keeps the pointer on the panel - on the monitor
+# it would only be over wl-mirror's picture, where clicks reach nothing.
+MIRROR_GAP_PX = 4096
 
 
 def read_conf(path=CONF):
@@ -77,18 +87,33 @@ def _run(cmd):
 
 
 def wayland_outputs():
-    '''Enabled outputs, as wlr-randr reports them: [{name, label}].
+    '''Enabled outputs, as wlr-randr reports them: [{name, label, x, y, w, h}].
 
-    label is "make model" from the EDID. Empty when wlr-randr is missing or
-    the desktop is not up yet.
+    label is "make model" from the EDID; x, y, w, h are the output's box in the
+    desktop layout, in logical pixels. labwc's NOOP-1 stand-in, which exists
+    only until a real display is up, is left out. Empty when wlr-randr is
+    missing or the desktop is not up yet.
     '''
     try:
         data = json.loads(_run(["wlr-randr", "--json"]) or "[]")
     except ValueError:
         return []
-    return [{"name": o.get("name", ""),
-             "label": "%s %s" % (o.get("make", ""), o.get("model", ""))}
-            for o in data if o.get("enabled")]
+    outputs = []
+    for o in data:
+        name = o.get("name", "")
+        if not o.get("enabled") or name.startswith(("NOOP-", "HEADLESS-")):
+            continue
+        mode = next((m for m in o.get("modes", []) if m.get("current")), {})
+        w, h = mode.get("width", 0), mode.get("height", 0)
+        if o.get("transform", "normal").endswith(("90", "270")):
+            w, h = h, w
+        scale = o.get("scale") or 1.0
+        pos = o.get("position") or {}
+        outputs.append({"name": name,
+                        "label": "%s %s" % (o.get("make", ""), o.get("model", "")),
+                        "x": pos.get("x", 0), "y": pos.get("y", 0),
+                        "w": int(round(w / scale)), "h": int(round(h / scale))})
+    return outputs
 
 
 _XRANDR_OUTPUT = re.compile(r"^(\S+) connected (?:primary )?(\d+)x(\d+)\+(\d+)\+(\d+)")
@@ -131,15 +156,26 @@ def screen_arg(conf=None):
     return geo.get(touch) or next(iter(geo.values()))
 
 
-def map_touch(output, path=LABWC_RC):
-    '''Point touch input at the panel's output in labwc's config. -> changed?
+def map_input(output, path=LABWC_RC):
+    '''Point touch input and the keyboard at the panel in labwc's config. -> changed?
 
-    Without this, a second monitor stretches the touch area across both
-    screens and every tap lands in the wrong place. Only the one marked line
-    is ever written; anything else in the file is left exactly as it was.
-    labwc is told to reload when the file changes.
+    Without the touch line, a second monitor stretches the touch area across
+    both screens and every tap lands in the wrong place. The line names no
+    device, which makes it labwc's default for every touchscreen; an empty
+    deviceName="" would match none of them. labwc focuses every new window, so
+    the window rule hands the keyboard - and the foot pedal, which is one -
+    back to the panel's window whenever the mirror opens. Only the marked
+    block is ever written; anything else in the file is left exactly as it
+    was. labwc is told to reload when the file changes.
     '''
-    entry = '%s\n  <touch deviceName="" mapToOutput="%s" />' % (TOUCH_MARK, output)
+    entry = ('%s\n'
+             '  <touch mapToOutput="%s" />\n'
+             '  <windowRules>\n'
+             '    <windowRule title="%s">\n'
+             '      <action name="FocusOutput" output="%s" />\n'
+             '    </windowRule>\n'
+             '  </windowRules>\n'
+             '  %s') % (TOUCH_MARK, output, MIRROR_TITLE, output, END_MARK)
     try:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
@@ -147,7 +183,9 @@ def map_touch(output, path=LABWC_RC):
         text = ('<?xml version="1.0" encoding="UTF-8"?>\n'
                 '<openbox_config xmlns="http://openbox.org/3.4/rc">\n'
                 '</openbox_config>\n')
-    ours = re.compile(re.escape(TOUCH_MARK) + r"\s*<touch [^>]*/>")
+    # The marked block, or the lone touch line that earlier versions wrote.
+    ours = re.compile(re.escape(TOUCH_MARK) + r"\s*<touch [^>]*/>(?:.*?"
+                      + re.escape(END_MARK) + r")?", re.S)
     if ours.search(text):
         new = ours.sub(lambda _m: entry, text, count=1)
     else:
@@ -164,7 +202,29 @@ def map_touch(output, path=LABWC_RC):
         fh.write(new)
     os.replace(tmp, path)
     subprocess.run(["pkill", "-HUP", "-x", "labwc"], check=False)
-    print("Touch input mapped to %s (%s)" % (output, path))
+    print("Touch input and keyboard focus mapped to %s (%s)" % (output, path))
+    return True
+
+
+def park_monitor(panel, monitor, mirroring):
+    '''Keep a mirroring monitor out of the pointer's reach. -> moved?
+
+    While it mirrors, the monitor goes MIRROR_GAP_PX right of the panel. If
+    mirroring is switched off while it is parked there, it goes back beside
+    the panel so the pointer can reach it as an ordinary desktop; any other
+    arrangement is left alone.
+    '''
+    right = panel["x"] + panel["w"]
+    parked = (right + MIRROR_GAP_PX, panel["y"])
+    now = (monitor["x"], monitor["y"])
+    if mirroring and now != parked:
+        dest = parked
+    elif not mirroring and now == parked:
+        dest = (right, panel["y"])
+    else:
+        return False
+    _run(["wlr-randr", "--output", monitor["name"], "--pos", "%d,%d" % dest])
+    print("Moved %s to %d,%d" % ((monitor["name"],) + dest))
     return True
 
 
@@ -191,10 +251,13 @@ def mirror_loop():
         outputs = wayland_outputs()
         touch = pick_touch(outputs, conf["TOUCH_DISPLAY"])
         if touch and touch != mapped:
-            map_touch(touch)
+            map_input(touch)
             mapped = touch
-        others = [o["name"] for o in outputs if o["name"] != touch]
-        want = (touch, others[0]) if (touch and others and _mirror_on(conf)) else None
+        others = [o for o in outputs if o["name"] != touch]
+        want = (touch, others[0]["name"]) if (touch and others and _mirror_on(conf)) else None
+        if touch and others:
+            panel = next(o for o in outputs if o["name"] == touch)
+            park_monitor(panel, others[0], mirroring=bool(want))
 
         if proc is not None and (proc.poll() is not None or showing != want):
             if proc.poll() is None:
@@ -209,7 +272,7 @@ def mirror_loop():
             try:
                 proc = subprocess.Popen(
                     ["wl-mirror", "--fullscreen-output", monitor,
-                     "--title", "FluoroSim mirror", panel],
+                     "--title", MIRROR_TITLE, panel],
                     env=_session_env())
                 showing = want
             except OSError as exc:

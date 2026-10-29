@@ -189,10 +189,18 @@ HDMI cable carries the picture only.
 Plug a monitor into the other HDMI port and it shows the same picture as the
 panel. `fluorosim-mirror.service` notices the new monitor within a second and
 runs `wl-mirror` fullscreen on it, scaled to fit. Unplugging the monitor stops
-the mirror, and the panel is unaffected either way. The service also keeps
-touch input mapped to the panel (one marked line in `~/.config/labwc/rc.xml`).
-Without that mapping, a second monitor would stretch the touch area across
-both screens and taps would land in the wrong place.
+the mirror, and the panel is unaffected either way. The monitor is only ever a
+picture of the panel, so everything you operate stays on the panel:
+
+- **Touch** is mapped to the panel (a marked block in `~/.config/labwc/rc.xml`).
+  Without it, a second monitor would stretch the touch area across both
+  screens and taps would land in the wrong place.
+- **The mouse pointer** cannot leave the panel: while mirroring, the monitor is
+  moved far away from the panel in the desktop layout, so there is no edge to
+  cross onto it.
+- **Keyboard focus, and so the foot pedal,** goes back to the simulator when
+  the mirror window opens (a labwc window rule in the same block); otherwise
+  the new mirror window would take it and the pedal would stop working.
 
 Settings go in `~/.config/fluorosim/display.conf`, and both are optional:
 
