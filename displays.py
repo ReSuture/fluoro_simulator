@@ -48,6 +48,11 @@ MIRROR_TITLE = "FluoroSim mirror"   # wl-mirror's window title; labwc's focus ru
 # it would only be over wl-mirror's picture, where clicks reach nothing.
 MIRROR_GAP_PX = 4096
 
+# X11 coordinates stop at 32767, and the simulator's window is an X11 one. A
+# panel found further out than this (a layout left in a bad state) is brought
+# back to the origin instead of having the monitor parked beyond it.
+LAYOUT_LIMIT_PX = 16384
+
 
 def read_conf(path=CONF):
     '''display.conf as a dict over DEFAULTS. Missing file = defaults.'''
@@ -206,25 +211,38 @@ def map_input(output, path=LABWC_RC):
     return True
 
 
-def park_monitor(panel, monitor, mirroring):
-    '''Keep a mirroring monitor out of the pointer's reach. -> moved?
+def home_spot(panel):
+    '''Where to hold the panel while a monitor is attached: where it is now,
+    or the origin if the layout has left it implausibly far out.'''
+    spot = (panel["x"], panel["y"])
+    return spot if max(abs(spot[0]), abs(spot[1])) <= LAYOUT_LIMIT_PX else (0, 0)
 
-    While it mirrors, the monitor goes MIRROR_GAP_PX right of the panel. If
-    mirroring is switched off while it is parked there, it goes back beside
-    the panel so the pointer can reach it as an ordinary desktop; any other
-    arrangement is left alone.
+
+def monitor_spot(panel, home, gap):
+    '''The monitor's place: `gap` px right of the panel held at `home`.'''
+    return (home[0] + panel["w"] + gap, home[1])
+
+
+def park_monitor(panel, monitor, home, gap):
+    '''Hold the panel at `home` and the monitor `gap` px right of it. -> moved?
+
+    Holding the panel matters: the compositor re-places an output that was
+    never positioned by hand to the right of the ones that were, so moving
+    the monitor alone would carry the panel off after it. Both positions
+    come from `home`, never from where the panel happens to be, so a move
+    can never set off another one.
     '''
-    right = panel["x"] + panel["w"]
-    parked = (right + MIRROR_GAP_PX, panel["y"])
-    now = (monitor["x"], monitor["y"])
-    if mirroring and now != parked:
-        dest = parked
-    elif not mirroring and now == parked:
-        dest = (right, panel["y"])
-    else:
+    dest = monitor_spot(panel, home, gap)
+    if (panel["x"], panel["y"]) == home and (monitor["x"], monitor["y"]) == dest:
         return False
-    _run(["wlr-randr", "--output", monitor["name"], "--pos", "%d,%d" % dest])
-    print("Moved %s to %d,%d" % ((monitor["name"],) + dest))
+    # labwc applies only a position that differs from the current one, and an
+    # output stays auto-placed until one is applied: nudge the panel a pixel
+    # first, so the second call pins it whatever order labwc takes the two
+    # outputs in.
+    _run(["wlr-randr", "--output", panel["name"], "--pos", "%d,%d" % (home[0], home[1] + 1)])
+    _run(["wlr-randr", "--output", panel["name"], "--pos", "%d,%d" % home,
+          "--output", monitor["name"], "--pos", "%d,%d" % dest])
+    print("Moved %s to %d,%d, panel held at %d,%d" % ((monitor["name"],) + dest + home))
     return True
 
 
@@ -246,6 +264,7 @@ def mirror_loop():
     proc, showing = None, None   # running wl-mirror and its (panel, monitor)
     started = 0.0
     mapped = None
+    homes = {}                   # (panel, monitor) -> where to hold the panel
     while True:
         conf = read_conf()
         outputs = wayland_outputs()
@@ -256,8 +275,14 @@ def mirror_loop():
         others = [o for o in outputs if o["name"] != touch]
         want = (touch, others[0]["name"]) if (touch and others and _mirror_on(conf)) else None
         if touch and others:
-            panel = next(o for o in outputs if o["name"] == touch)
-            park_monitor(panel, others[0], mirroring=bool(want))
+            panel, monitor = next(o for o in outputs if o["name"] == touch), others[0]
+            home = homes.setdefault((touch, monitor["name"]), home_spot(panel))
+            if want:
+                park_monitor(panel, monitor, home, MIRROR_GAP_PX)
+            elif (monitor["x"], monitor["y"]) == monitor_spot(panel, home, MIRROR_GAP_PX):
+                park_monitor(panel, monitor, home, 0)   # mirroring switched off: reachable again
+        else:
+            homes.clear()
 
         if proc is not None and (proc.poll() is not None or showing != want):
             if proc.poll() is None:
