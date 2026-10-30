@@ -536,6 +536,25 @@ SCREEN_SIZE = None
 # fills the touch panel rather than whichever output the desktop picked.
 SCREEN_POS = None
 
+# Windowed mode on a touch panel (--screen) tiles the FLUORO window and the
+# CONTROLS panel side by side across the panel, so both are on it and together
+# fill it - rather than the video at the camera's size and the panel at a fixed
+# desktop spot, which is off the panel whenever it is not the leftmost output.
+# labwc draws a title bar this tall above each window's contents (the Pi's
+# PiXtrix theme).
+TITLEBAR_PX = 26
+CONTROLS_W = 380   # width of the CONTROLS panel (render_controls)
+
+
+def windowed_layout():
+    '''Content boxes (x, y, w, h) of the FLUORO and CONTROLS windows for
+    windowed mode on the touch panel, or None without --screen.'''
+    if not SCREEN_SIZE:
+        return None
+    (sx, sy), (sw, sh) = SCREEN_POS or (0, 0), SCREEN_SIZE
+    y, h = sy + TITLEBAR_PX, sh - TITLEBAR_PX
+    return (sx, y, sw - CONTROLS_W, h), (sx + sw - CONTROLS_W, y, CONTROLS_W, h)
+
 # Latest processed frame for the MJPEG preview stream. The main loop only hands
 # the frame over (publish_preview); it is JPEG-encoded on first request, in the
 # web thread, so the capture loop never pays for encoding - and nothing is
@@ -1364,13 +1383,15 @@ def draw_text_field(img, x, y, w, h, text, focused=False, masked=False,
 
 
 @cache_last_render
-def render_controls(s, logo, live):
+def render_controls(s, logo, live, max_h=None):
     '''Render the vertical control panel (logo + button grid) for the CONTROLS window.
 
     Returns (image, buttons) with hit-boxes relative to the panel's top-left.
-    `s` is a state snapshot.
+    `s` is a state snapshot. `max_h` caps the height (a touch panel's windowed
+    layout): the logo is dropped first, and only if that is not enough is the
+    whole panel scaled down.
     '''
-    W, m, gap, top_pad = 380, 16, 10, 18
+    W, m, gap, top_pad = CONTROLS_W, 16, 10, 18
     bt, ba, cap_h = 56, 52, 22
 
     lw = W - 2 * m
@@ -1379,6 +1400,11 @@ def render_controls(s, logo, live):
     # Windowed, then Quit.
     H = (top_pad + lh + 14 + 26 + 14 + bt * 3 + gap * 3
          + cap_h + gap + ba + gap + ba + gap + ba + gap + ba + 16)
+    if max_h and H > max_h and logo is not None:
+        H -= lh
+        logo, lh = None, 0
+    if max_h and H < max_h:
+        H = max_h    # fill the tile: the spare room goes below the last button
 
     img = np.full((H, W, 3), C_BG, np.uint8)
     buttons = []
@@ -1443,6 +1469,12 @@ def render_controls(s, logo, live):
 
     draw_button(img, m, y, W - 2 * m, ba, "Stop simulator", None, False, "quit")
     buttons.append((m, y, W - 2 * m, ba, "action", "stop"))
+    if max_h and H > max_h:
+        # Still too tall for this screen: scale the whole panel to fit.
+        k = max_h / float(H)
+        img = cv.resize(img, (int(W * k), max_h), interpolation=cv.INTER_AREA)
+        buttons = [(int(bx * k), int(by * k), int(bw * k), int(bh * k), kind, name)
+                   for (bx, by, bw, bh, kind, name) in buttons]
     return img, buttons
 
 
@@ -2340,13 +2372,17 @@ def run_simulation(cam_index, show_window):
     # separate CONTROLS window used in windowed mode.
     logo = cv.imread(LOGO_IMAGE, cv.IMREAD_UNCHANGED) if show_window else None
 
+    # Both windows go without OpenCV's Qt toolbar and status bar
+    # (WINDOW_GUI_NORMAL): off fullscreen they only took room and added zoom
+    # buttons, and they made the CONTROLS panel taller than a touch panel.
     def show_controls_window():
-        cv.namedWindow("CONTROLS", cv.WINDOW_AUTOSIZE)
+        cv.namedWindow("CONTROLS", cv.WINDOW_AUTOSIZE | cv.WINDOW_GUI_NORMAL)
         cv.setMouseCallback("CONTROLS", on_mouse_controls)
-        cv.moveWindow("CONTROLS", 20, 20)
+        tiles = windowed_layout()
+        cv.moveWindow("CONTROLS", *(tiles[1][:2] if tiles else (20, 20)))
 
     def show_fluoro_window():
-        cv.namedWindow("FLUORO", cv.WND_PROP_FULLSCREEN)
+        cv.namedWindow("FLUORO", cv.WINDOW_NORMAL | cv.WINDOW_GUI_NORMAL)
         cv.setWindowProperty("FLUORO", cv.WND_PROP_ASPECT_RATIO, cv.WINDOW_KEEPRATIO)
         if SCREEN_POS:
             cv.moveWindow("FLUORO", *SCREEN_POS)
@@ -2516,6 +2552,13 @@ def run_simulation(cam_index, show_window):
             else:
                 show_controls_window()
                 overlay_buttons[:] = []
+                tiles = windowed_layout()
+                if tiles:
+                    # Off fullscreen the window gets back whatever size it last
+                    # had (the whole panel); give it its tile beside CONTROLS.
+                    fx, fy, fw, fh = tiles[0]
+                    cv.resizeWindow("FLUORO", fw, fh)
+                    cv.moveWindow("FLUORO", fx, fy)
             applied_fullscreen = s["fullscreen"]
 
         # Keyboard: the tab UI (focused text fields, ESC-back) gets first look;
@@ -2651,6 +2694,9 @@ def run_simulation(cam_index, show_window):
             rec_shape = None
 
         rec_elapsed = recorder.elapsed_str() if recorder.active else None
+        # Windowed on a touch panel: the boxes the two windows are tiled into.
+        tiles = None if s["fullscreen"] else windowed_layout()
+        ctrl_max_h = tiles[1][3] if tiles else None
 
         if show_window and view != "fluoro":
             # Remote Access / Library replace the video area under the tab
@@ -2661,6 +2707,8 @@ def run_simulation(cam_index, show_window):
                 fh, fw = res.shape[:2] if res is not None else (480, 640)
                 if SCREEN_SIZE and s["fullscreen"]:
                     vw, canvas_h = SCREEN_SIZE[0], SCREEN_SIZE[1] - TAB_H
+                elif tiles:
+                    vw, canvas_h = tiles[0][2], tiles[0][3] - TAB_H
                 else:
                     vw, canvas_h = fw, fh + (BAR_H if s["fullscreen"] else 0)
                 if view == "remote":
@@ -2685,7 +2733,7 @@ def run_simulation(cam_index, show_window):
                 view_buttons[:] = [(x, y + TAB_H, w, h, k, n)
                                    for (x, y, w, h, k, n) in vbtns]
                 if not s["fullscreen"]:
-                    panel, btns = render_controls(s, logo, live)
+                    panel, btns = render_controls(s, logo, live, ctrl_max_h)
                     ctrl_buttons[:] = btns
                     cv.imshow("CONTROLS", panel)
                 cv.imshow("FLUORO", np.vstack([tab, canvas]))
@@ -2701,6 +2749,10 @@ def run_simulation(cam_index, show_window):
                 # control bar, and every pixel/tap maps 1:1 to the screen.
                 sw, sh = SCREEN_SIZE
                 vid = fit_frame(vid, sw, sh - TAB_H - BAR_H)
+            elif tiles:
+                # Windowed on the touch panel: fill the FLUORO window's tile
+                # the same way, beside the CONTROLS panel.
+                vid = fit_frame(vid, tiles[0][2], tiles[0][3] - TAB_H)
             tab, tbtns = render_tab_bar(vid.shape[1], view, rec_elapsed)
             tab_buttons[:] = tbtns
             if s["fullscreen"]:
@@ -2712,7 +2764,7 @@ def run_simulation(cam_index, show_window):
                 cv.imshow("FLUORO", composite)
             else:
                 # Tabbed video in FLUORO, the vertical panel in CONTROLS.
-                panel, btns = render_controls(s, logo, live)
+                panel, btns = render_controls(s, logo, live, ctrl_max_h)
                 ctrl_buttons[:] = btns
                 cv.imshow("CONTROLS", panel)
                 cv.imshow("FLUORO", np.vstack([tab, vid]))
