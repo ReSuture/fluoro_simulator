@@ -155,7 +155,7 @@ snap = f.get_state_snapshot()
 bar_off, bar_btns_off = f.render_control_bar(snap, 1920, True)
 check("control bar: no Lateral hit-box while unavailable",
       not any(n == "lateral" for (_x, _y, _w, _h, _k, n) in bar_btns_off))
-_panel_off, panel_btns_off = f.render_controls(snap, None, True)
+_panel_off, panel_btns_off = f.render_ge_panel(f.ge_panel_state(snap), f.GE_W, f.GE_H)
 check("controls panel: no Lateral hit-box while unavailable",
       not any(n == "lateral" for (_x, _y, _w, _h, _k, n) in panel_btns_off))
 
@@ -165,7 +165,7 @@ snap = f.get_state_snapshot()
 bar_on, bar_btns_on = f.render_control_bar(snap, 1920, True)
 check("control bar: Lateral is pressable with two cameras",
       any(n == "lateral" for (_x, _y, _w, _h, _k, n) in bar_btns_on))
-_panel_on, panel_btns_on = f.render_controls(snap, None, True)
+_panel_on, panel_btns_on = f.render_ge_panel(f.ge_panel_state(snap), f.GE_W, f.GE_H)
 check("controls panel: Lateral is pressable with two cameras",
       any(n == "lateral" for (_x, _y, _w, _h, _k, n) in panel_btns_on))
 check("control bar keeps its height (the video must not be resized)",

@@ -131,17 +131,26 @@ ILLUM_DOWNSCALE = 4
 # physically linear.
 ATTEN_GAMMA = 1.6
 
-# ── C-arm circular aperture ───────────────────────────────────────────────────
-# A real C-arm image intensifier / flat-panel detector has a round input face,
-# so the live image is a bright circle with black corners. We reproduce that by
-# masking the fluoro output to a centred disc. APERTURE_ON toggles the effect;
-# APERTURE_SCALE is the disc radius as a fraction of half the frame's SHORTER
-# side (1.0 makes the circle just touch the top and bottom edges — the classic
-# look, with black corners and, on a wide frame, black side bars).
-# APERTURE_FEATHER softens the rim by that fraction of the radius so the edge is
-# anti-aliased rather than a hard jagged circle (0 = crisp edge).
+# ── C-arm field of view ───────────────────────────────────────────────────────
+# Each view is masked to the shape of the detector's field. A flat-panel C-arm
+# shows its square detector's image cut to a centred circle a little larger
+# than the square, as on GE's OEC display: the middle of each side stays
+# straight and each corner becomes one round arc, meeting the sides in a point
+# ("flatpanel", the default). "square" is the bare detector square and
+# "circle" an image intensifier's round input face (a bright disc with black
+# corners). APERTURE_ON toggles the mask; APERTURE_SCALE is the field's width -
+# the square's side or the disc's diameter - as a fraction of the frame's
+# SHORTER side (1.0 just touches the top and bottom edges), so every shape is
+# the same size. APERTURE_CORNER is the flat panel's circle radius as a
+# multiple of half the width: 1.0 would leave just the disc and 1.414 the whole
+# square; measured off GE's display it is about 1.12, which keeps half of each
+# side straight and meets it at about 27°. APERTURE_FEATHER softens the edge by
+# that fraction of half the width, so it is anti-aliased rather than jagged
+# (0 = crisp edge).
 APERTURE_ON = True
+APERTURE_SHAPE = "flatpanel"  # "flatpanel"/"square" = flat-panel detector, "circle" = image intensifier
 APERTURE_SCALE = 0.92
+APERTURE_CORNER = 1.12
 APERTURE_FEATHER = 0.015
 
 # ── Camera-position → viewport calibration ────────────────────────────────────
@@ -416,6 +425,7 @@ state = {
     "pos_z_cm": 0.0,        # camera Z position (cm from nominal height) — drives the zoom
     "ui_view": "fluoro",    # which tab the FLUORO window shows: fluoro|remote|library
     "recording": False,     # session recording to ~/fluorosim_recordings
+    "fluoro_sec": 0.0,      # fluoro time: seconds of beam-on (frames being captured)
     "camera": False,        # read-only: a camera is open and delivering frames
     "lateral": False,       # show the lateral camera instead of the main one
     "cameras": 0,           # read-only: how many cameras are attached right now
@@ -428,6 +438,10 @@ state = {
 # and the Library stay usable - and a camera plugged in later is picked up on
 # its own at the next retry.
 CAMERA_RETRY_SEC = 3.0
+
+# Fluoro time counts the beam-on time between consecutive frames, but never more
+# than this for one gap (seconds), so a stalled camera does not run the clock.
+FLUORO_GAP_SEC = 0.5
 
 # Consecutive failed reads before a camera is treated as gone (unplugged) and
 # released, dropping back to the placeholder + retry path. A few dropped frames
@@ -538,12 +552,11 @@ SCREEN_POS = None
 
 # Windowed mode on a touch panel (--screen) tiles the FLUORO window and the
 # CONTROLS panel side by side across the panel, so both are on it and together
-# fill it - rather than the video at the camera's size and the panel at a fixed
-# desktop spot, which is off the panel whenever it is not the leftmost output.
-# labwc draws a title bar this tall above each window's contents (the Pi's
-# PiXtrix theme).
+# fill it - the image as a square, full height, on the left and the GE-style
+# panel in the rest - rather than at the camera's size and a fixed desktop spot,
+# which is off the panel whenever it is not the leftmost output. labwc draws a
+# title bar this tall above each window's contents (the Pi's PiXtrix theme).
 TITLEBAR_PX = 26
-CONTROLS_W = 380   # width of the CONTROLS panel (render_controls)
 
 
 def windowed_layout():
@@ -553,7 +566,8 @@ def windowed_layout():
         return None
     (sx, sy), (sw, sh) = SCREEN_POS or (0, 0), SCREEN_SIZE
     y, h = sy + TITLEBAR_PX, sh - TITLEBAR_PX
-    return (sx, y, sw - CONTROLS_W, h), (sx + sw - CONTROLS_W, y, CONTROLS_W, h)
+    side = min(h, int(sw * 0.6))    # a narrow screen still leaves the panel room
+    return (sx, y, side, side), (sx + side, y, sw - side, h)
 
 
 def window_open(name):
@@ -875,11 +889,13 @@ def api_toggle(name):
 
 @app.route("/api/action/<action>", methods=["POST"])
 def api_action(action):
-    '''Apply a one-shot action (fullscreen / windowed / start / stop) and return the state.
+    '''Apply a one-shot action (fullscreen / windowed / start / stop /
+    fluoro_reset) and return the state.
 
     "stop" puts the simulation into standby but keeps this server running so a
     later "start" can resume it remotely. ("quit" is kept as an alias of "stop"
     for old clients — the web panel no longer exits the process.)
+    "fluoro_reset" zeroes the fluoro timer.
     '''
     with state_lock:
         if action == "fullscreen":
@@ -890,6 +906,8 @@ def api_action(action):
             state["running"] = True
         elif action in ("stop", "quit"):
             state["running"] = False
+        elif action == "fluoro_reset":
+            state["fluoro_sec"] = 0.0
         snap = dict(state)
     return jsonify(snap)
 
@@ -1035,29 +1053,41 @@ def composite_overlay(gray, overlay, equalize):
     return out
 
 
-# Feathered aperture masks are cached per frame-shape: the disc only depends on
+# Feathered aperture masks are cached per frame-shape: the field only depends on
 # the frame dimensions, so we build the float mask once and reuse it every frame.
 _aperture_cache = {}
 
 
 def aperture_mask(h, w):
-    '''Return a cached HxW float32 mask (1 inside the disc, 0 outside, feathered rim).'''
+    '''Return a cached HxW float32 mask (1 inside the field, 0 outside, feathered edge).'''
     key = (h, w)
     mask = _aperture_cache.get(key)
     if mask is None:
         cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
-        radius = min(h, w) / 2.0 * APERTURE_SCALE
+        half = min(h, w) / 2.0 * APERTURE_SCALE      # half the side / the radius
+        feather = max(1.0, half * APERTURE_FEATHER)
         yy, xx = np.ogrid[:h, :w]
-        dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
-        feather = max(1.0, radius * APERTURE_FEATHER)
-        # Ramp from 1 (inside) to 0 (outside) across the feather band at the rim.
-        mask = np.clip((radius - dist) / feather + 0.5, 0.0, 1.0).astype(np.float32)
+        # How far each pixel is outside the edge: measured square-wise for the
+        # square (the larger of the two axis offsets) and radially for a circle.
+        square = np.maximum(np.abs(yy - cy), np.abs(xx - cx)) - half
+        disc = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+        if APERTURE_SHAPE == "circle":
+            out = disc - half
+        elif APERTURE_SHAPE == "square":
+            out = square
+        else:
+            # The flat panel: inside both the square and the larger circle.
+            out = np.maximum(square, disc - half * APERTURE_CORNER)
+        # Ramp from 1 (inside) to 0 (outside) across the feather band.
+        mask = np.clip(0.5 - out / feather, 0.0, 1.0).astype(np.float32)
         _aperture_cache[key] = mask
     return mask
 
 
 def apply_aperture(img):
-    '''Mask the fluoro output to a centred C-arm disc; black corners, feathered rim.
+    '''Mask the fluoro output to the C-arm's field: a centred, round-cornered
+    or plain square (flat panel) or a disc (image intensifier), black outside,
+    feathered edge.
 
     Works on both the single-channel composite and the 3-channel raw frame, and
     returns a new array (the source frame is left untouched).
@@ -1103,6 +1133,67 @@ def load_master(path, invert=None):
     return img
 
 
+# ── UI typeface ───────────────────────────────────────────────────────────────
+# All on-screen text is set in Nunito Sans - Raspberry Pi OS's own desktop font
+# - through OpenCV's FreeType module, in Bold wherever text asks for a heavier
+# stroke. Each list of (file, face index) is tried in order; with no FreeType
+# module or none of the files, text falls back to OpenCV's own Hershey font,
+# so a missing font never breaks the UI. Nunito Sans is a variable font, and
+# FreeType opens one of its named weights when the face index carries the
+# weight's number in its upper 16 bits: 3 is Regular and 6 Bold (index 0 would
+# be ExtraLight; `fc-query <file>` lists them). Sizes are given as
+# Hershey-style scales: UI_PX_PER_SCALE pixels of font height per unit, which
+# gives the same capital height as Hershey Simplex at that scale.
+_NUNITO = "/usr/share/fonts/truetype/nunito-sans/NunitoSans-VariableFont_YTLC,opsz,wdth,wght.ttf"
+UI_FONT_FILES = {
+    False: ((_NUNITO, 3 << 16),
+            ("/usr/share/fonts/opentype/urw-base35/NimbusSans-Regular.otf", 0),
+            ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 0),
+            ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0)),
+    True: ((_NUNITO, 6 << 16),
+           ("/usr/share/fonts/opentype/urw-base35/NimbusSans-Bold.otf", 0),
+           ("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 0),
+           ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 0)),
+}
+UI_PX_PER_SCALE = 30.0
+_ui_faces = {}
+
+
+def _ui_face(bold):
+    '''The FreeType face for UI text, or None to fall back to Hershey.'''
+    if bold not in _ui_faces:
+        face = None
+        for path, index in UI_FONT_FILES[bold] if hasattr(cv, "freetype") else ():
+            if os.path.exists(path):
+                try:
+                    face = cv.freetype.createFreeType2()
+                    face.loadFontData(path, index)
+                    break
+                except cv.error:
+                    face = None
+        _ui_faces[bold] = face
+    return _ui_faces[bold]
+
+
+def ui_text_size(text, scale, thick=1):
+    '''cv.getTextSize in the UI typeface: ((width, cap height), baseline).'''
+    face = _ui_face(thick > 1)
+    if face is None:
+        return cv.getTextSize(text, cv.FONT_HERSHEY_SIMPLEX, scale, thick)
+    return face.getTextSize(text, max(6, int(round(UI_PX_PER_SCALE * scale))), -1)
+
+
+def ui_put_text(img, text, org, scale, color, thick=1):
+    '''cv.putText in the UI typeface; `org` is the left end of the baseline.'''
+    face = _ui_face(thick > 1)
+    org = (int(org[0]), int(org[1]))
+    if face is None:
+        cv.putText(img, text, org, cv.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv.LINE_AA)
+    else:
+        face.putText(img, text, org, max(6, int(round(UI_PX_PER_SCALE * scale))), color, -1,
+                     cv.LINE_AA, True)
+
+
 def build_filler_master(shape, label="LATERAL MASTER"):
     '''Stand-in background for a view whose master image does not exist yet.
 
@@ -1119,16 +1210,14 @@ def build_filler_master(shape, label="LATERAL MASTER"):
                        + ((xx - w / 2.0) / (w / 2.0)) ** 2)
     img = (206 * np.clip(1.0 - 0.10 * vignette, 0.0, 1.0)).astype(np.uint8)
 
-    font = cv.FONT_HERSHEY_SIMPLEX
     # About half the default viewport crop's height, so a caption is always in
     # shot even zoomed in to half the field.
     step = max(120, int(0.52 * FOV_CM[1] * PX_PER_CM))
     for cy in range(step // 2, h, step):
         for row, (text, scale, thick) in enumerate(
                 ((label, 1.5, 3), ("PLACEHOLDER - NO IMAGE YET", 0.8, 2))):
-            (tw, th), _ = cv.getTextSize(text, font, scale, thick)
-            cv.putText(img, text, ((w - tw) // 2, cy + row * 58), font, scale,
-                       150, thick, cv.LINE_AA)
+            (tw, th), _ = ui_text_size(text, scale, thick)
+            ui_put_text(img, text, ((w - tw) // 2, cy + row * 58), scale, 150, thick)
     return img
 
 
@@ -1137,7 +1226,7 @@ def render_fluoro_view(frame, master, s, work_w=None):
 
     The per-view half of the pipeline, shared by the single and split views:
     greyscale, pan the anatomy to the current position, composite by
-    attenuation, and mask to the round C-arm field. No annotations - the
+    attenuation, and mask to the C-arm's field of view. No annotations - the
     caller draws those on the finished (possibly composed) image.
 
     ``work_w`` caps the width the compositing runs at; None = the camera's own
@@ -1173,28 +1262,36 @@ def compose_split(left, right):
 
 
 def label_split(img, left_text, right_text):
-    '''Caption each half in its own bottom outer corner.
+    '''Caption each half down its outer edge, reading up the left half and down
+    the right one, like book spines.
 
-    Outside the aperture disc, so the labels never sit over anatomy, and at
-    opposite edges so the two can never be read against the wrong half. Not
-    gated on the HUD toggle: mistaking a lateral image for a frontal one is
-    exactly the confusion the simulator must never create.
+    In the black side bar beside each half's field, so the labels never sit
+    over anatomy (a flat-panel field reaches the corners they used to have),
+    and at opposite edges so the two can never be read against the
+    wrong half. Not gated on the HUD toggle: mistaking a lateral image for a
+    frontal one is exactly the confusion the simulator must never create.
     '''
-    font, scale, thick = cv.FONT_HERSHEY_SIMPLEX, 0.6, 2
+    scale, thick = 0.6, 2
     h, w = img.shape[:2]
-    (lw, lh), _ = cv.getTextSize(left_text, font, scale, thick)
-    cv.putText(img, left_text, (16, h - 14), font, scale, 235, thick, cv.LINE_AA)
-    (rw, _rh), _ = cv.getTextSize(right_text, font, scale, thick)
-    cv.putText(img, right_text, (w - rw - 16, h - 14), font, scale, 235, thick,
-               cv.LINE_AA)
+    for text, left in ((left_text, True), (right_text, False)):
+        (tw, th), base = ui_text_size(text, scale, thick)
+        tag = np.zeros((th + base + 4, tw + 4), np.uint8)
+        ui_put_text(tag, text, (2, th + 2), scale, 235, thick)
+        tag = cv.rotate(tag, cv.ROTATE_90_COUNTERCLOCKWISE if left
+                        else cv.ROTATE_90_CLOCKWISE)
+        tag_h, tag_w = tag.shape
+        y0 = (h - tag_h) // 2
+        x0 = 12 if left else w - tag_w - 12
+        region = img[y0:y0 + tag_h, x0:x0 + tag_w]
+        np.maximum(region, tag, out=region)    # light text onto the black bar
     return img
 
 
 def draw_str(dst, target, s):
     '''Draw white text with a black drop-shadow so it stays legible over any frame.'''
     x, y = target
-    cv.putText(dst, s, (x + 1, y + 1), cv.FONT_HERSHEY_PLAIN, 1.0, (0, 0, 0), thickness=2, lineType=cv.LINE_AA)
-    cv.putText(dst, s, (x, y), cv.FONT_HERSHEY_PLAIN, 1.0, (255, 255, 255), lineType=cv.LINE_AA)
+    ui_put_text(dst, s, (x + 1, y + 1), 0.45, (0, 0, 0))
+    ui_put_text(dst, s, (x, y), 0.45, (255, 255, 255))
 
 
 # ── On-screen control panel ───────────────────────────────────────────────────
@@ -1298,16 +1395,15 @@ def draw_button(img, x, y, w, h, label, sub=None, on=False, variant="normal"):
         bg, bd, tx = C_BTN_BG, C_BTN_BD, C_TEXT
     rounded_rect(img, x, y, w, h, 12, bg, -1)
     rounded_rect(img, x, y, w, h, 12, bd, 1)
-    font = cv.FONT_HERSHEY_SIMPLEX
     if sub is None:
-        (lw, lh), _ = cv.getTextSize(label, font, 0.55, 1)
-        cv.putText(img, label, (x + (w - lw) // 2, y + (h + lh) // 2), font, 0.55, tx, 1, cv.LINE_AA)
+        (lw, lh), _ = ui_text_size(label, 0.55)
+        ui_put_text(img, label, (x + (w - lw) // 2, y + (h + lh) // 2), 0.55, tx)
     else:
-        (lw, lh), _ = cv.getTextSize(label, font, 0.55, 1)
-        cv.putText(img, label, (x + (w - lw) // 2, y + h // 2 - 2), font, 0.55, tx, 1, cv.LINE_AA)
-        (sw, sh), _ = cv.getTextSize(sub, font, 0.42, 1)
-        cv.putText(img, sub, (x + (w - sw) // 2, y + h // 2 + 16), font, 0.42,
-                   tx if on else C_SUBTEXT, 1, cv.LINE_AA)
+        (lw, lh), _ = ui_text_size(label, 0.55)
+        ui_put_text(img, label, (x + (w - lw) // 2, y + h // 2 - 2), 0.55, tx)
+        (sw, sh), _ = ui_text_size(sub, 0.42)
+        ui_put_text(img, sub, (x + (w - sw) // 2, y + h // 2 + 16), 0.42,
+                    tx if on else C_SUBTEXT)
 
 
 def _render_key(arg):
@@ -1364,12 +1460,10 @@ def render_tab_bar(width, active_view, rec_elapsed=None):
         draw_button(img, bx, 5, tw, bh, label, None, active_view == name)
         buttons.append((bx, 5, tw, bh, "tab", name))
     if rec_elapsed is not None:
-        font = cv.FONT_HERSHEY_SIMPLEX
         txt = "REC %s" % rec_elapsed
-        (tw2, th2), _ = cv.getTextSize(txt, font, 0.55, 1)
+        (tw2, th2), _ = ui_text_size(txt, 0.55)
         cv.circle(img, (width - tw2 - 28, TAB_H // 2), 7, C_DOT_OFF, -1, cv.LINE_AA)
-        cv.putText(img, txt, (width - tw2 - 14, (TAB_H + th2) // 2), font, 0.55,
-                   C_QUIT_TX, 1, cv.LINE_AA)
+        ui_put_text(img, txt, (width - tw2 - 14, (TAB_H + th2) // 2), 0.55, C_QUIT_TX)
     return img, buttons
 
 
@@ -1378,7 +1472,6 @@ def draw_text_field(img, x, y, w, h, text, focused=False, masked=False,
     '''Draw a clickable text field (the keyboard types into it while focused).'''
     rounded_rect(img, x, y, w, h, 8, C_BTN_BG, -1)
     rounded_rect(img, x, y, w, h, 8, C_ON_BD if focused else C_BTN_BD, 1)
-    font = cv.FONT_HERSHEY_SIMPLEX
     shown = ("*" * len(text)) if masked else text
     color = C_TEXT
     if focused:
@@ -1386,106 +1479,363 @@ def draw_text_field(img, x, y, w, h, text, focused=False, masked=False,
     elif not shown and placeholder:
         shown, color = placeholder, C_SUBTEXT
     # Keep the tail visible when the text outgrows the box.
-    while len(shown) > 1 and cv.getTextSize(shown, font, 0.55, 1)[0][0] > w - 20:
+    while len(shown) > 1 and ui_text_size(shown, 0.55)[0][0] > w - 20:
         shown = shown[1:]
-    (_, th), _ = cv.getTextSize("Ag", font, 0.55, 1)
-    cv.putText(img, shown, (x + 10, y + (h + th) // 2), font, 0.55, color, 1, cv.LINE_AA)
+    (_, th), _ = ui_text_size("Ag", 0.55)
+    ui_put_text(img, shown, (x + 10, y + (h + th) // 2), 0.55, color)
+
+
+# ── Windowed mode: GE OEC-style panel and image ───────────────────────────────
+# In windowed mode the CONTROLS window is a touch panel modelled on GE's OEC
+# C-arm display - overlapping angled tabs, glossy round toggles, a big-digit
+# readout of the camera position and the fluoro time, a direction pad for
+# panning, a rocker for zoom and pill buttons for the rest - and FLUORO shows
+# the image alone. The panel is drawn at its design size, GE_W x GE_H (the
+# touch panel's tile), and scaled to fit any other window. Colours are BGR.
+GE_W, GE_H = 450, 574
+GE_BG = (14, 11, 9)
+GE_CARD = ((128, 118, 106), (98, 88, 77), (84, 75, 66))         # top, middle, bottom
+GE_TAB_ON, GE_TAB_OFF, GE_TAB_EDGE = (128, 118, 106), (66, 59, 52), (30, 26, 22)
+GE_WHITE, GE_MUTED, GE_DIM = (255, 255, 255), (200, 192, 184), (150, 142, 134)
+GE_CYAN = ((236, 214, 128), (200, 160, 32), (126, 82, 6))       # highlight, body, rim
+GE_CYAN_OFF = ((170, 150, 80), (120, 98, 38), (70, 56, 20))
+GE_CYAN_GLOW = (255, 220, 110)
+GE_LAVENDER = ((250, 205, 196), (226, 150, 140), (160, 92, 86))
+GE_GREY = ((176, 172, 168), (126, 122, 118), (82, 78, 74))       # Lateral view's plate
+GE_GREY_OFF = ((110, 106, 102), (82, 78, 74), (56, 53, 50))
+GE_KNOB = ((255, 255, 255), (232, 230, 228), (182, 178, 174))     # its switch knob
+GE_KNOB_OFF = ((150, 146, 142), (120, 116, 112), (90, 86, 82))
+GE_RED = ((150, 150, 255), (70, 70, 230), (30, 30, 150))
+GE_RED_OFF = ((120, 110, 170), (80, 70, 130), (50, 45, 90))
+GE_RED_GLOW = (90, 90, 255)
+GE_STOP, GE_STOP_RIM = ((70, 60, 120), (44, 36, 90), (30, 24, 60)), (90, 90, 245)
+GE_YELLOW = (40, 215, 245)
+# The state flags the panel draws from (see ge_panel_state).
+GE_PANEL_KEYS = ("overlay", "equalize", "hud", "pedal_mode", "recording", "lateral",
+                 "lateral_available", "fullscreen", "ui_view",
+                 "pos_x_cm", "pos_y_cm", "pos_z_cm")
+
+
+def _blend(dst, alpha, color, x0, y0):
+    '''Alpha-blend `color` (BGR, or an HxWx3 image) onto dst through `alpha` (HxW, 0-1).'''
+    h, w = alpha.shape
+    x1, y1 = max(x0, 0), max(y0, 0)
+    x2, y2 = min(x0 + w, dst.shape[1]), min(y0 + h, dst.shape[0])
+    if x2 <= x1 or y2 <= y1:
+        return
+    a = alpha[y1 - y0:y2 - y0, x1 - x0:x2 - x0, None]
+    col = np.asarray(color, np.float32)
+    if col.ndim == 3:
+        col = col[y1 - y0:y2 - y0, x1 - x0:x2 - x0]
+    roi = dst[y1:y2, x1:x2].astype(np.float32)
+    dst[y1:y2, x1:x2] = (roi * (1 - a) + col * a).astype(np.uint8)
+
+
+def _box_sdf(w, h, r):
+    '''Signed distance in px to a w x h box with corners of radius r (r = h/2: a pill).'''
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    qx = np.abs(xx - (w - 1) / 2.0) - (w / 2.0 - r)
+    qy = np.abs(yy - (h - 1) / 2.0) - (h / 2.0 - r)
+    out = np.sqrt(np.maximum(qx, 0) ** 2 + np.maximum(qy, 0) ** 2)
+    return out + np.minimum(np.maximum(qx, qy), 0) - r
+
+
+def _shade(w, h, stops, radial):
+    '''A w x h gradient through three colours: top to bottom, or radial from a
+    highlight up and to the left of centre.'''
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    if radial:
+        t = np.sqrt(((xx - 0.38 * w) / w) ** 2 + ((yy - 0.30 * h) / h) ** 2) / 0.85
+    else:
+        t = yy / max(1, h - 1)
+    t = np.clip(t, 0, 1)[..., None]
+    c0, c1, c2 = (np.array(c, np.float32) for c in stops)
+    return np.where(t < 0.5, c0 + (c1 - c0) * (t / 0.5), c1 + (c2 - c1) * ((t - 0.5) / 0.5))
+
+
+def _glossy(img, x, y, w, h, r, stops, glow=None, radial=False):
+    '''A glossy button: an optional soft glow, a gradient body, a light rim
+    and a sheen across the top.'''
+    if glow is not None:
+        pad = int(0.35 * min(w, h)) + 6
+        g = np.zeros((h + 2 * pad, w + 2 * pad), np.float32)
+        g[pad:pad + h, pad:pad + w] = np.clip(0.5 - _box_sdf(w, h, r), 0, 1)
+        _blend(img, cv.GaussianBlur(g, (0, 0), pad / 2.5) * 0.85, glow, x - pad, y - pad)
+    d = _box_sdf(w, h, r)
+    _blend(img, np.clip(0.5 - d, 0, 1), _shade(w, h, stops, radial), x, y)
+    _blend(img, np.clip(1.0 - np.abs(d + 1.2), 0, 1) * 0.55, stops[0], x, y)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    sheen = 1 - ((xx - w / 2.0) / (0.42 * w)) ** 2 - ((yy - 0.28 * h) / (0.22 * h)) ** 2
+    _blend(img, np.clip(sheen, 0, 1) ** 1.5 * 0.30 * np.clip(-d / 3, 0, 1), GE_WHITE, x, y)
+
+
+def _ge_text(img, text, cx, cy, max_w, scale, color=GE_WHITE, bold=True):
+    '''Flat text centred on (cx, cy), shrunk to fit max_w.'''
+    thick = 2 if bold else 1
+    (tw, th), _ = ui_text_size(text, scale, thick)
+    if tw > max_w:
+        scale *= max_w / float(tw)
+        (tw, th), _ = ui_text_size(text, scale, thick)
+    ui_put_text(img, text, (cx - tw / 2.0, cy + th / 2.0), scale, color, thick)
+
+
+def _ge_card(img, x, y, w, h):
+    '''One of the slate panels the controls are grouped on.'''
+    _blend(img, np.clip(0.5 - _box_sdf(w, h, 14), 0, 1), _shade(w, h, GE_CARD, False), x, y)
+
+
+def _chevron(img, cx, cy, size, angle, color, thick):
+    '''A ">" pointing at `angle` degrees (0 = right, 90 = down).'''
+    a = np.deg2rad(angle)
+    tip = np.array([cx + size * np.cos(a), cy + size * np.sin(a)])
+    for da in (np.deg2rad(140), -np.deg2rad(140)):
+        end = tip + size * 1.1 * np.array([np.cos(a + da), np.sin(a + da)])
+        cv.line(img, tuple(int(v) for v in tip), tuple(int(v) for v in end), color, thick,
+                cv.LINE_AA)
+
+
+def _ge_dpad(img, cx, cy, R, buttons):
+    '''The direction pad: four arrow sectors round a hub, panning like the
+    keyboard - up is Y- (W), down Y+ (S), left X- (A), right X+ (D).'''
+    _glossy(img, cx - R, cy - R, 2 * R, 2 * R, R,
+            ((240, 226, 150), (206, 168, 40), (140, 94, 8)), glow=GE_CYAN_GLOW, radial=True)
+    for ang in (45, 135, 225, 315):
+        a = np.deg2rad(ang)
+        cv.line(img, (int(cx + 0.36 * R * np.cos(a)), int(cy + 0.36 * R * np.sin(a))),
+                (int(cx + 0.97 * R * np.cos(a)), int(cy + 0.97 * R * np.sin(a))),
+                (150, 110, 20), 3, cv.LINE_AA)
+    for ang, name in ((270, "ym"), (0, "xp"), (90, "yp"), (180, "xm")):
+        a = np.deg2rad(ang)
+        px, py = cx + 0.62 * R * np.cos(a), cy + 0.62 * R * np.sin(a)
+        _chevron(img, px, py, 0.13 * R, ang, (110, 70, 10), 5)
+        _chevron(img, px, py, 0.13 * R, ang, GE_WHITE, 3)
+        buttons.append((int(px - 0.3 * R), int(py - 0.3 * R), int(0.6 * R), int(0.6 * R),
+                        "pan", name))
+    hub = int(0.33 * R)
+    _glossy(img, cx - hub, cy - hub, 2 * hub, 2 * hub, hub,
+            ((214, 186, 90), (176, 136, 24), (116, 76, 6)), radial=True)
+    _ge_text(img, "PAN", cx, cy, 1.6 * hub, 0.5)
+
+
+def fmt_fluoro(sec):
+    '''Fluoro time as mm:ss (the minutes keep counting past 99).'''
+    return "%02d:%02d" % divmod(int(sec), 60)
+
+
+def ge_panel_state(s):
+    '''What render_ge_panel draws from: the state flags, plus the fluoro time
+    in whole seconds - passed like that, the cached panel is redrawn once a
+    second while the beam is on rather than on every frame.'''
+    p = {k: s[k] for k in GE_PANEL_KEYS}
+    p["fluoro_sec"] = int(s["fluoro_sec"])
+    return p
 
 
 @cache_last_render
-def render_controls(s, logo, live, max_h=None):
-    '''Render the vertical control panel (logo + button grid) for the CONTROLS window.
+def render_ge_panel(p, width, height):
+    '''The windowed CONTROLS panel, GE OEC style, fitted into width x height.
 
-    Returns (image, buttons) with hit-boxes relative to the panel's top-left.
-    `s` is a state snapshot. `max_h` caps the height (a touch panel's windowed
-    layout): the logo is dropped first, and only if that is not enough is the
-    whole panel scaled down.
+    `p` comes from ge_panel_state. Returns (image, buttons) with hit-boxes
+    relative to the image's top-left.
     '''
-    W, m, gap, top_pad = CONTROLS_W, 16, 10, 18
-    bt, ba, cap_h = 56, 52, 22
-
-    lw = W - 2 * m
-    lh = int(logo.shape[0] * (lw / float(logo.shape[1]))) if logo is not None else 0
-    # rows: 3 toggle rows, then a location caption + nudge row, then Fullscreen/
-    # Windowed, then Quit.
-    H = (top_pad + lh + 14 + 26 + 14 + bt * 3 + gap * 3
-         + cap_h + gap + ba + gap + ba + gap + ba + gap + ba + 16)
-    if max_h and H > max_h and logo is not None:
-        H -= lh
-        logo, lh = None, 0
-    if max_h and H < max_h:
-        H = max_h    # fill the tile: the spare room goes below the last button
-
-    img = np.full((H, W, 3), C_BG, np.uint8)
+    w, h, m = GE_W, GE_H, 12
+    img = np.full((h, w, 3), GE_BG, np.uint8)
     buttons = []
-    y = top_pad
 
-    if logo is not None:
-        paste_rgba(img, logo, m, y, lw)
-    y += lh + 14
+    # Tabs: overlapping angled tabs on black, the selected one in front.
+    tw, lap = 162, 26
+    tabs = (("FLUORO", "fluoro"), ("REMOTE", "remote"), ("LIBRARY", "library"))
+    active = next((i for i, (_, n) in enumerate(tabs) if n == p["ui_view"]), 0)
+    order = sorted(range(len(tabs)), key=lambda i: -abs(i - active))   # back to front
+    for i in order:
+        x0 = 8 + i * (tw - lap)
+        poly = np.array([(x0, 47), (x0 + 18, 8), (x0 + tw - 18, 8), (x0 + tw, 47)], np.int32)
+        cv.fillPoly(img, [poly], GE_TAB_ON if i == active else GE_TAB_OFF, cv.LINE_AA)
+        cv.polylines(img, [poly], False, GE_TAB_EDGE, 1, cv.LINE_AA)
+        _ge_text(img, tabs[i][0], x0 + tw / 2.0, 29, tw - 48, 0.55,
+                 GE_WHITE if i == active else GE_MUTED, bold=(i == active))
+    img[47:50] = GE_TAB_ON                      # the shelf the selected tab sits on
+    for i in reversed(order):                   # front tab first: overlaps go to it
+        buttons.append((8 + i * (tw - lap), 8, tw, 42, "tab", tabs[i][1]))
 
-    title = "NAVISLab Controls"
-    font = cv.FONT_HERSHEY_SIMPLEX
-    (tw, th), _ = cv.getTextSize(title, font, 0.6, 1)
-    tx0 = (W - (tw + 18)) // 2
-    cv.circle(img, (tx0 + 5, y + 9), 5, C_DOT_ON if live else C_DOT_OFF, -1, cv.LINE_AA)
-    cv.putText(img, title, (tx0 + 18, y + 9 + th // 2), font, 0.6, C_TEXT, 1, cv.LINE_AA)
-    y += 26 + 14
+    # Imaging toggles: glossy round buttons, lit when on.
+    y = 56
+    _ge_card(img, m, y, w - 2 * m, 106)
+    dia = 70
+    gap = (w - 2 * m - 5 * dia) / 6.0
+    for i, (text, key) in enumerate((("OVERLAY", "overlay"), ("EQUALIZE", "equalize"),
+                                     ("HUD", "hud"), ("PEDAL", "pedal_mode"),
+                                     ("REC", "recording"))):
+        bx = int(round(m + gap + i * (dia + gap)))
+        on = bool(p[key])
+        if key == "recording":
+            stops, glow = (GE_RED, GE_RED_GLOW) if on else (GE_RED_OFF, None)
+        else:
+            stops, glow = (GE_CYAN, GE_CYAN_GLOW) if on else (GE_CYAN_OFF, None)
+        _glossy(img, bx, y + 10, dia, dia, dia // 2, stops, glow=glow, radial=True)
+        _ge_text(img, text, bx + dia / 2.0, y + 10 + dia / 2.0, dia - 12, 0.5,
+                 GE_WHITE if on else GE_MUTED)
+        _ge_text(img, "ON" if on else "OFF", bx + dia / 2.0, y + 94, dia, 0.38,
+                 (190, 255, 210) if on else GE_DIM, bold=False)
+        buttons.append((bx, y + 10, dia, dia, "toggle", key))
 
-    cw = (W - 2 * m - gap) // 2
-    toggles = [("Overlay", "overlay"), ("Equalize", "equalize"),
-               ("HUD", "hud"), ("Pedal mode", "pedal_mode"),
-               ("Record", "recording")]
-    for i, (label, key) in enumerate(toggles):
-        col, row = i % 2, i // 2
-        bx = m + col * (cw + gap)
-        by = y + row * (bt + gap)
-        # Record, the odd one out, takes the whole last row.
-        bw = W - 2 * m if key == "recording" else cw
-        on = bool(s[key])
-        draw_button(img, bx, by, bw, bt, label, "ON" if on else "OFF", on,
-                    "quit" if key == "recording" and on else "normal")
-        buttons.append((bx, by, bw, bt, "toggle", key))
-    y += 3 * (bt + gap)
+    # Readout: the camera position and the fluoro time in big digits.
+    y += 106 + 10
+    rw, rh = w - 2 * m, 84
+    d = _box_sdf(rw, rh, 14)
+    _blend(img, np.clip(0.5 - d, 0, 1), (10, 8, 7), m, y)
+    _blend(img, np.clip(1.2 - np.abs(d + 1.5), 0, 1), (225, 220, 214), m, y)
+    col = 80
+    for i, (axis, key) in enumerate((("X", "pos_x_cm"), ("Y", "pos_y_cm"), ("Z", "pos_z_cm"))):
+        x0 = m + i * col
+        ui_put_text(img, axis + "  cm", (x0 + 14, y + 22), 0.4, GE_DIM)
+        val = "%d" % round(p[key])
+        (vw, _), _ = ui_text_size(val, 0.95)
+        ui_put_text(img, val, (x0 + (col - vw) / 2.0 + 4, y + 64), 0.95, GE_WHITE)
+        cv.line(img, (x0 + col, y + 14), (x0 + col, y + rh - 14), (70, 64, 58), 1)
+    tx = m + 3 * col
+    clock = fmt_fluoro(p["fluoro_sec"])            # the fluoro time
+    (cw, _), _ = ui_text_size(clock, 1.35)
+    ui_put_text(img, clock, (tx + 14, y + 62), 1.35, GE_WHITE)
+    ui_put_text(img, "mm:ss", (tx + 20 + cw, y + 62), 0.4, GE_DIM)
+    bx, bw, bh = m + rw - 70, 58, 24
+    _glossy(img, bx, y + 8, bw, bh, bh // 2, GE_CYAN_OFF)
+    _ge_text(img, "RESET", bx + bw / 2.0, y + 8 + bh / 2.0, bw - 12, 0.36, GE_MUTED)
+    buttons.append((bx - 4, y + 4, bw + 8, bh + 8, "action", "fluoro_reset"))
 
-    # Background-location readout + nudge buttons (X−/X+/Y−/Y+/Z−/Z+).
-    cap = "Background   X %.0f   Y %.0f   Z %.0f cm" % (
-        s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"])
-    (capw, caph), _ = cv.getTextSize(cap, font, 0.5, 1)
-    cv.putText(img, cap, ((W - capw) // 2, y + caph + 2), font, 0.5, C_SUBTEXT, 1, cv.LINE_AA)
-    y += cap_h + gap
-    pw = (W - 2 * m - 5 * gap) // 6
-    for i, (label, name) in enumerate([("X-", "xm"), ("X+", "xp"), ("Y-", "ym"),
-                                       ("Y+", "yp"), ("Z-", "zm"), ("Z+", "zp")]):
-        bx = m + i * (pw + gap)
-        draw_button(img, bx, y, pw, ba, label, None, False)
-        buttons.append((bx, y, pw, ba, "pan", name))
-    y += ba + gap
-
-    # Lateral view: only pressable while a second camera is attached.
-    lat_ok = bool(s["lateral_available"])
-    draw_button(img, m, y, W - 2 * m, ba, "Lateral view",
-                None if lat_ok else "needs 2 cameras", bool(s["lateral"]),
-                "normal" if lat_ok else "disabled")
+    # Movement: the direction pad for X/Y, a rocker for Z, and Lateral view.
+    y += rh + 10
+    mh = 196
+    _ge_card(img, m, y, w - 2 * m, mh)
+    R = 84
+    _ge_dpad(img, m + 16 + R, y + mh // 2, R, buttons)
+    zx, zw, zh = m + 16 + 2 * R + 22, 62, 172
+    zy = y + (mh - zh) // 2
+    _glossy(img, zx, zy, zw, zh, zw // 2, GE_LAVENDER)
+    cv.line(img, (zx + 10, zy + zh // 2), (zx + zw - 10, zy + zh // 2), (150, 90, 84), 2, cv.LINE_AA)
+    _chevron(img, zx + zw / 2.0, zy + 34, 11, 270, GE_WHITE, 3)
+    _chevron(img, zx + zw / 2.0, zy + zh - 34, 11, 90, GE_WHITE, 3)
+    _ge_text(img, "Z+", zx + zw / 2.0, zy + 62, zw - 14, 0.45)
+    _ge_text(img, "Z-", zx + zw / 2.0, zy + zh - 62, zw - 14, 0.45)
+    buttons += [(zx, zy, zw, zh // 2, "pan", "zp"),
+                (zx, zy + zh // 2, zw, zh - zh // 2, "pan", "zm")]
+    # Lateral view: an on/off switch on a grey plate - the knob slides right and
+    # the track lights up while the split view is on. Dimmed, and unpressable,
+    # with fewer than two cameras; the whole plate is the hit area.
+    lx = zx + zw + 16
+    lw = w - m - 16 - lx
+    lat_ok, lat_on = bool(p["lateral_available"]), bool(p["lateral"])
+    _blend(img, np.clip(0.5 - _box_sdf(lw, zh, 20), 0, 1),
+           _shade(lw, zh, GE_GREY if lat_ok else GE_GREY_OFF, False), lx, zy)
+    text_c = GE_WHITE if lat_ok else GE_DIM
+    _ge_text(img, "LATERAL", lx + lw / 2.0, zy + 34, lw - 16, 0.55, text_c)
+    _ge_text(img, "VIEW", lx + lw / 2.0, zy + 58, lw - 16, 0.55, text_c)
+    tw, th = 84, 42                                 # the switch's track...
+    tx, ty = lx + (lw - tw) // 2, zy + 84
+    d = _box_sdf(tw, th, th // 2)
+    _blend(img, np.clip(0.5 - d, 0, 1),
+           GE_CYAN[1] if lat_on else (58, 54, 50) if lat_ok else (70, 66, 62), tx, ty)
+    _blend(img, np.clip(1.2 - np.abs(d + 1.2), 0, 1) * 0.6, (30, 28, 26), tx, ty)
+    kd = th - 8                                     # ...and its knob
+    kx = tx + (tw - kd - 4 if lat_on else 4)
+    _blend(img, np.clip(0.5 - _box_sdf(kd, kd, kd // 2), 0, 1) * 0.45, (20, 18, 16),
+           kx + 1, ty + 6)
+    _glossy(img, kx, ty + 4, kd, kd, kd // 2, GE_KNOB if lat_ok else GE_KNOB_OFF, radial=True)
     if lat_ok:
-        buttons.append((m, y, W - 2 * m, ba, "action", "lateral"))
-    y += ba + gap
+        _ge_text(img, "ON" if lat_on else "OFF", lx + lw / 2.0, zy + zh - 22, lw - 16, 0.42,
+                 (190, 255, 210) if lat_on else GE_MUTED, bold=False)
+        buttons.append((lx, zy, lw, zh, "toggle", "lateral"))
+    else:
+        _ge_text(img, "connect 2nd camera", lx + lw / 2.0, zy + zh - 22, lw - 16, 0.36, GE_DIM,
+                 bold=False)
 
-    draw_button(img, m, y, cw, ba, "Fullscreen", None, s["fullscreen"])
-    buttons.append((m, y, cw, ba, "action", "fullscreen"))
-    draw_button(img, m + cw + gap, y, cw, ba, "Windowed", None, not s["fullscreen"])
-    buttons.append((m + cw + gap, y, cw, ba, "action", "windowed"))
-    y += ba + gap
+    # Window mode, a pair of radio options like GE's NORM / MAG, and Stop.
+    y += mh + 10
+    ch = h - y - m
+    _ge_card(img, m, y, w - 2 * m, ch)
+    for i, (text, name, on) in enumerate((("FULLSCREEN", "fullscreen", p["fullscreen"]),
+                                          ("WINDOWED", "windowed", not p["fullscreen"]))):
+        ry = y + ch // 2 - 17 + i * 34
+        cv.circle(img, (m + 28, ry), 9, GE_WHITE, 2, cv.LINE_AA)
+        if on:
+            cv.circle(img, (m + 28, ry), 5, GE_WHITE, -1, cv.LINE_AA)
+        ui_put_text(img, text, (m + 46, ry + 6), 0.5, GE_WHITE if on else GE_MUTED, 2 if on else 1)
+        buttons.append((m + 12, ry - 16, 170, 32, "action", name))
+    sx, sw, sh = m + 196, w - 2 * m - 196 - 14, 50
+    sy = y + (ch - sh) // 2
+    _glossy(img, sx, sy, sw, sh, sh // 2, GE_STOP)
+    _blend(img, np.clip(1.4 - np.abs(_box_sdf(sw, sh, sh // 2) + 1.5), 0, 1), GE_STOP_RIM, sx, sy)
+    _ge_text(img, "STOP SIMULATOR", sx + sw / 2.0, sy + sh / 2.0, sw - 30, 0.5, (190, 190, 255))
+    buttons.append((sx, sy, sw, sh, "action", "stop"))
 
-    draw_button(img, m, y, W - 2 * m, ba, "Stop simulator", None, False, "quit")
-    buttons.append((m, y, W - 2 * m, ba, "action", "stop"))
-    if max_h and H > max_h:
-        # Still too tall for this screen: scale the whole panel to fit.
-        k = max_h / float(H)
-        img = cv.resize(img, (int(W * k), max_h), interpolation=cv.INTER_AREA)
-        buttons = [(int(bx * k), int(by * k), int(bw * k), int(bh * k), kind, name)
-                   for (bx, by, bw, bh, kind, name) in buttons]
+    # Fit the design-size panel into the window.
+    k = min(width / float(w), height / float(h))
+    if abs(k - 1.0) > 1e-3:
+        img = cv.resize(img, (max(1, int(w * k)), max(1, int(h * k))),
+                        interpolation=cv.INTER_AREA if k < 1 else cv.INTER_LINEAR)
+        buttons = [(int(x * k), int(y * k), int(bw * k), int(bh * k), kind, name)
+                   for (x, y, bw, bh, kind, name) in buttons]
     return img, buttons
+
+
+def render_ge_image(src, side, s, logo, split, pedal_down, live, rec_elapsed):
+    '''FLUORO's picture in windowed mode, side x side: the frame's centre
+    square - the field and nothing else; the split view is letterboxed whole -
+    with the logo and GE-style corner notes (the HUD's, while it is on).'''
+    if src is None:
+        return np.zeros((side, side, 3), np.uint8)
+    bgr = cv.cvtColor(src, cv.COLOR_GRAY2BGR) if src.ndim == 2 else src
+    h, w = bgr.shape[:2]
+    if split or w <= h:
+        img = fit_frame(bgr, side, side)
+    else:
+        x0 = (w - h) // 2
+        img = cv.resize(bgr[:, x0:x0 + h], (side, side), interpolation=cv.INTER_LINEAR)
+    if logo is not None:
+        paste_rgba(img, logo, 12, 12, max(60, side // 6))
+    cv.circle(img, (side - 18, 18), 6, C_DOT_ON if live else C_DOT_OFF, -1, cv.LINE_AA)
+    if rec_elapsed is not None:
+        txt = "REC %s" % rec_elapsed
+        (tw, th), _ = ui_text_size(txt, 0.5)
+        cv.circle(img, (side - 52 - tw, 18), 6, C_DOT_OFF, -1, cv.LINE_AA)
+        ui_put_text(img, txt, (side - 38 - tw, 18 + th // 2), 0.5, C_QUIT_TX)
+    if s["hud"]:
+        note = "PEDAL ACTIVE" if pedal_down else ("PEDAL MODE" if s["pedal_mode"] else "")
+        if note:
+            ui_put_text(img, note, (14, side - 16), 0.5, GE_YELLOW)
+        zoom = ZOOM_REF_CM / max(0.05 * ZOOM_REF_CM, ZOOM_REF_CM + FLIP_Z * s["pos_z_cm"])
+        mag = "%.2fx" % zoom
+        (zw, _), _ = ui_text_size(mag, 0.5)
+        ui_put_text(img, mag, (side - zw - 14, side - 16), 0.5, GE_MUTED)
+    return img
+
+
+def render_tab_view(view, s, width, height):
+    '''The Remote Access or Library view at width x height, with the on-screen
+    keyboard over its bottom while a text field has focus. -> (image, buttons)'''
+    if view == "remote":
+        canvas, vbtns = render_remote_view(s, width, height)
+    else:
+        canvas, vbtns = render_library_view(width, height)
+    if ui["focus"] and view == "remote":
+        # A focused text field pops the on-screen keyboard over the bottom of
+        # the view (its echo strip keeps the typed text visible even when the
+        # field itself is covered).
+        kb, kbtns = render_keyboard(width, ui[ui["focus"]],
+                                    ui["focus"] == "password" and not ui["show_pw"])
+        kh = kb.shape[0]
+        if kh < canvas.shape[0]:
+            canvas[-kh:] = kb
+            vbtns = list(vbtns) + [(x, y + canvas.shape[0] - kh, w, h, k, n)
+                                   for (x, y, w, h, k, n) in kbtns]
+    return canvas, vbtns
+
+
+def ui_snapshot(s):
+    '''The state for the cached fullscreen strips: all of it but the fluoro
+    time, which changes every frame while the beam is on and would otherwise
+    force a redraw each time.'''
+    return {k: v for k, v in s.items() if k != "fluoro_sec"}
 
 
 # Control-bar geometry, shared with the Remote Access / Library views so their
@@ -1537,8 +1887,8 @@ def render_control_bar(s, width, live):
     cap = "Bg  X %.0f  Y %.0f  Z %.0f cm" % (
         s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"])
     cap_w = 240
-    (_, caph), _ = cv.getTextSize(cap, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-    cv.putText(img, cap, (pad, y + (bh + caph) // 2), cv.FONT_HERSHEY_SIMPLEX, 0.5, C_SUBTEXT, 1, cv.LINE_AA)
+    (_, caph), _ = ui_text_size(cap, 0.5)
+    ui_put_text(img, cap, (pad, y + (bh + caph) // 2), 0.5, C_SUBTEXT)
     pw = (width - 2 * pad - cap_w - 5 * gap) // 6
     x = pad + cap_w
     for (label, name) in [("X-", "xm"), ("X+", "xp"), ("Y-", "ym"),
@@ -1580,13 +1930,12 @@ def render_keyboard(W, value, masked):
     img = np.full((echo_h + 4 * (row_h + gap) + gap, W, 3), C_BG, np.uint8)
     cv.line(img, (0, 0), (W, 0), C_BTN_BD, 1, cv.LINE_AA)
     buttons = []
-    font = cv.FONT_HERSHEY_SIMPLEX
 
     shown = ("*" * len(value)) if masked else value
     shown += "_"
-    while len(shown) > 1 and cv.getTextSize(shown, font, 0.6, 1)[0][0] > W - 28:
+    while len(shown) > 1 and ui_text_size(shown, 0.6)[0][0] > W - 28:
         shown = shown[1:]  # keep the tail visible
-    cv.putText(img, shown, (14, 26), font, 0.6, C_ON_TX, 1, cv.LINE_AA)
+    ui_put_text(img, shown, (14, 26), 0.6, C_ON_TX)
 
     def key_row(keys, y):
         '''keys = [(label, name, weight, on)]; weights share the row's width.'''
@@ -1669,10 +2018,9 @@ def render_remote_view(s, W, H):
     img = np.full((H, W, 3), C_BG, np.uint8)
     buttons = []
     m, gap, bh = 24, 8, 38
-    font = cv.FONT_HERSHEY_SIMPLEX
 
     def text(txt, x, yy, scale=0.55, color=C_TEXT):
-        cv.putText(img, txt, (x, yy), font, scale, color, 1, cv.LINE_AA)
+        ui_put_text(img, txt, (x, yy), scale, color)
 
     # ── WiFi ──
     y = 34
@@ -1685,7 +2033,7 @@ def render_remote_view(s, W, H):
         chip = ("portal: online", C_ON_TX) if st["online"] else \
                ("portal: unreachable", C_QUIT_TX) if st["wifi_connected"] else None
         if chip:
-            (cw_, _), _ = cv.getTextSize(chip[0], font, 0.5, 1)
+            (cw_, _), _ = ui_text_size(chip[0], 0.5)
             text(chip[0], W - m - cw_, y, 0.5, chip[1])
     y += 14
 
@@ -1985,10 +2333,9 @@ def render_library_view(W, H):
     img = np.full((H, W, 3), C_BG, np.uint8)
     buttons = []
     m, gap, bh = 24, 8, 38
-    font = cv.FONT_HERSHEY_SIMPLEX
 
     def text(txt, x, yy, scale=0.55, color=C_TEXT):
-        cv.putText(img, txt, (x, yy), font, scale, color, 1, cv.LINE_AA)
+        ui_put_text(img, txt, (x, yy), scale, color)
 
     if library.mode == "playing":
         ctrl_h = bh + 18
@@ -2067,9 +2414,8 @@ def render_library_view(W, H):
                 cv.ellipse(img, (cx, cy), (8, 8), -90, 0, int(360 * frac),
                            C_DOT_ON, 2, cv.LINE_AA)
                 pct = "%d" % int(frac * 100)
-                (pw, ph), _ = cv.getTextSize(pct, font, 0.3, 1)
-                cv.putText(img, pct, (cx - pw // 2, cy + ph // 2), font, 0.3,
-                           C_TEXT, 1, cv.LINE_AA)
+                (pw, ph), _ = ui_text_size(pct, 0.3)
+                ui_put_text(img, pct, (cx - pw // 2, cy + ph // 2), 0.3, C_TEXT)
         elif st == "failed":
             cv.line(img, (cx - 5, cy - 5), (cx + 5, cy + 5), C_DOT_OFF, 2, cv.LINE_AA)
             cv.line(img, (cx - 5, cy + 5), (cx + 5, cy - 5), C_DOT_OFF, 2, cv.LINE_AA)
@@ -2084,13 +2430,13 @@ def render_library_view(W, H):
         bx = W - m - 200
         when = _fmt_when(e["mtime"])
         dur = library.duration(e["path"])
-        dur_x = bx - cv.getTextSize(dur, font, 0.45, 1)[0][0] - 12
-        date_x = dur_x - cv.getTextSize(when, font, 0.45, 1)[0][0] - 16
+        dur_x = bx - ui_text_size(dur, 0.45)[0][0] - 12
+        date_x = dur_x - ui_text_size(when, 0.45)[0][0] - 16
         text(when, date_x, y + 25, 0.45, C_SUBTEXT)
         text(dur, dur_x, y + 25, 0.45, C_SUBTEXT)
         name = e["name"]
         name_w = date_x - (m + 28) - 10
-        while len(name) > 4 and cv.getTextSize(name, font, 0.5, 1)[0][0] > name_w:
+        while len(name) > 4 and ui_text_size(name, 0.5)[0][0] > name_w:
             name = name[:-2] + "~"
         text(name, m + 28, y + 25, 0.5)
         draw_button(img, bx, y + 4, 80, row_h - 14, "Play", None, False)
@@ -2168,6 +2514,8 @@ def apply_button(kind, name):
             # Standby, not process exit: the web server stays up so the panel's
             # Start button (or the desktop shortcut) can bring the sim back.
             state["running"] = False
+        elif name == "fluoro_reset":
+            state["fluoro_sec"] = 0.0
 
 
 def _hit(buttons, x, y):
@@ -2329,13 +2677,11 @@ def run_simulation(cam_index, show_window):
     # One per view, so a missing lateral camera says so.
     def build_placeholder(head):
         img = np.zeros((480, 640), np.uint8)
-        font = cv.FONT_HERSHEY_SIMPLEX
         for text, size, thick, grey, ty in (
                 (head, 0.9, 2, 235, 232),
                 ("connect a camera - it is picked up automatically", 0.45, 1, 130, 262)):
-            (tw, _), _ = cv.getTextSize(text, font, size, thick)
-            cv.putText(img, text, ((640 - tw) // 2, ty), font, size, grey, thick,
-                       cv.LINE_AA)
+            (tw, _), _ = ui_text_size(text, size, thick)
+            ui_put_text(img, text, ((640 - tw) // 2, ty), size, grey, thick)
         enc_ok, jpg = cv.imencode(".jpg", img, [cv.IMWRITE_JPEG_QUALITY, 80])
         return img, (jpg.tobytes() if enc_ok else None)
 
@@ -2422,7 +2768,9 @@ def run_simulation(cam_index, show_window):
     applied_fullscreen = None  # last fullscreen state pushed to the window (avoids redundant calls)
     retile_until = {}          # window name -> monotonic deadline for putting it back in its tile
     res = None                 # last processed frame (shown + streamed)
+    res_plain = None           # windowed: that frame before the HUD text went on
     live = False               # True once a frame has been read (drives the status dot)
+    beam_t = None              # when the last frame was taken with the beam on (fluoro time)
 
     while True:
         s = get_state_snapshot()
@@ -2449,7 +2797,7 @@ def run_simulation(cam_index, show_window):
                     cv.destroyAllWindows()
                     cv.waitKey(1)  # let the GUI process the window teardown
                 applied_fullscreen = None
-                res, live = None, False
+                res, res_plain, live, beam_t = None, None, False, None
             windows_open = False
             next_cam_scan = 0.0
             for _role in caps:
@@ -2598,6 +2946,8 @@ def run_simulation(cam_index, show_window):
         any_open = any(caps[r] is not None for r in wanted)
         capture_now = ((pedal_down or not s["pedal_mode"])
                        and not lib_playing and any_open)
+        if not capture_now:
+            beam_t = None     # beam off: the gap until the next frame is not fluoro time
 
         if not any_open:
             # Nothing to show: publish the prebuilt placeholder so the window,
@@ -2605,7 +2955,8 @@ def run_simulation(cam_index, show_window):
             # an unattended simulator does not spin a core.
             live = False
             placeholder_key = "split" if split else "main"
-            res = no_camera_img[placeholder_key]
+            res, res_plain = no_camera_img[placeholder_key], None
+            beam_t = None
             time.sleep(0.03)
         elif capture_now:
             # Read every camera this view needs, and turn each frame into a
@@ -2642,6 +2993,15 @@ def run_simulation(cam_index, show_window):
             live = True
             placeholder_key = None
 
+            # Fluoro time: the beam is on while frames are being taken, so add
+            # the time since the previous one - capped, so a stall in the
+            # camera is not counted as beam time.
+            now = time.monotonic()
+            if beam_t is not None:
+                with state_lock:
+                    state["fluoro_sec"] += min(now - beam_t, FLUORO_GAP_SEC)
+            beam_t = now
+
             if split:
                 # A half with no camera shows that half's placeholder, so one
                 # camera dropping out never takes the working view with it.
@@ -2656,6 +3016,9 @@ def run_simulation(cam_index, show_window):
             else:
                 res = views["main"]
 
+            # Windowed, FLUORO shows the field alone and puts its own notes in
+            # the corners, so it takes the frame from before the HUD text.
+            res_plain = None if s["fullscreen"] else res.copy()
             if s["hud"]:
                 draw_str(res, (20, 20), "Overlay:%s  Equalize:%s" %
                          (s["overlay"], s["equalize"]))
@@ -2707,7 +3070,6 @@ def run_simulation(cam_index, show_window):
         rec_elapsed = recorder.elapsed_str() if recorder.active else None
         # Windowed on a touch panel: the boxes the two windows are tiled into.
         tiles = None if s["fullscreen"] else windowed_layout()
-        ctrl_max_h = tiles[1][3] if tiles else None
 
         # A window closed with its title-bar X comes back with the next
         # cv.imshow below, but labwc places it anew - lower down, partly off
@@ -2724,44 +3086,48 @@ def run_simulation(cam_index, show_window):
                         cv.resizeWindow(name, box[2], box[3])
                     cv.moveWindow(name, box[0], box[1])
 
-        if show_window and view != "fluoro":
+        if show_window and not s["fullscreen"]:
+            # Windowed: the GE-style panel, tabs and all, in CONTROLS; FLUORO
+            # shows the image alone - or the Remote Access / Library view -
+            # filling its square. A failure in tab code must never take down
+            # the sim: fall back to the Fluoro view.
+            try:
+                if tiles:
+                    side, (pw, ph) = tiles[0][2], tiles[1][2:]
+                else:
+                    side, (pw, ph) = (res.shape[0] if res is not None else 480), (GE_W, GE_H)
+                if view == "fluoro":
+                    canvas, vbtns = render_ge_image(
+                        res if res_plain is None else res_plain, side, s, logo, split,
+                        pedal_down, live, rec_elapsed), []
+                else:
+                    canvas, vbtns = render_tab_view(view, s, side, side)
+                tab_buttons[:] = []
+                view_buttons[:] = vbtns
+                panel, btns = render_ge_panel(ge_panel_state(s), pw, ph)
+                ctrl_buttons[:] = btns
+                cv.imshow("CONTROLS", panel)
+                cv.imshow("FLUORO", canvas)
+            except Exception:
+                traceback.print_exc()
+                with state_lock:
+                    state["ui_view"] = "fluoro"
+        elif show_window and view != "fluoro":
             # Remote Access / Library replace the video area under the tab
             # bar; the capture pipeline above keeps running so the preview
             # stays live and switching back is instant. A failure in tab code
             # must never take down the sim: fall back to the Fluoro view.
             try:
                 fh, fw = res.shape[:2] if res is not None else (480, 640)
-                if SCREEN_SIZE and s["fullscreen"]:
+                if SCREEN_SIZE:
                     vw, canvas_h = SCREEN_SIZE[0], SCREEN_SIZE[1] - TAB_H
-                elif tiles:
-                    vw, canvas_h = tiles[0][2], tiles[0][3] - TAB_H
                 else:
-                    vw, canvas_h = fw, fh + (BAR_H if s["fullscreen"] else 0)
-                if view == "remote":
-                    canvas, vbtns = render_remote_view(s, vw, canvas_h)
-                else:
-                    canvas, vbtns = render_library_view(vw, canvas_h)
-                if ui["focus"] and view == "remote":
-                    # A focused text field pops the on-screen keyboard over
-                    # the bottom of the view (its echo strip keeps the typed
-                    # text visible even when the field itself is covered).
-                    kb, kbtns = render_keyboard(
-                        vw, ui[ui["focus"]],
-                        ui["focus"] == "password" and not ui["show_pw"])
-                    kh = kb.shape[0]
-                    if kh < canvas.shape[0]:
-                        canvas[-kh:] = kb
-                        vbtns = list(vbtns) + [
-                            (x, y + canvas.shape[0] - kh, w, h, k, n)
-                            for (x, y, w, h, k, n) in kbtns]
+                    vw, canvas_h = fw, fh + BAR_H
+                canvas, vbtns = render_tab_view(view, s, vw, canvas_h)
                 tab, tbtns = render_tab_bar(vw, view, rec_elapsed)
                 tab_buttons[:] = tbtns
                 view_buttons[:] = [(x, y + TAB_H, w, h, k, n)
                                    for (x, y, w, h, k, n) in vbtns]
-                if not s["fullscreen"]:
-                    panel, btns = render_controls(s, logo, live, ctrl_max_h)
-                    ctrl_buttons[:] = btns
-                    cv.imshow("CONTROLS", panel)
                 cv.imshow("FLUORO", np.vstack([tab, canvas]))
             except Exception:
                 traceback.print_exc()
@@ -2769,31 +3135,20 @@ def run_simulation(cam_index, show_window):
                     state["ui_view"] = "fluoro"
         elif res is not None and show_window:
             vid = cv.cvtColor(res, cv.COLOR_GRAY2BGR) if res.ndim == 2 else res
-            if s["fullscreen"] and SCREEN_SIZE:
+            if SCREEN_SIZE:
                 # Compose natively at the display resolution: the video is
                 # letterboxed (not stretched) between the tab bar and the
                 # control bar, and every pixel/tap maps 1:1 to the screen.
                 sw, sh = SCREEN_SIZE
                 vid = fit_frame(vid, sw, sh - TAB_H - BAR_H)
-            elif tiles:
-                # Windowed on the touch panel: fill the FLUORO window's tile
-                # the same way, beside the CONTROLS panel.
-                vid = fit_frame(vid, tiles[0][2], tiles[0][3] - TAB_H)
             tab, tbtns = render_tab_bar(vid.shape[1], view, rec_elapsed)
             tab_buttons[:] = tbtns
-            if s["fullscreen"]:
-                # Stack the video between the tab bar and a thin control bar.
-                bar, bbtns = render_control_bar(s, vid.shape[1], live)
-                composite = np.vstack([tab, vid, bar])
-                overlay_buttons[:] = [(x, y + TAB_H + vid.shape[0], w, h, k, n)
-                                      for (x, y, w, h, k, n) in bbtns]
-                cv.imshow("FLUORO", composite)
-            else:
-                # Tabbed video in FLUORO, the vertical panel in CONTROLS.
-                panel, btns = render_controls(s, logo, live, ctrl_max_h)
-                ctrl_buttons[:] = btns
-                cv.imshow("CONTROLS", panel)
-                cv.imshow("FLUORO", np.vstack([tab, vid]))
+            # Stack the video between the tab bar and a thin control bar.
+            bar, bbtns = render_control_bar(ui_snapshot(s), vid.shape[1], live)
+            composite = np.vstack([tab, vid, bar])
+            overlay_buttons[:] = [(x, y + TAB_H + vid.shape[0], w, h, k, n)
+                                  for (x, y, w, h, k, n) in bbtns]
+            cv.imshow("FLUORO", composite)
         if placeholder_key and no_camera_buf.get(placeholder_key) is not None:
             # Static placeholder: publish the pre-encoded copy rather than
             # re-encoding the same image on every iteration.

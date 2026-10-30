@@ -107,8 +107,12 @@ web panel, the on-screen control bar and the `CONTROLS` panel; it is dimmed and
 unpressable whenever fewer than two are attached.
 
 Selecting it puts **both projections on screen side by side**, each with its own
-circular field, captioned `FRONTAL` and `LATERAL` in the outer bottom corners so
-the two can never be confused. Both cameras stay open together while the split
+flat-panel field - a square cut to a slightly larger circle, so each corner is
+one round arc meeting the straight sides in a point, as on GE's OEC display -
+captioned `FRONTAL` and `LATERAL` down the outer edges (in the black bars beside
+the fields) so the two can never be confused. `APERTURE_SHAPE` in
+`fluoro_web.py` switches both fields to a plain square (`"square"`) or an image
+intensifier's round one (`"circle"`). Both cameras stay open together while the split
 view is on, so toggling it never interrupts the frontal image; turning it off
 closes the lateral camera again rather than hold USB bandwidth it is not using.
 If one camera drops out, its half shows that half's "no camera" screen and the
@@ -211,6 +215,26 @@ MIRROR=on               # off = a second monitor stays an ordinary desktop
 
 `python3 displays.py status` shows what is attached and which output is the
 panel.
+
+### Fullscreen and windowed layouts
+
+**Fullscreen** stacks the video between the tab bar (Fluoro / Remote Access /
+Library) and a three-row control bar. **Windowed** is modelled on GE's OEC
+C-arm display: the image fills a square window on the left - the field alone,
+with the logo and small corner notes - and a touch panel fills the rest:
+
+- angled, overlapping **tabs** (Fluoro / Remote / Library) on a black header;
+- glossy round **toggles**: Overlay, Equalize, HUD, Pedal and Rec;
+- a **readout** of the camera position (X, Y, Z in cm) and the **fluoro time**
+  (mm:ss), with a Reset button;
+- a **direction pad** for X/Y panning, a **rocker** for Z, and **Lateral view**;
+- **Fullscreen / Windowed** options and **Stop simulator**.
+
+The fluoro time counts beam-on time - while frames are being taken, so in
+Pedal mode only while the pedal is held, and all the time with Pedal mode off -
+until it is reset (also `POST /api/action/fluoro_reset`). All on-screen text is
+set in Nunito Sans (Raspberry Pi OS's own desktop font), falling back to Nimbus
+Sans, Liberation Sans, DejaVu Sans and finally OpenCV's own font.
 
 ### No camera attached
 
