@@ -555,6 +555,16 @@ def windowed_layout():
     y, h = sy + TITLEBAR_PX, sh - TITLEBAR_PX
     return (sx, y, sw - CONTROLS_W, h), (sx + sw - CONTROLS_W, y, CONTROLS_W, h)
 
+
+def window_open(name):
+    '''False while a window is closed with its title-bar X. OpenCV only hides
+    it then (minimized still counts as open), and the next cv.imshow shows
+    it again, with its flags and click handler intact.'''
+    try:
+        return cv.getWindowProperty(name, cv.WND_PROP_VISIBLE) >= 1
+    except cv.error:
+        return False
+
 # Latest processed frame for the MJPEG preview stream. The main loop only hands
 # the frame over (publish_preview); it is JPEG-encoded on first request, in the
 # web thread, so the capture loop never pays for encoding - and nothing is
@@ -2410,6 +2420,7 @@ def run_simulation(cam_index, show_window):
     placeholder_key = None     # which prebuilt placeholder `res` currently is
     rec_shape = None           # frame shape the running recording was opened at
     applied_fullscreen = None  # last fullscreen state pushed to the window (avoids redundant calls)
+    retile_until = {}          # window name -> monotonic deadline for putting it back in its tile
     res = None                 # last processed frame (shown + streamed)
     live = False               # True once a frame has been read (drives the status dot)
 
@@ -2697,6 +2708,21 @@ def run_simulation(cam_index, show_window):
         # Windowed on a touch panel: the boxes the two windows are tiled into.
         tiles = None if s["fullscreen"] else windowed_layout()
         ctrl_max_h = tiles[1][3] if tiles else None
+
+        # A window closed with its title-bar X comes back with the next
+        # cv.imshow below, but labwc places it anew - lower down, partly off
+        # the panel, and the resizable FLUORO window shrunk to fit there - a
+        # moment after it reappears. Keep putting it back in its tile for a
+        # second after that; a window the user drags is left be.
+        if show_window and tiles and applied_fullscreen is False:
+            now = time.monotonic()
+            for name, box in (("FLUORO", tiles[0]), ("CONTROLS", tiles[1])):
+                if not window_open(name):
+                    retile_until[name] = now + 1.0
+                elif retile_until.get(name, 0.0) > now:
+                    if name == "FLUORO":
+                        cv.resizeWindow(name, box[2], box[3])
+                    cv.moveWindow(name, box[0], box[1])
 
         if show_window and view != "fluoro":
             # Remote Access / Library replace the video area under the tab
