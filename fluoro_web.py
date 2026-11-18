@@ -67,6 +67,8 @@ from __future__ import print_function
 
 import os
 import sys
+import ctypes
+import ctypes.util
 import glob
 import functools
 import json
@@ -425,7 +427,7 @@ state = {
     "pos_z_cm": 0.0,        # camera Z position (cm from nominal height) — drives the zoom
     "ui_view": "fluoro",    # which tab the FLUORO window shows: fluoro|remote|library
     "recording": False,     # session recording to ~/fluorosim_recordings
-    "fluoro_sec": 0.0,      # fluoro time: seconds of beam-on (frames being captured)
+    "fluoro_sec": 0.0,      # fluoro time: seconds of beam-on (frames taken / pedal held)
     "camera": False,        # read-only: a camera is open and delivering frames
     "lateral": False,       # show the lateral camera instead of the main one
     "cameras": 0,           # read-only: how many cameras are attached right now
@@ -439,9 +441,12 @@ state = {
 # its own at the next retry.
 CAMERA_RETRY_SEC = 3.0
 
-# Fluoro time counts the beam-on time between consecutive frames, but never more
-# than this for one gap (seconds), so a stalled camera does not run the clock.
-FLUORO_GAP_SEC = 0.5
+# Fluoro time adds up the time between consecutive moments the beam is seen on
+# (a frame taken; in Pedal mode, the pedal held), but a gap longer than this
+# (seconds) is not beam time: the camera stalled, or the pedal came up between.
+# It outlasts the keyboard's key-repeat delay (0.6 s by default), since where X
+# cannot say whether the key is down, a held pedal is seen only as its repeats.
+FLUORO_GAP_SEC = 0.75
 
 # Consecutive failed reads before a camera is treated as gone (unplugged) and
 # released, dropping back to the placeholder + retry path. A few dropped frames
@@ -1788,7 +1793,7 @@ def render_ge_panel(p, width, height):
     return img, buttons
 
 
-def render_ge_image(src, width, height, s, logo, split, pedal_down, live, rec_elapsed):
+def render_ge_image(src, width, height, s, logo, split, live, rec_elapsed):
     '''The picture at width x height, GE style: no HUD text on it - the logo
     and the HUD's notes sit in its corners instead. A frame wider than the
     space is cut to its centre (the field is square), so windowed mode's
@@ -1813,9 +1818,10 @@ def render_ge_image(src, width, height, s, logo, split, pedal_down, live, rec_el
         cv.circle(img, (width - 54 - tw, 20), 6, C_DOT_OFF, -1, cv.LINE_AA)
         ui_put_text(img, txt, (width - 40 - tw, 20 + th // 2), 0.5, C_QUIT_TX)
     if s["hud"]:
-        note = "PEDAL ACTIVE" if pedal_down else ("PEDAL MODE" if s["pedal_mode"] else "")
-        if note:
-            ui_put_text(img, note, (16, height - 16), 0.5, GE_YELLOW)
+        # A steady note: the pedal reaches the loop as a stream of 'b' presses,
+        # so a note that followed them would flicker while it is held.
+        if s["pedal_mode"]:
+            ui_put_text(img, "PEDAL MODE", (16, height - 16), 0.5, GE_YELLOW)
         zoom = ZOOM_REF_CM / max(0.05 * ZOOM_REF_CM, ZOOM_REF_CM + FLIP_Z * s["pos_z_cm"])
         mag = "%.2fx" % zoom
         (zw, _), _ = ui_text_size(mag, 0.5)
@@ -2577,6 +2583,58 @@ def on_mouse_fluoro(event, x, y, flags, param):
             apply_button(*hit)
 
 
+class HeldKey(object):
+    '''Whether a key is down right now, asked of the X server.
+
+    cv.waitKey reports key presses only, so a held foot pedal - a keyboard that
+    types 'b' - arrives as one 'b' and then, after the key-repeat delay (0.6 s
+    by default), as the key's repeats. The X server (Xwayland on the Pi) knows
+    the key's real state: XQueryKeymap on a connection of our own, through
+    libX11. held() is None where there is no X server to ask.
+    '''
+
+    def __init__(self, keysym):
+        self._x = None
+        try:
+            lib = ctypes.util.find_library("X11")
+            if not lib or not os.environ.get("DISPLAY"):
+                return
+            x = ctypes.CDLL(lib)
+            x.XOpenDisplay.restype = ctypes.c_void_p
+            x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x.XKeysymToKeycode.restype = ctypes.c_ubyte
+            x.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char * 32]
+            dpy = x.XOpenDisplay(None)
+            code = x.XKeysymToKeycode(dpy, keysym) if dpy else 0
+            if code:
+                self._x, self._dpy, self._code = x, dpy, code
+        except Exception:      # no libX11 / no display: held() says it can't tell
+            self._x = None
+
+    def held(self):
+        if self._x is None:
+            return None
+        keys = (ctypes.c_char * 32)()
+        self._x.XQueryKeymap(self._dpy, keys)
+        return bool(bytearray(keys.raw)[self._code >> 3] & (1 << (self._code & 7)))
+
+
+def fluoro_tick(beam_t, now, beam):
+    '''One step of the fluoro clock -> (beam_t, seconds to add).
+
+    beam_t is when the beam was last seen on (None: it has been off since).
+    beam is True while it is on - a frame taken, or the pedal held - False
+    when it is off, and None when that is unknown: a held pedal between two of
+    its key repeats where X cannot be asked, in which case the gap is counted
+    if the next repeat comes within FLUORO_GAP_SEC.
+    '''
+    if beam:
+        gap = None if beam_t is None else now - beam_t
+        return now, (gap if gap is not None and gap <= FLUORO_GAP_SEC else 0.0)
+    return (beam_t if beam is None else None), 0.0
+
+
 def handle_ui_key(key):
     '''Route a keypress to the tab UI. Returns True when consumed.
 
@@ -2798,9 +2856,10 @@ def run_simulation(cam_index, show_window):
     applied_fullscreen = None  # last fullscreen state pushed to the window (avoids redundant calls)
     retile_until = {}          # window name -> monotonic deadline for putting it back in its tile
     res = None                 # last processed frame (shown + streamed)
-    res_plain = None           # windowed: that frame before the HUD text went on
+    res_plain = None           # that frame before the HUD text went on (for the screen)
     live = False               # True once a frame has been read (drives the status dot)
-    beam_t = None              # when the last frame was taken with the beam on (fluoro time)
+    beam_t = None              # when the beam was last seen on (fluoro time; see fluoro_tick)
+    pedal_key = HeldKey(0x62) if show_window else None   # is the pedal's 'b' down right now?
 
     while True:
         s = get_state_snapshot()
@@ -2976,8 +3035,20 @@ def run_simulation(cam_index, show_window):
         any_open = any(caps[r] is not None for r in wanted)
         capture_now = ((pedal_down or not s["pedal_mode"])
                        and not lib_playing and any_open)
-        if not capture_now:
-            beam_t = None     # beam off: the gap until the next frame is not fluoro time
+
+        # Is the beam on, for the fluoro time? With Pedal mode off, while frames
+        # are taken; in Pedal mode, while the pedal is held - from the X
+        # server's key state, as the 'b' presses alone come with gaps (None:
+        # unknown until the next 'b', where X cannot be asked).
+        if not any_open or lib_playing:
+            beam = False
+        elif not s["pedal_mode"]:
+            beam = True
+        else:
+            held = pedal_key.held() if pedal_key is not None else None
+            if view != "fluoro" and ui["focus"] is not None:
+                held = False      # a 'b' typed into a text field is not the pedal
+            beam = True if pedal_down else held
 
         if not any_open:
             # Nothing to show: publish the prebuilt placeholder so the window,
@@ -2986,7 +3057,6 @@ def run_simulation(cam_index, show_window):
             live = False
             placeholder_key = "split" if split else "main"
             res, res_plain = no_camera_img[placeholder_key], None
-            beam_t = None
             time.sleep(0.03)
         elif capture_now:
             # Read every camera this view needs, and turn each frame into a
@@ -3023,15 +3093,6 @@ def run_simulation(cam_index, show_window):
             live = True
             placeholder_key = None
 
-            # Fluoro time: the beam is on while frames are being taken, so add
-            # the time since the previous one - capped, so a stall in the
-            # camera is not counted as beam time.
-            now = time.monotonic()
-            if beam_t is not None:
-                with state_lock:
-                    state["fluoro_sec"] += min(now - beam_t, FLUORO_GAP_SEC)
-            beam_t = now
-
             if split:
                 # A half with no camera shows that half's placeholder, so one
                 # camera dropping out never takes the working view with it.
@@ -3058,6 +3119,13 @@ def run_simulation(cam_index, show_window):
                          (s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"]))
             if pedal_down:
                 draw_str(res, (20, 80), "PEDAL ACTIVE")
+
+        # Fluoro time. (A camera read that failed has skipped this: the gap
+        # until its next frame counts if that comes within FLUORO_GAP_SEC.)
+        beam_t, beam_sec = fluoro_tick(beam_t, time.monotonic(), beam)
+        if beam_sec:
+            with state_lock:
+                state["fluoro_sec"] += beam_sec
 
         # Recording needs a live camera: if it disappears mid-session, close the
         # file cleanly and flip the toggle off instead of filling the recording
@@ -3130,7 +3198,7 @@ def run_simulation(cam_index, show_window):
                 if view == "fluoro":
                     canvas, vbtns = render_ge_image(
                         res if res_plain is None else res_plain, side, side, s, logo, split,
-                        pedal_down, live, rec_elapsed), []
+                        live, rec_elapsed), []
                 else:
                     canvas, vbtns = render_tab_view(view, s, side, side)
                 tab_buttons[:] = []
@@ -3176,7 +3244,7 @@ def run_simulation(cam_index, show_window):
             bar, bbtns = render_ge_bar(p, width)
             vid_h = (SCREEN_SIZE[1] - head.shape[0] - bar.shape[0]) if SCREEN_SIZE else res.shape[0]
             vid = render_ge_image(res if res_plain is None else res_plain, width, vid_h, s, logo,
-                                  split, pedal_down, live, None)
+                                  split, live, None)
             tab_buttons[:] = hbtns
             overlay_buttons[:] = [(x, y + head.shape[0] + vid_h, w, h, k, n)
                                   for (x, y, w, h, k, n) in bbtns]

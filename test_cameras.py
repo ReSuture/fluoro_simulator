@@ -392,6 +392,47 @@ check("the frontal half is still the same physical camera after renumbering",
       "was %.1f, now %.1f" % (main_level, left_moved))
 
 
+print("\n10. Fluoro time")
+
+
+def clock(events):
+    '''Run fluoro_tick over (time, beam) steps; -> seconds counted.'''
+    beam_t, total = None, 0.0
+    for now, beam in events:
+        beam_t, add = f.fluoro_tick(beam_t, now, beam)
+        total += add
+    return total
+
+
+def steps(t0, t1, dt, beam):
+    return [(t0 + i * dt, beam) for i in range(int(round((t1 - t0) / dt)))]
+
+
+# Pedal mode where X can say: held 3 s (the loop polls every 15 ms), then up.
+held = clock(steps(0.0, 3.0, 0.015, True) + steps(3.0, 4.0, 0.015, False))
+check("pedal held 3 s counts 3 s", abs(held - 3.0) < 0.05, held)
+taps = clock(steps(0.0, 0.2, 0.01, True) + steps(0.2, 0.7, 0.01, False)
+             + steps(0.7, 0.9, 0.01, True) + steps(0.9, 1.4, 0.01, False)
+             + steps(1.4, 1.6, 0.01, True) + steps(1.6, 3.0, 0.01, False))
+check("three 0.2 s taps count 0.6 s, not the gaps", abs(taps - 0.6) < 0.05, taps)
+# Without X: a held pedal is one 'b', then (after the 0.6 s repeat delay) a
+# repeat every 40 ms, and nothing known between them.
+presses = [0.0, 0.6] + [0.6 + 0.04 * i for i in range(1, 60)]     # held ~3 s
+loop = sorted([(t, True) for t in presses] + [(t, None) for t in
+              [i * 0.01 for i in range(500)] if t not in presses])
+repeats = clock(loop + [(5.0, True), (5.02, None)])                  # a tap 2 s later
+check("without X, a held pedal counts through the repeat delay",
+      abs(repeats - presses[-1]) < 0.01, repeats)
+frames = clock(steps(0.0, 2.0, 1 / 30.0, True))
+check("Pedal mode off: 2 s of frames count 2 s", abs(frames - 2.0) < 0.05, frames)
+stalled = clock([(0.0, True), (0.03, True), (1.5, True), (1.53, True)])
+check("a stalled camera's gap is not counted", abs(stalled - 0.06) < 0.001, stalled)
+display = os.environ.pop("DISPLAY", None)
+check("with no X display the pedal's state is unknown", f.HeldKey(0x62).held() is None)
+if display is not None:
+    os.environ["DISPLAY"] = display
+
+
 print("\n%d passed, %d failed" % (len(PASSED), len(FAILED)))
 for failure in FAILED:
     print("  FAILED: %s" % failure)

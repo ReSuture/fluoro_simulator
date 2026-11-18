@@ -232,11 +232,16 @@ with the logo and small corner notes - and a touch panel fills the rest:
 - a **direction pad** for X/Y panning, a **rocker** for Z, and **Lateral view**;
 - **Fullscreen / Windowed** options and **Stop simulator**.
 
-The fluoro time counts beam-on time - while frames are being taken, so in
-Pedal mode only while the pedal is held, and all the time with Pedal mode off -
-until it is reset (also `POST /api/action/fluoro_reset`). All on-screen text is
-set in Nunito Sans (Raspberry Pi OS's own desktop font), falling back to Nimbus
-Sans, Liberation Sans, DejaVu Sans and finally OpenCV's own font.
+The fluoro time counts beam-on time - in Pedal mode while the pedal is held,
+and all the time frames are being taken with Pedal mode off - until it is reset
+(also `POST /api/action/fluoro_reset`). The pedal only types `b`, so whether it
+is still held between the key's repeats is asked of the X server (the key's
+real state, through libX11); without X, the repeats are timed instead. In Pedal
+mode the image's corner note reads a steady PEDAL MODE.
+
+All on-screen text is set in Nunito Sans (Raspberry Pi OS's own desktop font),
+falling back to Nimbus Sans, Liberation Sans, DejaVu Sans and finally OpenCV's
+own font.
 
 ### No camera attached
 
