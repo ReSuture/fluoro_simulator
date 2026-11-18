@@ -72,6 +72,7 @@ import ctypes.util
 import glob
 import functools
 import json
+import math
 import re
 import time
 import struct
@@ -925,7 +926,9 @@ def api_position():
     POSTs the camera's (x, y) here and the processing loop pans the anatomy
     viewport to match. Accepts JSON ``{"x": <cm>, "y": <cm>}`` or plain form/query
     params ``x`` and ``y``. An optional ``z`` (cm) sets the zoom the same way;
-    omitting it leaves the current zoom unchanged. Returns the full updated state.
+    omitting it leaves the current zoom unchanged. A position past the
+    anatomy's edges is brought back to them (clamp_position) - the field can
+    go no further - and the returned state carries the position as applied.
     '''
     data = request.get_json(silent=True) or {}
     x = data.get("x", request.values.get("x"))
@@ -934,13 +937,13 @@ def api_position():
     try:
         x, y = float(x), float(y)
         z = float(z) if z is not None else None
+        if any(math.isnan(v) or math.isinf(v) for v in (x, y, z) if v is not None):
+            raise ValueError("not a finite number")
     except (TypeError, ValueError):
         return jsonify({"error": "provide numeric x and y (cm), optional z (cm)"}), 400
     with state_lock:
-        state["pos_x_cm"] = x
-        state["pos_y_cm"] = y
-        if z is not None:
-            state["pos_z_cm"] = z
+        state["pos_x_cm"], state["pos_y_cm"], state["pos_z_cm"] = clamp_position(
+            x, y, state["pos_z_cm"] if z is None else z)
         snap = dict(state)
     return jsonify(snap)
 
@@ -1001,6 +1004,68 @@ def compute_viewport(master, x_cm, y_cm, z_cm=0.0):
     x0 = max(0, min(int(round(cx - w / 2.0)), mw - w))
     y0 = max(0, min(int(round(cy - h / 2.0)), mh - h))
     return master[y0:y0 + h, x0:x0 + w]
+
+
+# ── The anatomy's edges ───────────────────────────────────────────────────────
+# compute_viewport stops the field at the edges of the master; the position, and
+# so its readout, stops there too, or the numbers would run on while the picture
+# stood still. (width, height) of the frontal master in px - the calibration is
+# in its pixels - set once it is loaded; None until then (nothing is clamped).
+MASTER_SIZE = None
+ZOOM_MIN = 0.05        # the closest zoom compute_viewport allows
+
+
+def set_master_size(master):
+    global MASTER_SIZE
+    MASTER_SIZE = (master.shape[1], master.shape[0])
+
+
+def zoom_limits(size):
+    '''(z_min, z_max) in cm: from the closest zoom to the widest field that
+    still fits inside the anatomy whole - wider, it is cut to the master in one
+    direction only and the picture is squeezed.'''
+    mw, mh = size
+    fit = min(mw / (FOV_CM[0] * PX_PER_CM), mh / (FOV_CM[1] * PX_PER_CM))
+    ends = [(zoom * ZOOM_REF_CM - ZOOM_REF_CM) / FLIP_Z for zoom in (ZOOM_MIN, fit)]
+    return min(ends), max(ends)
+
+
+def travel_limits(size, z_cm):
+    '''((x_min, x_max), (y_min, y_max)) in cm: how far the field can move at
+    height z_cm before compute_viewport stops it at the anatomy's edge.'''
+    zoom = max(ZOOM_MIN, (ZOOM_REF_CM + FLIP_Z * z_cm) / ZOOM_REF_CM)
+    out = []
+    for fov, origin, flip, extent in ((FOV_CM[0], ORIGIN_PX[0], FLIP_X, size[0]),
+                                      (FOV_CM[1], ORIGIN_PX[1], FLIP_Y, size[1])):
+        win = max(1, min(int(round(fov * zoom * PX_PER_CM)), extent))
+        ends = [(centre - origin) / (flip * PX_PER_CM)
+                for centre in (win / 2.0, extent - win / 2.0)]
+        out.append((min(ends), max(ends)))
+    return tuple(out)
+
+
+def clamp_position(x, y, z):
+    '''The position (cm) brought inside the anatomy's edges: Z first, then X
+    and Y at that height, as zooming out leaves the field less room to move.'''
+    if MASTER_SIZE is None:
+        return x, y, z
+    z_lo, z_hi = zoom_limits(MASTER_SIZE)
+    z = min(max(z, z_lo), z_hi)
+    (x_lo, x_hi), (y_lo, y_hi) = travel_limits(MASTER_SIZE, z)
+    return min(max(x, x_lo), x_hi), min(max(y, y_lo), y_hi), z
+
+
+def pan_step(pos, axis, direction):
+    '''One pan/zoom step from pos (x, y, z): along axis 0/1/2, direction +1/-1.
+
+    It goes to the next PAN_STEP_CM grid line at least half a step away, but
+    no further than the anatomy's edge: the readout counts in steps, stops
+    where the picture stops, and a step back from an edge lands on the grid.
+    '''
+    pos = list(pos)
+    k = pos[axis] / PAN_STEP_CM
+    pos[axis] = (math.ceil(k + 0.5) if direction > 0 else math.floor(k - 0.5)) * PAN_STEP_CM
+    return clamp_position(*pos)
 
 
 def estimate_illumination(gray):
@@ -2503,6 +2568,17 @@ def render_library_view(W, H):
     return img, buttons
 
 
+# The direction pad and Z rocker: button -> (axis, direction) for pan_step.
+PAN_BUTTONS = {"xm": (0, -1), "xp": (0, 1), "ym": (1, -1), "yp": (1, 1),
+               "zm": (2, -1), "zp": (2, 1)}
+
+
+def _pan_locked(axis, direction):
+    '''One pan/zoom step of the shared position (the caller holds state_lock).'''
+    state["pos_x_cm"], state["pos_y_cm"], state["pos_z_cm"] = pan_step(
+        (state["pos_x_cm"], state["pos_y_cm"], state["pos_z_cm"]), axis, direction)
+
+
 def apply_button(kind, name):
     '''Apply an on-screen button press to the shared `state` (under state_lock).'''
     if kind == "tab":
@@ -2529,19 +2605,8 @@ def apply_button(kind, name):
     with state_lock:
         if kind == "toggle":
             state[name] = not state[name]
-        elif kind == "pan":
-            if name == "xm":
-                state["pos_x_cm"] -= PAN_STEP_CM
-            elif name == "xp":
-                state["pos_x_cm"] += PAN_STEP_CM
-            elif name == "ym":
-                state["pos_y_cm"] -= PAN_STEP_CM
-            elif name == "yp":
-                state["pos_y_cm"] += PAN_STEP_CM
-            elif name == "zm":
-                state["pos_z_cm"] -= PAN_STEP_CM
-            elif name == "zp":
-                state["pos_z_cm"] += PAN_STEP_CM
+        elif kind == "pan" and name in PAN_BUTTONS:
+            _pan_locked(*PAN_BUTTONS[name])
         elif name == "fullscreen":
             state["fullscreen"] = True
         elif name == "windowed":
@@ -2811,6 +2876,10 @@ def run_simulation(cam_index, show_window):
               "pixels, so the two views will not pan alike."
               % (lateral_master.shape, master.shape))
     masters = {"main": master, "lateral": lateral_master}
+    set_master_size(master)     # the anatomy's edges, for clamp_position
+    with state_lock:            # (a position posted before now is brought inside them)
+        state["pos_x_cm"], state["pos_y_cm"], state["pos_z_cm"] = clamp_position(
+            state["pos_x_cm"], state["pos_y_cm"], state["pos_z_cm"])
 
     # On-screen control panel: the logo image and a helper to (re)open the
     # separate CONTROLS window used in windowed mode.
@@ -3305,17 +3374,17 @@ def _handle_key(key):
         elif key == ord(' '):
             state["pedal_mode"] = not state["pedal_mode"]
         elif key == ord('a'):            # pan the anatomy background: X−
-            state["pos_x_cm"] -= PAN_STEP_CM
+            _pan_locked(0, -1)
         elif key == ord('d'):            # X+
-            state["pos_x_cm"] += PAN_STEP_CM
+            _pan_locked(0, 1)
         elif key == ord('w'):            # Y−
-            state["pos_y_cm"] -= PAN_STEP_CM
+            _pan_locked(1, -1)
         elif key == ord('s'):            # Y+
-            state["pos_y_cm"] += PAN_STEP_CM
+            _pan_locked(1, 1)
         elif key == ord('q'):            # Z− (lower the camera = zoom in)
-            state["pos_z_cm"] -= PAN_STEP_CM
+            _pan_locked(2, -1)
         elif key == ord('e'):            # Z+ (raise the camera = zoom out)
-            state["pos_z_cm"] += PAN_STEP_CM
+            _pan_locked(2, 1)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

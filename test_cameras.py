@@ -466,6 +466,69 @@ with f.state_lock:
     f.state.update({"pedal_mode": False, "overlay": False, "pos_y_cm": 0.0})
 
 
+print("\n12. The camera stops at the anatomy's edges")
+saved_size, f.MASTER_SIZE = f.MASTER_SIZE, (867, 1275)
+# Every master pixel holds its own index, so a crop's first pixel says where
+# compute_viewport cut the field.
+numbered = np.arange(867 * 1275, dtype=np.int32).reshape(1275, 867)
+
+
+def field(pos):
+    '''(x0, y0, w, h) of the field compute_viewport cuts at pos.'''
+    crop = f.compute_viewport(numbered, *pos)
+    return int(crop[0, 0]) % 867, int(crop[0, 0]) // 867, crop.shape[1], crop.shape[0]
+
+
+def walk(pos, axis, direction):
+    '''Step until the position stops; -> every position on the way.'''
+    seen = [tuple(pos)]
+    for _ in range(60):
+        nxt = f.pan_step(seen[-1], axis, direction)
+        if nxt == seen[-1]:
+            break
+        seen.append(nxt)
+    return seen
+
+
+for z in (0.0, 10.0):
+    for axis, name in ((0, "X"), (1, "Y")):
+        for d in (1, -1):
+            seen = walk((0.0, 0.0, z), axis, d)
+            # The readout shows whole cm: it must never change on a step that
+            # leaves the picture where it was, and must stop at the edge.
+            dead = [b[axis] for a, b in zip(seen, seen[1:])
+                    if round(a[axis]) != round(b[axis]) and field(a) == field(b)]
+            x0, y0, w, h = field(seen[-1])
+            edge = x0 in (0, 867 - w) if axis == 0 else y0 in (0, 1275 - h)
+            grid = all(abs(p[axis] / 5.0 - round(p[axis] / 5.0)) < 1e-9 for p in seen[:-1])
+            check("Z=%d %s%s: readout and picture stop together at the edge"
+                  % (z, name, "+" if d > 0 else "-"), not dead and edge and grid,
+                  "stopped at %.2f; dead steps %s" % (seen[-1][axis], dead))
+z_lo, z_hi = f.zoom_limits(f.MASTER_SIZE)
+top = walk((0.0, 0.0, 0.0), 2, 1)[-1]
+_, _, w, h = field(top)
+check("Z+ stops at the widest field that is still whole (unsqueezed)",
+      top[2] == z_hi and w == 867 and abs(w / float(h) - f.FOV_CM[0] / f.FOV_CM[1]) < 0.01,
+      "z %.2f, field %dx%d" % (top[2], w, h))
+check("Z- stops at the closest zoom", walk((0.0, 0.0, 0.0), 2, -1)[-1][2] == z_lo, z_lo)
+edge_pos = walk((0.0, 0.0, 10.0), 0, 1)[-1]
+check("a step back from an edge lands on the 5 cm grid",
+      f.pan_step(edge_pos, 0, -1)[0] == 0.0, f.pan_step(edge_pos, 0, -1))
+pos = (15.0, 0.0, 0.0)
+for _ in range(2):
+    pos = f.pan_step(pos, 2, 1)                 # zoom out twice: Z 0 -> 10
+check("zooming out pulls X in with the field, so the readout stays true",
+      pos[2] == 10.0 and pos[0] == f.travel_limits(f.MASTER_SIZE, 10.0)[0][1], pos)
+body = client.post("/api/position", json={"x": 100, "y": -100, "z": 100}).get_json()
+(_, x_hi), (y_lo, _) = f.travel_limits(f.MASTER_SIZE, z_hi)
+check("POST /api/position past the edges is brought back to them",
+      (body["pos_x_cm"], body["pos_y_cm"], body["pos_z_cm"]) == (x_hi, y_lo, z_hi), body)
+check("POST /api/position refuses NaN",
+      client.post("/api/position", json={"x": "nan", "y": 0}).status_code == 400)
+client.post("/api/position", json={"x": 0, "y": 0, "z": 0})
+f.MASTER_SIZE = saved_size
+
+
 print("\n%d passed, %d failed" % (len(PASSED), len(FAILED)))
 for failure in FAILED:
     print("  FAILED: %s" % failure)

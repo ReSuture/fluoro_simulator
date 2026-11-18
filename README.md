@@ -232,6 +232,12 @@ with the logo and small corner notes - and a touch panel fills the rest:
 - a **direction pad** for X/Y panning, a **rocker** for Z, and **Lateral view**;
 - **Fullscreen / Windowed** options and **Stop simulator**.
 
+Pan and zoom go in 5 cm steps and stop at the anatomy's edges - X/Y where the
+field reaches the edge of the master image, Z+ at the widest field that still
+fits inside it whole - so the readout stops where the picture does; zooming out
+draws X/Y in with the field. Positions posted to `/api/position` are clamped
+the same way.
+
 The fluoro time counts beam-on time - in Pedal mode while the pedal is held,
 and all the time frames are being taken with Pedal mode off - until it is reset
 (also `POST /api/action/fluoro_reset`). The pedal only types `b`, so whether it
