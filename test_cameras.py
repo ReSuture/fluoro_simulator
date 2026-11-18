@@ -433,6 +433,39 @@ if display is not None:
     os.environ["DISPLAY"] = display
 
 
+print("\n11. Pedal mode: the held picture follows a pan")
+# The loop from section 8 is still running, windowless, so the pedal is never
+# down: in Pedal mode nothing is captured and the picture is held.
+with f.state_lock:
+    f.state.update({"lateral": False, "overlay": True, "pos_x_cm": 0.0,
+                    "pos_y_cm": 0.0, "pos_z_cm": 0.0})
+time.sleep(2)
+with f.state_lock:
+    f.state["pedal_mode"] = True
+time.sleep(1.5)
+clock_before = f.state["fluoro_sec"]   # after the frame in flight at the switch
+seq_held, _ = f.latest_preview()
+held_img = preview_image()
+time.sleep(1.0)
+check("pedal up: no new frames, the picture is held",
+      f.latest_preview()[0] == seq_held)
+with f.state_lock:
+    f.state["pos_y_cm"] = 20.0                 # pan while the pedal is up
+time.sleep(1.0)
+panned = preview_image()
+check("a pan redraws the held picture at once",
+      f.latest_preview()[0] != seq_held
+      and np.abs(panned.astype(int) - held_img.astype(int)).mean() > 2,
+      "mean change %.2f" % np.abs(panned.astype(int) - held_img.astype(int)).mean())
+seq_panned = f.latest_preview()[0]
+time.sleep(1.0)
+check("...once: it is held again after the redraw", f.latest_preview()[0] == seq_panned)
+check("redrawing is not beam time", f.state["fluoro_sec"] == clock_before,
+      "%.3f -> %.3f" % (clock_before, f.state["fluoro_sec"]))
+with f.state_lock:
+    f.state.update({"pedal_mode": False, "overlay": False, "pos_y_cm": 0.0})
+
+
 print("\n%d passed, %d failed" % (len(PASSED), len(FAILED)))
 for failure in FAILED:
     print("  FAILED: %s" % failure)

@@ -2860,6 +2860,8 @@ def run_simulation(cam_index, show_window):
     live = False               # True once a frame has been read (drives the status dot)
     beam_t = None              # when the beam was last seen on (fluoro time; see fluoro_tick)
     pedal_key = HeldKey(0x62) if show_window else None   # is the pedal's 'b' down right now?
+    held_frames = {}           # the camera frames the picture was last made from, per role
+    drawn_with = None          # the view settings it was drawn with (see `redraw` below)
 
     while True:
         s = get_state_snapshot()
@@ -2887,6 +2889,7 @@ def run_simulation(cam_index, show_window):
                     cv.waitKey(1)  # let the GUI process the window teardown
                 applied_fullscreen = None
                 res, res_plain, live, beam_t = None, None, False, None
+                held_frames, drawn_with = {}, None
             windows_open = False
             next_cam_scan = 0.0
             for _role in caps:
@@ -3050,6 +3053,18 @@ def run_simulation(cam_index, show_window):
                 held = False      # a 'b' typed into a text field is not the pedal
             beam = True if pedal_down else held
 
+        # Between pedal presses the picture is held. A pan, a zoom or a toggle
+        # made meanwhile is drawn on the held frames straight away - the
+        # anatomy moves under the still camera image, as the readout says it
+        # has - instead of waiting for the next press and then jumping by all
+        # of it at once.
+        view_now = (split, s["overlay"], s["equalize"], s["hud"], s["pedal_mode"],
+                    s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"])
+        redraw = (not capture_now and any_open and not lib_playing
+                  and view_now != drawn_with
+                  and all(r in held_frames for r in wanted))
+        new_frame = False          # a picture was made this iteration (captured or redrawn)
+
         if not any_open:
             # Nothing to show: publish the prebuilt placeholder so the window,
             # the tab bar and the Library keep rendering, and idle a little so
@@ -3058,14 +3073,14 @@ def run_simulation(cam_index, show_window):
             placeholder_key = "split" if split else "main"
             res, res_plain = no_camera_img[placeholder_key], None
             time.sleep(0.03)
-        elif capture_now:
-            # Read every camera this view needs, and turn each frame into a
-            # finished view. In split screen the halves are composited at a
-            # reduced working width (SPLIT_WORK_MAX_W): the pipeline is the
-            # expensive part of the frame and it runs twice here.
-            views = {}
-            work_w = SPLIT_WORK_MAX_W if split else None
-            for _role in wanted:
+        elif capture_now or redraw:
+            # Read every camera this view needs - or, redrawing, take the held
+            # frames again - and turn each frame into a finished view. In split
+            # screen the halves are composited at a reduced working width
+            # (SPLIT_WORK_MAX_W): the pipeline is the expensive part of the
+            # frame and it runs twice here.
+            frames = {} if capture_now else held_frames
+            for _role in (wanted if capture_now else ()):
                 camera = caps[_role]
                 if camera is None:
                     continue
@@ -3085,11 +3100,15 @@ def run_simulation(cam_index, show_window):
                         next_open[_role] = time.monotonic() + CAMERA_RETRY_SEC
                     continue
                 cam_fails[_role] = 0
-                views[_role] = render_fluoro_view(frame, masters[_role], s, work_w)
+                frames[_role] = frame
+            work_w = SPLIT_WORK_MAX_W if split else None
+            views = {r: render_fluoro_view(frames[r], masters[r], s, work_w)
+                     for r in wanted if r in frames}
 
             if not views:
                 time.sleep(0.01)
                 continue     # transient: keep the previous frame on screen
+            held_frames, drawn_with, new_frame = frames, view_now, True
             live = True
             placeholder_key = None
 
@@ -3148,7 +3167,7 @@ def run_simulation(cam_index, show_window):
             if recorder.ensure_started(res.shape):
                 if rec_shape is None:
                     rec_shape = res.shape
-                if capture_now:
+                if new_frame:
                     # The writer is fixed at the size it opened with, so a view
                     # switch to a camera of a different resolution is scaled to
                     # match rather than silently corrupting the file.
@@ -3253,10 +3272,10 @@ def run_simulation(cam_index, show_window):
             # Static placeholder: publish the pre-encoded copy rather than
             # re-encoding the same image on every iteration.
             publish_preview(jpeg=no_camera_buf[placeholder_key])
-        elif res is not None and capture_now:
+        elif res is not None and new_frame:
             # The web MJPEG preview always streams the clean frame (the browser has
             # its own HTML buttons), so publish `res`, not the composited view.
-            # Only a newly captured frame is published: it is never drawn on
+            # Only a newly made frame is published: it is never drawn on
             # again after this, so the web thread can encode it unlocked.
             publish_preview(frame=res)
 
