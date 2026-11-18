@@ -152,7 +152,7 @@ print("\n5. On-screen buttons")
 with f.state_lock:
     f.state["lateral_available"] = False
 snap = f.get_state_snapshot()
-bar_off, bar_btns_off = f.render_control_bar(snap, 1920, True)
+bar_off, bar_btns_off = f.render_ge_bar(f.ge_panel_state(snap), 1920)
 check("control bar: no Lateral hit-box while unavailable",
       not any(n == "lateral" for (_x, _y, _w, _h, _k, n) in bar_btns_off))
 _panel_off, panel_btns_off = f.render_ge_panel(f.ge_panel_state(snap), f.GE_W, f.GE_H)
@@ -162,7 +162,7 @@ check("controls panel: no Lateral hit-box while unavailable",
 with f.state_lock:
     f.state["lateral_available"] = True
 snap = f.get_state_snapshot()
-bar_on, bar_btns_on = f.render_control_bar(snap, 1920, True)
+bar_on, bar_btns_on = f.render_ge_bar(f.ge_panel_state(snap), 1920)
 check("control bar: Lateral is pressable with two cameras",
       any(n == "lateral" for (_x, _y, _w, _h, _k, n) in bar_btns_on))
 _panel_on, panel_btns_on = f.render_ge_panel(f.ge_panel_state(snap), f.GE_W, f.GE_H)

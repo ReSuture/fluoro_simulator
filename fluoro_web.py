@@ -1438,35 +1438,6 @@ def cache_last_render(fn):
     return wrapper
 
 
-TAB_H = 44  # height of the persistent tab bar stacked on top of the FLUORO frame
-
-
-@cache_last_render
-def render_tab_bar(width, active_view, rec_elapsed=None):
-    '''Render the persistent Fluoro / Remote Access / Library tab bar.
-
-    Returns (image, buttons) with hit-boxes relative to the bar's top-left.
-    `rec_elapsed` is a "mm:ss" string shown with a red dot while recording.
-    '''
-    img = np.full((TAB_H, width, 3), C_BG, np.uint8)
-    cv.line(img, (0, TAB_H - 1), (width, TAB_H - 1), C_BTN_BD, 1, cv.LINE_AA)
-    buttons = []
-    pad, gap, bh = 5, 6, TAB_H - 10
-    tw = min(190, (width - 2 * pad - 2 * gap) // 3)
-    for i, (label, name) in enumerate([("Fluoro", "fluoro"),
-                                       ("Remote Access", "remote"),
-                                       ("Library", "library")]):
-        bx = pad + i * (tw + gap)
-        draw_button(img, bx, 5, tw, bh, label, None, active_view == name)
-        buttons.append((bx, 5, tw, bh, "tab", name))
-    if rec_elapsed is not None:
-        txt = "REC %s" % rec_elapsed
-        (tw2, th2), _ = ui_text_size(txt, 0.55)
-        cv.circle(img, (width - tw2 - 28, TAB_H // 2), 7, C_DOT_OFF, -1, cv.LINE_AA)
-        ui_put_text(img, txt, (width - tw2 - 14, (TAB_H + th2) // 2), 0.55, C_QUIT_TX)
-    return img, buttons
-
-
 def draw_text_field(img, x, y, w, h, text, focused=False, masked=False,
                     placeholder=""):
     '''Draw a clickable text field (the keyboard types into it while focused).'''
@@ -1485,14 +1456,19 @@ def draw_text_field(img, x, y, w, h, text, focused=False, masked=False,
     ui_put_text(img, shown, (x + 10, y + (h + th) // 2), 0.55, color)
 
 
-# ── Windowed mode: GE OEC-style panel and image ───────────────────────────────
-# In windowed mode the CONTROLS window is a touch panel modelled on GE's OEC
-# C-arm display - overlapping angled tabs, glossy round toggles, a big-digit
-# readout of the camera position and the fluoro time, a direction pad for
-# panning, a rocker for zoom and pill buttons for the rest - and FLUORO shows
-# the image alone. The panel is drawn at its design size, GE_W x GE_H (the
-# touch panel's tile), and scaled to fit any other window. Colours are BGR.
+# ── GE OEC-style screens ──────────────────────────────────────────────────────
+# Both modes are modelled on GE's OEC C-arm display. Windowed, the CONTROLS
+# window is a touch panel - overlapping angled tabs, glossy round toggles, a
+# big-digit readout of the camera position and the fluoro time, a direction
+# pad for panning, a rocker for zoom and pill buttons for the rest - and FLUORO
+# shows the image alone; the panel is drawn at its design size, GE_W x GE_H
+# (the touch panel's tile), and scaled to fit any other window. Fullscreen
+# stacks the image between a header strip (the tabs, window mode and Stop),
+# TAB_H tall, and a control bar of the same controls, BAR_H tall; both strips
+# are laid out for GE_FS_W, drawn wider on a wider screen and scaled down on a
+# narrower one. Colours are BGR.
 GE_W, GE_H = 450, 574
+GE_FS_W, TAB_H, BAR_H = 1024, 44, 126
 GE_BG = (14, 11, 9)
 GE_CARD = ((128, 118, 106), (98, 88, 77), (84, 75, 66))         # top, middle, bottom
 GE_TAB_ON, GE_TAB_OFF, GE_TAB_EDGE = (128, 118, 106), (66, 59, 52), (30, 26, 22)
@@ -1631,6 +1607,116 @@ def ge_panel_state(s):
     return p
 
 
+GE_TABS = (("FLUORO", "fluoro"), ("REMOTE", "remote"), ("LIBRARY", "library"))
+GE_TOGGLES = (("OVERLAY", "overlay"), ("EQUALIZE", "equalize"), ("HUD", "hud"),
+              ("PEDAL", "pedal_mode"), ("REC", "recording"))
+
+
+def _ge_tabs(img, view, x, top, bottom, tw, lap, scale, buttons):
+    '''The overlapping angled tabs from x, the selected one in front, standing
+    on a shelf at `bottom` that spans the image.'''
+    active = next((i for i, (_, n) in enumerate(GE_TABS) if n == view), 0)
+    order = sorted(range(len(GE_TABS)), key=lambda i: -abs(i - active))   # back to front
+    slant = (bottom - top) * 18 // 39
+    for i in order:
+        x0 = x + i * (tw - lap)
+        poly = np.array([(x0, bottom), (x0 + slant, top), (x0 + tw - slant, top),
+                         (x0 + tw, bottom)], np.int32)
+        cv.fillPoly(img, [poly], GE_TAB_ON if i == active else GE_TAB_OFF, cv.LINE_AA)
+        cv.polylines(img, [poly], False, GE_TAB_EDGE, 1, cv.LINE_AA)
+        _ge_text(img, GE_TABS[i][0], x0 + tw / 2.0, (top + bottom) / 2.0 + 1, tw - 48, scale,
+                 GE_WHITE if i == active else GE_MUTED, bold=(i == active))
+    img[bottom:bottom + 3] = GE_TAB_ON
+    for i in reversed(order):                   # front tab first: overlaps go to it
+        buttons.append((x + i * (tw - lap), top, tw, bottom + 3 - top, "tab", GE_TABS[i][1]))
+
+
+def _ge_toggles(img, p, x, y, w, dia, caption_dy, scale, caption_scale, buttons):
+    '''The five glossy round toggles spread across w from x, tops at y, lit
+    when on, each with ON/OFF caption_dy below its top.'''
+    gap = (w - 5 * dia) / 6.0
+    for i, (text, key) in enumerate(GE_TOGGLES):
+        bx = int(round(x + gap + i * (dia + gap)))
+        on = bool(p[key])
+        if key == "recording":
+            stops, glow = (GE_RED, GE_RED_GLOW) if on else (GE_RED_OFF, None)
+        else:
+            stops, glow = (GE_CYAN, GE_CYAN_GLOW) if on else (GE_CYAN_OFF, None)
+        _glossy(img, bx, y, dia, dia, dia // 2, stops, glow=glow, radial=True)
+        _ge_text(img, text, bx + dia / 2.0, y + dia / 2.0, dia - 12, scale,
+                 GE_WHITE if on else GE_MUTED)
+        _ge_text(img, "ON" if on else "OFF", bx + dia / 2.0, y + caption_dy, dia, caption_scale,
+                 (190, 255, 210) if on else GE_DIM, bold=False)
+        buttons.append((bx, y, dia, dia, "toggle", key))
+
+
+def _ge_readout(img, p, x, y, w, h, col, scale, buttons):
+    '''The readout band, w x h: the camera position (X, Y, Z in cm) in
+    col-wide columns, then the fluoro time with its Reset button.'''
+    d = _box_sdf(w, h, 14)
+    _blend(img, np.clip(0.5 - d, 0, 1), (10, 8, 7), x, y)
+    _blend(img, np.clip(1.2 - np.abs(d + 1.5), 0, 1), (225, 220, 214), x, y)
+    for i, (axis, key) in enumerate((("X", "pos_x_cm"), ("Y", "pos_y_cm"), ("Z", "pos_z_cm"))):
+        cx = x + i * col
+        ui_put_text(img, axis + "  cm", (cx + 0.17 * col, y + 0.26 * h), 0.4 * scale, GE_DIM)
+        val = "%d" % round(p[key])
+        (vw, _), _ = ui_text_size(val, 0.95 * scale)
+        ui_put_text(img, val, (cx + (col - vw) / 2.0 + 4 * scale, y + 0.76 * h), 0.95 * scale,
+                    GE_WHITE)
+        cv.line(img, (int(cx + col), int(y + 0.17 * h)), (int(cx + col), int(y + 0.83 * h)),
+                (70, 64, 58), 1)
+    tx = x + 3 * col
+    clock = fmt_fluoro(p["fluoro_sec"])
+    (cw, _), _ = ui_text_size(clock, 1.35 * scale)
+    ui_put_text(img, clock, (tx + 14 * scale, y + 0.74 * h), 1.35 * scale, GE_WHITE)
+    ui_put_text(img, "mm:ss", (tx + 20 * scale + cw, y + 0.74 * h), 0.4 * scale, GE_DIM)
+    bw, bh = int(58 * scale), int(24 * scale)
+    bx, by = x + w - bw - int(12 * scale), y + int(8 * scale)
+    _glossy(img, bx, by, bw, bh, bh // 2, GE_CYAN_OFF)
+    _ge_text(img, "RESET", bx + bw / 2.0, by + bh / 2.0, bw - 12 * scale, 0.36 * scale, GE_MUTED)
+    buttons.append((bx - 4, by - 4, bw + 8, bh + 8, "action", "fluoro_reset"))
+
+
+def _ge_zrocker(img, x, y, w, h, chev, scale, buttons):
+    '''The lavender Z rocker: Z+ (raise the camera) above, Z- below.'''
+    _glossy(img, x, y, w, h, w // 2, GE_LAVENDER)
+    cv.line(img, (x + w // 6, y + h // 2), (x + w - w // 6, y + h // 2), (150, 90, 84), 2, cv.LINE_AA)
+    _chevron(img, x + w / 2.0, y + 0.2 * h, chev, 270, GE_WHITE, 3 if chev > 8 else 2)
+    _chevron(img, x + w / 2.0, y + 0.8 * h, chev, 90, GE_WHITE, 3 if chev > 8 else 2)
+    _ge_text(img, "Z+", x + w / 2.0, y + 0.36 * h, w - 14, scale)
+    _ge_text(img, "Z-", x + w / 2.0, y + 0.64 * h, w - 14, scale)
+    buttons += [(x, y, w, h // 2, "pan", "zp"), (x, y + h // 2, w, h - h // 2, "pan", "zm")]
+
+
+def _ge_switch(img, x, y, w, h, on, ok):
+    '''An on/off slide switch: the knob sits right, on a lit track, when on.'''
+    d = _box_sdf(w, h, h // 2)
+    _blend(img, np.clip(0.5 - d, 0, 1),
+           GE_CYAN[1] if on else (58, 54, 50) if ok else (70, 66, 62), x, y)
+    _blend(img, np.clip(1.2 - np.abs(d + 1.2), 0, 1) * 0.6, (30, 28, 26), x, y)
+    kd = int(h * 0.81)
+    inset = (h - kd) // 2
+    kx = x + (w - kd - inset if on else inset)
+    _blend(img, np.clip(0.5 - _box_sdf(kd, kd, kd // 2), 0, 1) * 0.45, (20, 18, 16),
+           kx + 1, y + inset + 2)
+    _glossy(img, kx, y + inset, kd, kd, kd // 2, GE_KNOB if ok else GE_KNOB_OFF, radial=True)
+
+
+def _ge_lateral_caption(p):
+    '''What the Lateral view switch says under it, and in which colour.'''
+    if not p["lateral_available"]:
+        return "connect 2nd camera", GE_DIM
+    return ("ON", (190, 255, 210)) if p["lateral"] else ("OFF", GE_MUTED)
+
+
+def _ge_stop(img, x, y, w, h, scale, buttons):
+    '''The Stop simulator pill: dark red with a red rim.'''
+    _glossy(img, x, y, w, h, h // 2, GE_STOP)
+    _blend(img, np.clip(1.4 - np.abs(_box_sdf(w, h, h // 2) + 1.5), 0, 1), GE_STOP_RIM, x, y)
+    _ge_text(img, "STOP SIMULATOR", x + w / 2.0, y + h / 2.0, w - 24, scale, (190, 190, 255))
+    buttons.append((x, y, w, h, "action", "stop"))
+
+
 @cache_last_render
 def render_ge_panel(p, width, height):
     '''The windowed CONTROLS panel, GE OEC style, fitted into width x height.
@@ -1641,113 +1727,42 @@ def render_ge_panel(p, width, height):
     w, h, m = GE_W, GE_H, 12
     img = np.full((h, w, 3), GE_BG, np.uint8)
     buttons = []
-
-    # Tabs: overlapping angled tabs on black, the selected one in front.
-    tw, lap = 162, 26
-    tabs = (("FLUORO", "fluoro"), ("REMOTE", "remote"), ("LIBRARY", "library"))
-    active = next((i for i, (_, n) in enumerate(tabs) if n == p["ui_view"]), 0)
-    order = sorted(range(len(tabs)), key=lambda i: -abs(i - active))   # back to front
-    for i in order:
-        x0 = 8 + i * (tw - lap)
-        poly = np.array([(x0, 47), (x0 + 18, 8), (x0 + tw - 18, 8), (x0 + tw, 47)], np.int32)
-        cv.fillPoly(img, [poly], GE_TAB_ON if i == active else GE_TAB_OFF, cv.LINE_AA)
-        cv.polylines(img, [poly], False, GE_TAB_EDGE, 1, cv.LINE_AA)
-        _ge_text(img, tabs[i][0], x0 + tw / 2.0, 29, tw - 48, 0.55,
-                 GE_WHITE if i == active else GE_MUTED, bold=(i == active))
-    img[47:50] = GE_TAB_ON                      # the shelf the selected tab sits on
-    for i in reversed(order):                   # front tab first: overlaps go to it
-        buttons.append((8 + i * (tw - lap), 8, tw, 42, "tab", tabs[i][1]))
+    _ge_tabs(img, p["ui_view"], 8, 8, 47, 162, 26, 0.55, buttons)
 
     # Imaging toggles: glossy round buttons, lit when on.
     y = 56
     _ge_card(img, m, y, w - 2 * m, 106)
-    dia = 70
-    gap = (w - 2 * m - 5 * dia) / 6.0
-    for i, (text, key) in enumerate((("OVERLAY", "overlay"), ("EQUALIZE", "equalize"),
-                                     ("HUD", "hud"), ("PEDAL", "pedal_mode"),
-                                     ("REC", "recording"))):
-        bx = int(round(m + gap + i * (dia + gap)))
-        on = bool(p[key])
-        if key == "recording":
-            stops, glow = (GE_RED, GE_RED_GLOW) if on else (GE_RED_OFF, None)
-        else:
-            stops, glow = (GE_CYAN, GE_CYAN_GLOW) if on else (GE_CYAN_OFF, None)
-        _glossy(img, bx, y + 10, dia, dia, dia // 2, stops, glow=glow, radial=True)
-        _ge_text(img, text, bx + dia / 2.0, y + 10 + dia / 2.0, dia - 12, 0.5,
-                 GE_WHITE if on else GE_MUTED)
-        _ge_text(img, "ON" if on else "OFF", bx + dia / 2.0, y + 94, dia, 0.38,
-                 (190, 255, 210) if on else GE_DIM, bold=False)
-        buttons.append((bx, y + 10, dia, dia, "toggle", key))
+    _ge_toggles(img, p, m, y + 10, w - 2 * m, 70, 84, 0.5, 0.38, buttons)
 
     # Readout: the camera position and the fluoro time in big digits.
     y += 106 + 10
-    rw, rh = w - 2 * m, 84
-    d = _box_sdf(rw, rh, 14)
-    _blend(img, np.clip(0.5 - d, 0, 1), (10, 8, 7), m, y)
-    _blend(img, np.clip(1.2 - np.abs(d + 1.5), 0, 1), (225, 220, 214), m, y)
-    col = 80
-    for i, (axis, key) in enumerate((("X", "pos_x_cm"), ("Y", "pos_y_cm"), ("Z", "pos_z_cm"))):
-        x0 = m + i * col
-        ui_put_text(img, axis + "  cm", (x0 + 14, y + 22), 0.4, GE_DIM)
-        val = "%d" % round(p[key])
-        (vw, _), _ = ui_text_size(val, 0.95)
-        ui_put_text(img, val, (x0 + (col - vw) / 2.0 + 4, y + 64), 0.95, GE_WHITE)
-        cv.line(img, (x0 + col, y + 14), (x0 + col, y + rh - 14), (70, 64, 58), 1)
-    tx = m + 3 * col
-    clock = fmt_fluoro(p["fluoro_sec"])            # the fluoro time
-    (cw, _), _ = ui_text_size(clock, 1.35)
-    ui_put_text(img, clock, (tx + 14, y + 62), 1.35, GE_WHITE)
-    ui_put_text(img, "mm:ss", (tx + 20 + cw, y + 62), 0.4, GE_DIM)
-    bx, bw, bh = m + rw - 70, 58, 24
-    _glossy(img, bx, y + 8, bw, bh, bh // 2, GE_CYAN_OFF)
-    _ge_text(img, "RESET", bx + bw / 2.0, y + 8 + bh / 2.0, bw - 12, 0.36, GE_MUTED)
-    buttons.append((bx - 4, y + 4, bw + 8, bh + 8, "action", "fluoro_reset"))
+    _ge_readout(img, p, m, y, w - 2 * m, 84, 80, 1.0, buttons)
 
     # Movement: the direction pad for X/Y, a rocker for Z, and Lateral view.
-    y += rh + 10
+    y += 84 + 10
     mh = 196
     _ge_card(img, m, y, w - 2 * m, mh)
     R = 84
     _ge_dpad(img, m + 16 + R, y + mh // 2, R, buttons)
     zx, zw, zh = m + 16 + 2 * R + 22, 62, 172
     zy = y + (mh - zh) // 2
-    _glossy(img, zx, zy, zw, zh, zw // 2, GE_LAVENDER)
-    cv.line(img, (zx + 10, zy + zh // 2), (zx + zw - 10, zy + zh // 2), (150, 90, 84), 2, cv.LINE_AA)
-    _chevron(img, zx + zw / 2.0, zy + 34, 11, 270, GE_WHITE, 3)
-    _chevron(img, zx + zw / 2.0, zy + zh - 34, 11, 90, GE_WHITE, 3)
-    _ge_text(img, "Z+", zx + zw / 2.0, zy + 62, zw - 14, 0.45)
-    _ge_text(img, "Z-", zx + zw / 2.0, zy + zh - 62, zw - 14, 0.45)
-    buttons += [(zx, zy, zw, zh // 2, "pan", "zp"),
-                (zx, zy + zh // 2, zw, zh - zh // 2, "pan", "zm")]
-    # Lateral view: an on/off switch on a grey plate - the knob slides right and
-    # the track lights up while the split view is on. Dimmed, and unpressable,
+    _ge_zrocker(img, zx, zy, zw, zh, 11, 0.45, buttons)
+    # Lateral view: an on/off switch on a grey plate, dimmed and unpressable
     # with fewer than two cameras; the whole plate is the hit area.
     lx = zx + zw + 16
     lw = w - m - 16 - lx
-    lat_ok, lat_on = bool(p["lateral_available"]), bool(p["lateral"])
+    lat_ok = bool(p["lateral_available"])
     _blend(img, np.clip(0.5 - _box_sdf(lw, zh, 20), 0, 1),
            _shade(lw, zh, GE_GREY if lat_ok else GE_GREY_OFF, False), lx, zy)
     text_c = GE_WHITE if lat_ok else GE_DIM
     _ge_text(img, "LATERAL", lx + lw / 2.0, zy + 34, lw - 16, 0.55, text_c)
     _ge_text(img, "VIEW", lx + lw / 2.0, zy + 58, lw - 16, 0.55, text_c)
-    tw, th = 84, 42                                 # the switch's track...
-    tx, ty = lx + (lw - tw) // 2, zy + 84
-    d = _box_sdf(tw, th, th // 2)
-    _blend(img, np.clip(0.5 - d, 0, 1),
-           GE_CYAN[1] if lat_on else (58, 54, 50) if lat_ok else (70, 66, 62), tx, ty)
-    _blend(img, np.clip(1.2 - np.abs(d + 1.2), 0, 1) * 0.6, (30, 28, 26), tx, ty)
-    kd = th - 8                                     # ...and its knob
-    kx = tx + (tw - kd - 4 if lat_on else 4)
-    _blend(img, np.clip(0.5 - _box_sdf(kd, kd, kd // 2), 0, 1) * 0.45, (20, 18, 16),
-           kx + 1, ty + 6)
-    _glossy(img, kx, ty + 4, kd, kd, kd // 2, GE_KNOB if lat_ok else GE_KNOB_OFF, radial=True)
+    _ge_switch(img, lx + (lw - 84) // 2, zy + 84, 84, 42, bool(p["lateral"]), lat_ok)
+    cap, cap_c = _ge_lateral_caption(p)
+    _ge_text(img, cap, lx + lw / 2.0, zy + zh - 22, lw - 16, 0.42 if lat_ok else 0.36, cap_c,
+             bold=False)
     if lat_ok:
-        _ge_text(img, "ON" if lat_on else "OFF", lx + lw / 2.0, zy + zh - 22, lw - 16, 0.42,
-                 (190, 255, 210) if lat_on else GE_MUTED, bold=False)
         buttons.append((lx, zy, lw, zh, "toggle", "lateral"))
-    else:
-        _ge_text(img, "connect 2nd camera", lx + lw / 2.0, zy + zh - 22, lw - 16, 0.36, GE_DIM,
-                 bold=False)
 
     # Window mode, a pair of radio options like GE's NORM / MAG, and Stop.
     y += mh + 10
@@ -1761,12 +1776,7 @@ def render_ge_panel(p, width, height):
             cv.circle(img, (m + 28, ry), 5, GE_WHITE, -1, cv.LINE_AA)
         ui_put_text(img, text, (m + 46, ry + 6), 0.5, GE_WHITE if on else GE_MUTED, 2 if on else 1)
         buttons.append((m + 12, ry - 16, 170, 32, "action", name))
-    sx, sw, sh = m + 196, w - 2 * m - 196 - 14, 50
-    sy = y + (ch - sh) // 2
-    _glossy(img, sx, sy, sw, sh, sh // 2, GE_STOP)
-    _blend(img, np.clip(1.4 - np.abs(_box_sdf(sw, sh, sh // 2) + 1.5), 0, 1), GE_STOP_RIM, sx, sy)
-    _ge_text(img, "STOP SIMULATOR", sx + sw / 2.0, sy + sh / 2.0, sw - 30, 0.5, (190, 190, 255))
-    buttons.append((sx, sy, sw, sh, "action", "stop"))
+    _ge_stop(img, m + 196, y + (ch - 50) // 2, w - 2 * m - 196 - 14, 50, 0.5, buttons)
 
     # Fit the design-size panel into the window.
     k = min(width / float(w), height / float(h))
@@ -1778,35 +1788,38 @@ def render_ge_panel(p, width, height):
     return img, buttons
 
 
-def render_ge_image(src, side, s, logo, split, pedal_down, live, rec_elapsed):
-    '''FLUORO's picture in windowed mode, side x side: the frame's centre
-    square - the field and nothing else; the split view is letterboxed whole -
-    with the logo and GE-style corner notes (the HUD's, while it is on).'''
+def render_ge_image(src, width, height, s, logo, split, pedal_down, live, rec_elapsed):
+    '''The picture at width x height, GE style: no HUD text on it - the logo
+    and the HUD's notes sit in its corners instead. A frame wider than the
+    space is cut to its centre (the field is square), so windowed mode's
+    square shows the field alone; otherwise - and always for the split view -
+    it is letterboxed whole, with the notes in the black beside it.'''
     if src is None:
-        return np.zeros((side, side, 3), np.uint8)
+        return np.zeros((height, width, 3), np.uint8)
     bgr = cv.cvtColor(src, cv.COLOR_GRAY2BGR) if src.ndim == 2 else src
     h, w = bgr.shape[:2]
-    if split or w <= h:
-        img = fit_frame(bgr, side, side)
+    if not split and w * height > h * width:
+        cw = int(round(h * width / float(height)))
+        x0 = (w - cw) // 2
+        img = cv.resize(bgr[:, x0:x0 + cw], (width, height), interpolation=cv.INTER_LINEAR)
     else:
-        x0 = (w - h) // 2
-        img = cv.resize(bgr[:, x0:x0 + h], (side, side), interpolation=cv.INTER_LINEAR)
+        img = fit_frame(bgr, width, height)
     if logo is not None:
-        paste_rgba(img, logo, 12, 12, max(60, side // 6))
-    cv.circle(img, (side - 18, 18), 6, C_DOT_ON if live else C_DOT_OFF, -1, cv.LINE_AA)
+        paste_rgba(img, logo, 14, 14, min(120, max(60, width // 6)))
+    cv.circle(img, (width - 20, 20), 6, C_DOT_ON if live else C_DOT_OFF, -1, cv.LINE_AA)
     if rec_elapsed is not None:
         txt = "REC %s" % rec_elapsed
         (tw, th), _ = ui_text_size(txt, 0.5)
-        cv.circle(img, (side - 52 - tw, 18), 6, C_DOT_OFF, -1, cv.LINE_AA)
-        ui_put_text(img, txt, (side - 38 - tw, 18 + th // 2), 0.5, C_QUIT_TX)
+        cv.circle(img, (width - 54 - tw, 20), 6, C_DOT_OFF, -1, cv.LINE_AA)
+        ui_put_text(img, txt, (width - 40 - tw, 20 + th // 2), 0.5, C_QUIT_TX)
     if s["hud"]:
         note = "PEDAL ACTIVE" if pedal_down else ("PEDAL MODE" if s["pedal_mode"] else "")
         if note:
-            ui_put_text(img, note, (14, side - 16), 0.5, GE_YELLOW)
+            ui_put_text(img, note, (16, height - 16), 0.5, GE_YELLOW)
         zoom = ZOOM_REF_CM / max(0.05 * ZOOM_REF_CM, ZOOM_REF_CM + FLIP_Z * s["pos_z_cm"])
         mag = "%.2fx" % zoom
         (zw, _), _ = ui_text_size(mag, 0.5)
-        ui_put_text(img, mag, (side - zw - 14, side - 16), 0.5, GE_MUTED)
+        ui_put_text(img, mag, (width - zw - 16, height - 16), 0.5, GE_MUTED)
     return img
 
 
@@ -1831,72 +1844,89 @@ def render_tab_view(view, s, width, height):
     return canvas, vbtns
 
 
-def ui_snapshot(s):
-    '''The state for the cached fullscreen strips: all of it but the fluoro
-    time, which changes every frame while the beam is on and would otherwise
-    force a redraw each time.'''
-    return {k: v for k, v in s.items() if k != "fluoro_sec"}
-
-
-# Control-bar geometry, shared with the Remote Access / Library views so their
-# canvases match the fluoro composite's height exactly (no window resizing).
-BAR_PAD, BAR_GAP, BAR_BH = 6, 6, 34
-BAR_H = BAR_PAD + 3 * BAR_BH + 2 * BAR_GAP + BAR_PAD  # 3 rows: toggles, actions, location
+def _ge_fit(img, buttons, width):
+    '''Scale a design-width strip, and its hit-boxes, down to `width`.'''
+    k = width / float(img.shape[1])
+    img = cv.resize(img, (width, max(1, int(round(img.shape[0] * k)))), interpolation=cv.INTER_AREA)
+    return img, [(int(x * k), int(y * k), int(w * k), int(h * k), kind, name)
+                 for (x, y, w, h, kind, name) in buttons]
 
 
 @cache_last_render
-def render_control_bar(s, width, live):
-    '''Render a short, full-width control strip stacked below the video in fullscreen.
-
-    Returns (image, buttons) with hit-boxes relative to the bar's top-left.
-    '''
-    pad, gap, bh = BAR_PAD, BAR_GAP, BAR_BH
-    bar_h = BAR_H
-    img = np.full((bar_h, width, 3), C_BG, np.uint8)
-    cv.line(img, (0, 0), (width, 0), C_BTN_BD, 1, cv.LINE_AA)
+def render_ge_header(p, width, rec_elapsed):
+    '''Fullscreen's top strip, TAB_H tall: the overlapping tabs on the left;
+    the Fullscreen | Windowed switch and Stop on the right, with the
+    recording's time between while one runs. -> (image, buttons)'''
+    W = max(width, GE_FS_W)
+    img = np.full((TAB_H, W, 3), GE_BG, np.uint8)
     buttons = []
+    _ge_tabs(img, p["ui_view"], 8, 6, TAB_H - 3, 150, 24, 0.5, buttons)
+    sw, sh = 168, 30
+    sx, sy = W - 8 - sw, 6
+    _ge_stop(img, sx, sy, sw, sh, 0.42, buttons)
+    segw = 116                                  # the two halves of the window switch
+    gx = sx - 14 - 2 * segw
+    _blend(img, np.clip(0.5 - _box_sdf(2 * segw, sh, sh // 2), 0, 1), (40, 36, 32), gx, sy)
+    hx = gx if p["fullscreen"] else gx + segw
+    _blend(img, np.clip(0.5 - _box_sdf(segw, sh, sh // 2), 0, 1),
+           _shade(segw, sh, GE_CARD, False), hx, sy)
+    for k, (text, name) in enumerate((("FULLSCREEN", "fullscreen"), ("WINDOWED", "windowed"))):
+        sel = (k == 0) == bool(p["fullscreen"])
+        _ge_text(img, text, gx + segw * (k + 0.5), sy + sh / 2.0, segw - 20, 0.4,
+                 GE_WHITE if sel else GE_DIM, bold=sel)
+        buttons.append((gx + k * segw, sy, segw, sh, "action", name))
+    if rec_elapsed is not None:
+        txt = "REC %s" % rec_elapsed
+        (rw, rh), _ = ui_text_size(txt, 0.5)
+        rx = gx - 24 - rw
+        cv.circle(img, (rx - 14, TAB_H // 2), 6, C_DOT_OFF, -1, cv.LINE_AA)
+        ui_put_text(img, txt, (rx, TAB_H // 2 + rh // 2), 0.5, C_QUIT_TX)
+    return _ge_fit(img, buttons, width) if W != width else (img, buttons)
 
-    toggles = [("Overlay", "overlay"), ("Equalize", "equalize"),
-               ("HUD", "hud"), ("Pedal mode", "pedal_mode"),
-               ("Record", "recording")]
-    cw = (width - 2 * pad - 4 * gap) // 5
-    y = pad
-    for i, (label, key) in enumerate(toggles):
-        bx = pad + i * (cw + gap)
-        on = bool(s[key])
-        draw_button(img, bx, y, cw, bh, label, None, on,
-                    "quit" if key == "recording" and on else "normal")
-        buttons.append((bx, y, cw, bh, "toggle", key))
 
-    y += bh + gap
-    aw = (width - 2 * pad - 3 * gap) // 4
-    lat_ok = bool(s["lateral_available"])
-    draw_button(img, pad, y, aw, bh, "Lateral view", None, bool(s["lateral"]),
-                "normal" if lat_ok else "disabled")
+@cache_last_render
+def render_ge_bar(p, width):
+    '''Fullscreen's control bar, BAR_H tall: slate cards for the round
+    toggles, the readout, the direction pad with the Z rocker, and the
+    Lateral view switch. Laid out for GE_FS_W: centred on a wider screen and
+    scaled down on a narrower one. -> (image, buttons)'''
+    W = max(width, GE_FS_W)
+    img = np.full((BAR_H, W, 3), GE_BG, np.uint8)
+    buttons = []
+    m, gap, y = 8, 8, 8
+    ch = BAR_H - 2 * y
+    x = (W - GE_FS_W) // 2 + m
+
+    aw = 374                                    # toggles
+    _ge_card(img, x, y, aw, ch)
+    _ge_toggles(img, p, x, y + 10, aw, 62, 87, 0.45, 0.34, buttons)
+    x += aw + gap
+
+    rw = 296                                    # readout
+    _ge_card(img, x, y, rw, ch)
+    _ge_readout(img, p, x + 8, y + 8, rw - 16, ch - 16, 46, 0.8, buttons)
+    x += rw + gap
+
+    mw = 176                                    # direction pad + Z rocker
+    _ge_card(img, x, y, mw, ch)
+    R = 50
+    _ge_dpad(img, x + 10 + R, y + ch // 2, R, buttons)
+    _ge_zrocker(img, x + 10 + 2 * R + 14, y + 7, 38, ch - 14, 7, 0.34, buttons)
+    x += mw + gap
+
+    lw = (W - GE_FS_W) // 2 + GE_FS_W - m - x  # Lateral view switch
+    lat_ok = bool(p["lateral_available"])
+    _blend(img, np.clip(0.5 - _box_sdf(lw, ch, 14), 0, 1),
+           _shade(lw, ch, GE_GREY if lat_ok else GE_GREY_OFF, False), x, y)
+    _ge_text(img, "LATERAL VIEW", x + lw / 2.0, y + 20, lw - 16, 0.42,
+             GE_WHITE if lat_ok else GE_DIM)
+    _ge_switch(img, x + (lw - 70) // 2, y + 38, 70, 34, bool(p["lateral"]), lat_ok)
+    cap, cap_c = _ge_lateral_caption(p)
+    _ge_text(img, cap, x + lw / 2.0, y + ch - 13, lw - 14, 0.34 if lat_ok else 0.3, cap_c,
+             bold=False)
     if lat_ok:
-        buttons.append((pad, y, aw, bh, "action", "lateral"))
-    draw_button(img, pad + aw + gap, y, aw, bh, "Fullscreen", None, s["fullscreen"])
-    buttons.append((pad + aw + gap, y, aw, bh, "action", "fullscreen"))
-    draw_button(img, pad + 2 * (aw + gap), y, aw, bh, "Windowed", None, not s["fullscreen"])
-    buttons.append((pad + 2 * (aw + gap), y, aw, bh, "action", "windowed"))
-    draw_button(img, pad + 3 * (aw + gap), y, aw, bh, "Stop simulator", None, False, "quit")
-    buttons.append((pad + 3 * (aw + gap), y, aw, bh, "action", "stop"))
-
-    # Row 3: background-location readout + nudge buttons (X−/X+/Y−/Y+/Z−/Z+).
-    y += bh + gap
-    cap = "Bg  X %.0f  Y %.0f  Z %.0f cm" % (
-        s["pos_x_cm"], s["pos_y_cm"], s["pos_z_cm"])
-    cap_w = 240
-    (_, caph), _ = ui_text_size(cap, 0.5)
-    ui_put_text(img, cap, (pad, y + (bh + caph) // 2), 0.5, C_SUBTEXT)
-    pw = (width - 2 * pad - cap_w - 5 * gap) // 6
-    x = pad + cap_w
-    for (label, name) in [("X-", "xm"), ("X+", "xp"), ("Y-", "ym"),
-                          ("Y+", "yp"), ("Z-", "zm"), ("Z+", "zp")]:
-        draw_button(img, x, y, pw, bh, label, None, False)
-        buttons.append((x, y, pw, bh, "pan", name))
-        x += pw + gap
-    return img, buttons
+        buttons.append((x, y, lw, ch, "toggle", "lateral"))
+    return _ge_fit(img, buttons, width) if W != width else (img, buttons)
 
 
 def fit_frame(vid, W, H):
@@ -3016,9 +3046,10 @@ def run_simulation(cam_index, show_window):
             else:
                 res = views["main"]
 
-            # Windowed, FLUORO shows the field alone and puts its own notes in
-            # the corners, so it takes the frame from before the HUD text.
-            res_plain = None if s["fullscreen"] else res.copy()
+            # On screen the field gets GE-style notes in its corners instead
+            # of the HUD text, so the screen takes the frame from before it;
+            # recordings and the web preview keep the HUD text.
+            res_plain = res.copy()
             if s["hud"]:
                 draw_str(res, (20, 20), "Overlay:%s  Equalize:%s" %
                          (s["overlay"], s["equalize"]))
@@ -3098,7 +3129,7 @@ def run_simulation(cam_index, show_window):
                     side, (pw, ph) = (res.shape[0] if res is not None else 480), (GE_W, GE_H)
                 if view == "fluoro":
                     canvas, vbtns = render_ge_image(
-                        res if res_plain is None else res_plain, side, s, logo, split,
+                        res if res_plain is None else res_plain, side, side, s, logo, split,
                         pedal_down, live, rec_elapsed), []
                 else:
                     canvas, vbtns = render_tab_view(view, s, side, side)
@@ -3113,42 +3144,43 @@ def run_simulation(cam_index, show_window):
                 with state_lock:
                     state["ui_view"] = "fluoro"
         elif show_window and view != "fluoro":
-            # Remote Access / Library replace the video area under the tab
-            # bar; the capture pipeline above keeps running so the preview
-            # stays live and switching back is instant. A failure in tab code
-            # must never take down the sim: fall back to the Fluoro view.
+            # Remote Access / Library replace the image and the control bar
+            # under the header strip; the capture pipeline above keeps running
+            # so the preview stays live and switching back is instant. A
+            # failure in tab code must never take down the sim: fall back to
+            # the Fluoro view.
             try:
                 fh, fw = res.shape[:2] if res is not None else (480, 640)
+                vw = SCREEN_SIZE[0] if SCREEN_SIZE else fw
+                head, hbtns = render_ge_header(ge_panel_state(s), vw, rec_elapsed)
                 if SCREEN_SIZE:
-                    vw, canvas_h = SCREEN_SIZE[0], SCREEN_SIZE[1] - TAB_H
-                else:
-                    vw, canvas_h = fw, fh + BAR_H
+                    canvas_h = SCREEN_SIZE[1] - head.shape[0]
+                else:   # as tall as the fluoro view: its frame plus the bar
+                    canvas_h = fh + render_ge_bar(ge_panel_state(s), vw)[0].shape[0]
                 canvas, vbtns = render_tab_view(view, s, vw, canvas_h)
-                tab, tbtns = render_tab_bar(vw, view, rec_elapsed)
-                tab_buttons[:] = tbtns
-                view_buttons[:] = [(x, y + TAB_H, w, h, k, n)
+                tab_buttons[:] = hbtns
+                view_buttons[:] = [(x, y + head.shape[0], w, h, k, n)
                                    for (x, y, w, h, k, n) in vbtns]
-                cv.imshow("FLUORO", np.vstack([tab, canvas]))
+                cv.imshow("FLUORO", np.vstack([head, canvas]))
             except Exception:
                 traceback.print_exc()
                 with state_lock:
                     state["ui_view"] = "fluoro"
         elif res is not None and show_window:
-            vid = cv.cvtColor(res, cv.COLOR_GRAY2BGR) if res.ndim == 2 else res
-            if SCREEN_SIZE:
-                # Compose natively at the display resolution: the video is
-                # letterboxed (not stretched) between the tab bar and the
-                # control bar, and every pixel/tap maps 1:1 to the screen.
-                sw, sh = SCREEN_SIZE
-                vid = fit_frame(vid, sw, sh - TAB_H - BAR_H)
-            tab, tbtns = render_tab_bar(vid.shape[1], view, rec_elapsed)
-            tab_buttons[:] = tbtns
-            # Stack the video between the tab bar and a thin control bar.
-            bar, bbtns = render_control_bar(ui_snapshot(s), vid.shape[1], live)
-            composite = np.vstack([tab, vid, bar])
-            overlay_buttons[:] = [(x, y + TAB_H + vid.shape[0], w, h, k, n)
+            # The image between the header strip and the control bar. With
+            # --screen it is composed natively at the display resolution -
+            # letterboxed, not stretched - so every pixel and tap maps 1:1.
+            p = ge_panel_state(s)
+            width = SCREEN_SIZE[0] if SCREEN_SIZE else res.shape[1]
+            head, hbtns = render_ge_header(p, width, rec_elapsed)
+            bar, bbtns = render_ge_bar(p, width)
+            vid_h = (SCREEN_SIZE[1] - head.shape[0] - bar.shape[0]) if SCREEN_SIZE else res.shape[0]
+            vid = render_ge_image(res if res_plain is None else res_plain, width, vid_h, s, logo,
+                                  split, pedal_down, live, None)
+            tab_buttons[:] = hbtns
+            overlay_buttons[:] = [(x, y + head.shape[0] + vid_h, w, h, k, n)
                                   for (x, y, w, h, k, n) in bbtns]
-            cv.imshow("FLUORO", composite)
+            cv.imshow("FLUORO", np.vstack([head, vid, bar]))
         if placeholder_key and no_camera_buf.get(placeholder_key) is not None:
             # Static placeholder: publish the pre-encoded copy rather than
             # re-encoding the same image on every iteration.

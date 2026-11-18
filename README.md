@@ -218,8 +218,10 @@ panel.
 
 ### Fullscreen and windowed layouts
 
-**Fullscreen** stacks the video between the tab bar (Fluoro / Remote Access /
-Library) and a three-row control bar. **Windowed** is modelled on GE's OEC
+**Fullscreen**, in the same GE style, stacks the image between a header strip -
+the overlapping tabs, a Fullscreen | Windowed switch and Stop - and a control bar
+of slate cards: the round toggles, the readout, a small direction pad with the
+Z rocker, and the Lateral view switch. **Windowed** is modelled on GE's OEC
 C-arm display: the image fills a square window on the left - the field alone,
 with the logo and small corner notes - and a touch panel fills the rest:
 
