@@ -48,9 +48,7 @@ a { color: #9ecbff; }
            padding: 9px 14px 9px 10px; border-radius: 8px; border: 1px solid #26323f;
            background: #131a22; color: #e7edf3;
            transition: background .12s, border-color .12s, color .12s; }
-.backbtn svg { width: 16px; height: 16px; flex: none; color: #7af0b6; fill: none;
-               stroke: currentColor; stroke-width: 2; stroke-linecap: round;
-               stroke-linejoin: round; }
+.backbtn svg { flex: none; color: #7af0b6; }  /* size and stroke: attributes in the markup */
 .backbtn:hover { border-color: #12b76a; background: #103b2a; color: #7af0b6; }
 .backbtn:focus-visible { outline: 2px solid #12b76a; outline-offset: 2px; }
 .backbtn:active { transform: translateY(1px); }

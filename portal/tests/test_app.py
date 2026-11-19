@@ -106,6 +106,17 @@ def test_unauthenticated_request_is_rejected(client):
     assert client.get("/").status_code == 401
 
 
+def test_stylesheet_url_carries_its_content_version(client, app):
+    # Cloudflare has browsers keep /static files for hours, so a changed
+    # style.css has to arrive under a new URL.
+    import hashlib
+    import os
+    with open(os.path.join(app.static_folder, "style.css"), "rb") as fh:
+        version = hashlib.sha256(fh.read()).hexdigest()[:10]
+    html = client.get("/", headers=CUSTOMER).get_data(as_text=True)
+    assert "/static/style.css?v=%s" % version in html
+
+
 def test_customer_sees_assigned_device(client):
     _provision(client)
     client.post("/admin/devices/abc123/assign",

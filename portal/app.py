@@ -41,6 +41,17 @@ def create_app():
     db.init_db()
     app.teardown_appcontext(db.close_db)
 
+    # Version the stylesheet's URL by its content. Cloudflare's Browser Cache
+    # TTL tells browsers to keep /static files for 4 hours whatever this app
+    # sends, so a changed style.css under the same URL would reach returning
+    # visitors hours after the HTML it belongs with.
+    try:
+        with open(os.path.join(app.static_folder, "style.css"), "rb") as fh:
+            css_version = hashlib.sha256(fh.read()).hexdigest()[:10]
+    except OSError:
+        css_version = "0"
+    app.jinja_env.globals["css_version"] = css_version
+
     # ── CSRF (admin forms) ────────────────────────────────────────────────────
 
     def csrf_token():
