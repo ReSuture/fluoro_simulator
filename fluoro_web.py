@@ -93,7 +93,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 import numpy as np
 import cv2 as cv
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
 
 import device_setup
 import recording
@@ -645,162 +645,366 @@ PAGE = """
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>NAVISLab Controls</title>
 <style>
-  :root { color-scheme: dark; }
+  /* The device's own controls as its touch screen draws them, GE OEC style:
+     the colours are the GE_* palette and the shapes the _ge_* helpers in
+     fluoro_web.py (glossy = a three-stop gradient, a light rim, a sheen). */
+  @font-face { font-family: "Nunito Sans"; src: url("/ui-font.ttf") format("truetype");
+               font-weight: 200 1000; font-stretch: 75% 125%; font-display: swap; }
+  :root {
+    color-scheme: dark;
+    --bg: #090b0e; --white: #ffffff; --muted: #b8c0c8; --dim: #868e96; --oncap: #d2ffbe;
+    --card: linear-gradient(#6a7680, #4d5862 50%, #424b54);
+    --tab-on: #6a7680; --tab-off: #343b42;
+    --yellow: #f5d728; --live: #12b76a; --dead: #f04438;
+    --cyan: radial-gradient(circle at 38% 30%, #80d6ec 0%, #20a0c8 42.5%, #06527e 85%);
+    --cyan-off: radial-gradient(circle at 38% 30%, #5096aa 0%, #266278 42.5%, #143846 85%);
+    --red: radial-gradient(circle at 38% 30%, #ff9696 0%, #e64646 42.5%, #961e1e 85%);
+    --red-off: radial-gradient(circle at 38% 30%, #aa6e78 0%, #824650 42.5%, #5a2d32 85%);
+  }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-  body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-         background: #0b0f14; color: #e7edf3; }
-  header { padding: 18px 16px; display: flex; flex-direction: column; align-items: center; gap: 10px;
-           border-bottom: 1px solid #1d2733; position: sticky; top: 0; background: #0b0f14; }
-  header .titlerow { display: flex; align-items: center; gap: 10px; }
-  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
-  header img.logo { width: min(520px, 88%); height: auto; display: block; }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: #f04438; }
-  .dot.live { background: #12b76a; box-shadow: 0 0 8px #12b76a; }
-  main { padding: 16px; max-width: 720px; margin: 0 auto; }
-  .preview { width: 100%; background: #000; border-radius: 12px; overflow: hidden;
-             border: 1px solid #1d2733; aspect-ratio: 4 / 3; display: flex; }
-  .preview img { width: 100%; height: 100%; object-fit: contain; }
-  /* Fullscreen: stack the video on top (filling the available space) and a
-     compact, full-width control strip below it — the controls never cover the
-     video, and the video only loses the strip's height. Leaving fullscreen
-     returns everything to the normal stacked layout. */
-  .stage:fullscreen, .stage:-webkit-full-screen {
-      display: flex; flex-direction: column; width: 100vw; height: 100vh; background: #000; }
-  .stage:fullscreen .preview, .stage:-webkit-full-screen .preview {
-      flex: 1 1 auto; min-height: 0; width: 100%;
-      border: 0; border-radius: 0; aspect-ratio: auto; }
-  .stage:fullscreen .panel, .stage:-webkit-full-screen .panel {
-      flex: 0 0 auto; padding: 10px 12px; background: #0b0f14; border-top: 1px solid #1d2733; }
-  /* Lay the buttons out horizontally so the strip stays short. */
-  .stage:fullscreen .panel .grid, .stage:-webkit-full-screen .panel .grid {
-      grid-template-columns: repeat(5, 1fr); margin-top: 0; }
-  .stage:fullscreen .panel .actions, .stage:-webkit-full-screen .panel .actions {
-      grid-template-columns: repeat(4, 1fr); margin-top: 8px; }
-  .stage:fullscreen .panel button, .stage:-webkit-full-screen .panel button {
-      padding: 10px 8px; font-size: 14px; }
-  .stage:fullscreen .panel button.quit, .stage:-webkit-full-screen .panel button.quit,
-  .stage:fullscreen .panel button.rec, .stage:-webkit-full-screen .panel button.rec {
-      grid-column: auto; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 16px; }
-  /* Five toggles in two columns: Record, the odd one out, takes the last row. */
-  .grid button.rec { grid-column: 1 / -1; }
-  button { font-size: 16px; padding: 16px 12px; border-radius: 12px; border: 1px solid #26323f;
-           background: #131a22; color: #e7edf3; cursor: pointer; font-weight: 600;
-           transition: background .12s, border-color .12s; }
-  button:active { transform: translateY(1px); }
-  button.on { background: #103b2a; border-color: #12b76a; color: #7af0b6; }
-  button.rec.on { background: #3b1013; border-color: #f04438; color: #ff9a9a; }
-  button.toggle .st { display: block; font-size: 12px; font-weight: 500; opacity: .7; margin-top: 2px; }
-  .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
-  button.quit { background: #2a1416; border-color: #5b2327; color: #ff9a9a; }
-  button.quit.on { background: #3b1013; border-color: #f04438; }
-  .hint { color: #7d8a99; font-size: 12px; margin: 14px 2px 0; }
-  .warn { color: #ff9a9a; background: #2a1416; border: 1px solid #5b2327;
-          border-radius: 8px; padding: 10px 12px; font-size: 13px; margin: 12px 0 0; }
-  .viewbtn { width: 100%; margin-top: 16px; }
-  .panel button[disabled] { opacity: 0.4; cursor: not-allowed; }
-  .liblink { color: #7af0b6; font-size: 14px; font-weight: 600; text-decoration: none;
-             border: 1px solid #26323f; border-radius: 999px; padding: 6px 16px; }
-  .liblink:active { transform: translateY(1px); }
-  .posctl { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
-  .posctl label { display: flex; align-items: center; gap: 6px; color: #7d8a99; font-size: 14px; }
-  .posctl input { width: 90px; font-size: 16px; padding: 12px 10px; border-radius: 10px;
-                  border: 1px solid #26323f; background: #131a22; color: #e7edf3; }
-  .posctl button { padding: 12px 18px; }
+  html, body { margin: 0; background: var(--bg); color: var(--white);
+               font-family: "Nunito Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  button { font: inherit; color: inherit; border: 0; padding: 0; background: none; cursor: pointer; }
+  button:disabled { cursor: not-allowed; }
+  .gloss { position: relative; }
+  .gloss::after { content: ""; position: absolute; left: 8%; right: 8%; top: 6%; height: 44%;
+                  border-radius: 50%; pointer-events: none;
+                  background: radial-gradient(ellipse at 50% 50%, rgba(255,255,255,.30), rgba(255,255,255,0) 70%); }
+
+  /* Picture left, panel right - the Pi's windowed layout; stacked on a phone. */
+  .app { display: flex; gap: 16px; justify-content: center; align-items: flex-start;
+         padding: 16px; min-height: 100vh; background: var(--bg); }
+  .view { flex: 0 1 auto; display: flex; flex-direction: column; gap: 10px;
+          width: min(calc(100vh - 32px), calc(100vw - 32px - 450px - 16px)); }
+  /* The square field alone (the frame's black sides cropped off); a split
+     view or the no-camera card shows whole. */
+  .field { position: relative; width: 100%; aspect-ratio: 1 / 1; background: #000; overflow: hidden; }
+  .field > .feed { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .field.wide { aspect-ratio: auto; }
+  .field.wide > .feed { position: static; display: block; height: auto; object-fit: contain; }
+  .field .logo { position: absolute; left: 14px; top: 14px; width: clamp(60px, 17%, 120px); height: auto; }
+  .field .live { position: absolute; right: 14px; top: 14px; width: 12px; height: 12px;
+                 border-radius: 50%; background: var(--dead); }
+  .field .live.on { background: var(--live); box-shadow: 0 0 8px var(--live); }
+  .field .rec { position: absolute; right: 36px; top: 10px; display: none; align-items: center;
+                gap: 7px; font-size: 15px; color: #ff9a9a; }
+  .field .rec::before { content: ""; width: 12px; height: 12px; border-radius: 50%; background: var(--dead); }
+  .field .rec.on { display: flex; }
+  .field .note { position: absolute; bottom: 12px; font-size: 15px; display: none; }
+  .field .note.on { display: block; }
+  .field .pedal { left: 16px; color: var(--yellow); }
+  .field .zoom { right: 16px; color: var(--muted); }
+  .warn { margin: 0; padding: 10px 14px; border-radius: 14px; background: #2a1416;
+          border: 1px solid #5b2327; color: #ff9a9a; font-size: 14px; }
+
+  /* The panel, GE_W wide like the Pi's CONTROLS window. */
+  .panel { flex: 0 0 450px; width: 450px; display: flex; flex-direction: column; gap: 10px; }
+  .card { background: var(--card); border-radius: 14px; }
+  .tabs { display: flex; align-items: flex-end; height: 44px; padding: 0 8px; margin-bottom: -2px;
+          border-bottom: 3px solid var(--tab-on); }
+  .tab { position: relative; flex: 0 0 162px; height: 39px; margin-right: -26px; display: flex;
+         align-items: center; justify-content: center; gap: 6px; font-size: 16px;
+         color: var(--muted); text-decoration: none; background: var(--tab-off);
+         clip-path: polygon(18px 0, calc(100% - 18px) 0, 100% 100%, 0 100%); }
+  .tab.on { background: var(--tab-on); color: var(--white); font-weight: 800; z-index: 1; }
+  .tab small { font-size: 12px; }
+
+  .toggles { display: flex; justify-content: space-evenly; padding: 10px 0 9px; }
+  .tg { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .knob { width: 70px; height: 70px; border-radius: 50%; font-size: 13px; font-weight: 800;
+          color: var(--muted); background: var(--cyan-off);
+          box-shadow: inset 0 0 0 1.5px rgba(80,150,170,.55); }
+  .knob.sm { font-size: 11.5px; }
+  .knob.on { color: var(--white); background: var(--cyan);
+             box-shadow: inset 0 0 0 1.5px rgba(128,214,236,.55), 0 0 18px 3px rgba(110,220,255,.7); }
+  .knob.red { background: var(--red-off); box-shadow: inset 0 0 0 1.5px rgba(170,110,120,.55); }
+  .knob.red.on { background: var(--red);
+                 box-shadow: inset 0 0 0 1.5px rgba(255,150,150,.55), 0 0 18px 3px rgba(255,90,90,.7); }
+  .knob:active, .pill:active { transform: translateY(1px); }
+  .cap { font-size: 11px; color: var(--dim); }
+  .cap.on { color: var(--oncap); }
+
+  .readout { position: relative; display: grid; grid-template-columns: 80px 80px 80px 1fr;
+             height: 84px; background: #07080a; border: 1.2px solid #d6dce1; border-radius: 14px; }
+  .ax { position: relative; margin: 14px 0; border-right: 1px solid #3a4046; }
+  .ax .lbl { position: absolute; left: 14px; top: 1px; font-size: 12px; color: var(--dim); white-space: pre; }
+  .ax .val { position: absolute; left: 4px; right: 0; bottom: -3px; text-align: center;
+             font-size: 28px; line-height: 1; }
+  .clock { display: flex; align-items: flex-end; gap: 6px; padding: 0 0 15px 14px; }
+  .clock b { font-size: 40px; line-height: 1; font-weight: 400; }
+  .clock small { font-size: 12px; color: var(--dim); margin-bottom: 3px; }
+  .pill { border-radius: 999px; font-weight: 800; }
+  .reset { position: absolute; right: 12px; top: 8px; width: 58px; height: 24px; font-size: 11px;
+           color: var(--muted); background: linear-gradient(#5096aa, #266278 50%, #143846);
+           box-shadow: inset 0 0 0 1px rgba(80,150,170,.55); }
+
+  .move { display: flex; align-items: center; gap: 14px; padding: 14px 12px 14px 16px; }
+  .dpad { flex: 0 0 auto; width: 168px; height: 168px; overflow: visible; }
+  .dpad text { font-family: inherit; font-weight: 800; font-size: 14px; fill: #fff; }
+  .dpad .sec { fill: transparent; cursor: pointer; }
+  .dpad .sec:active { fill: rgba(255,255,255,.2); }
+  .rocker { flex: 0 0 auto; width: 62px; height: 172px; border-radius: 31px; overflow: hidden;
+            background: linear-gradient(#c4cdfa, #8c96e2 50%, #565ca0);
+            box-shadow: inset 0 0 0 1.5px rgba(196,205,250,.55); }
+  .rocker button { position: absolute; left: 0; right: 0; height: 50%; display: flex;
+                   flex-direction: column; align-items: center; gap: 6px; font-size: 15px; font-weight: 800; }
+  .rocker button:active { background: rgba(255,255,255,.18); }
+  .rocker .zp { top: 0; padding-top: 22px; }
+  .rocker .zm { bottom: 0; flex-direction: column-reverse; padding-bottom: 22px; }
+  .rocker .rule { position: absolute; left: 10px; right: 10px; top: calc(50% - 1px); height: 2px;
+                  background: #545a96; }
+  .chev { width: 18px; height: 18px; overflow: visible; }
+  .chev polyline { fill: none; stroke: #fff; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+  .lateral { flex: 1 1 auto; height: 172px; border-radius: 14px; display: flex; flex-direction: column;
+             align-items: center; justify-content: space-between; padding: 16px 6px 12px;
+             background: linear-gradient(#a8acb0, #767a7e 50%, #4a4e52); }
+  .lateral.na { background: linear-gradient(#666a6e, #4a4e52 50%, #323538); }
+  .lateral .ttl { font-size: 17px; font-weight: 800; line-height: 1.35; text-align: center; }
+  .lateral.na .ttl { color: var(--muted); }
+  .switch { position: relative; width: 84px; height: 42px; border-radius: 21px; background: #32363a;
+            box-shadow: inset 0 0 0 1.2px rgba(26,28,30,.6); }
+  .switch.on { background: #20a0c8; }
+  .switch:disabled { background: #3e4246; }
+  .switch .k { position: absolute; top: 4px; left: 4px; width: 34px; height: 34px; border-radius: 50%;
+               background: radial-gradient(circle at 38% 30%, #fff 0%, #e4e6e8 42.5%, #aeb2b6 85%);
+               box-shadow: 1px 2px 3px rgba(16,18,20,.45), inset 0 0 0 1px rgba(255,255,255,.55);
+               transition: left .15s; }
+  .switch.on .k { left: 46px; }
+  .switch:disabled .k { background: radial-gradient(circle at 38% 30%, #8e9296 0%, #707478 42.5%, #52565a 85%); }
+  .lcap { font-size: 12px; color: var(--dim); }
+  .lcap.on { color: var(--oncap); }
+  .lcap.off { color: var(--muted); }
+
+  .bottom { display: flex; align-items: center; justify-content: space-between; padding: 14px 14px 14px 18px; }
+  .radio { display: flex; flex-direction: column; gap: 12px; }
+  .radio button { display: flex; align-items: center; gap: 10px; font-size: 16px; color: var(--muted); }
+  .radio button::before { content: ""; width: 18px; height: 18px; border-radius: 50%;
+                          border: 2px solid var(--muted); }
+  .radio button.on { color: var(--white); font-weight: 800; }
+  .radio button.on::before { border-color: var(--white); background: radial-gradient(circle, #fff 0 4px, transparent 5px); }
+  .run { width: 214px; height: 48px; font-size: 16px; color: #ffbebe;
+         background: linear-gradient(#783c46, #5a242c 50%, #3c181e); box-shadow: inset 0 0 0 2px #f55a5a; }
+  .run.start { color: #fff; background: linear-gradient(#80d6ec, #20a0c8 50%, #06527e);
+               box-shadow: inset 0 0 0 1.5px rgba(128,214,236,.55), 0 0 14px rgba(110,220,255,.55); }
+
+  details.adv { color: var(--dim); font-size: 13px; padding: 2px 4px 0; }
+  details.adv summary { cursor: pointer; }
+  details.adv .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+  details.adv input { width: 72px; font: inherit; font-size: 15px; padding: 7px 8px; border-radius: 8px;
+                      border: 1px solid #3a4046; background: #07080a; color: var(--white); }
+  details.adv button { padding: 7px 16px; font-size: 14px; color: #fff;
+                       background: linear-gradient(#5096aa, #266278 50%, #143846); }
+
+  @media (max-width: 880px) {
+    .app { flex-direction: column; align-items: center; padding: 10px; }
+    .view { width: min(100%, 600px); }
+    .panel { flex: none; width: min(100%, 450px); }
+  }
+  @media (max-width: 440px) {
+    .tab { flex-basis: 140px; }
+    .knob { width: 58px; height: 58px; font-size: 11px; }
+    .knob.sm { font-size: 9.5px; }
+    .readout { grid-template-columns: 64px 64px 64px 1fr; }
+    .ax .val { font-size: 24px; }
+    .clock b { font-size: 32px; }
+    .move { gap: 8px; padding: 12px 8px; }
+    .dpad { width: 140px; height: 140px; }
+    .rocker { width: 54px; height: 150px; }
+    .lateral { height: 150px; }
+    .lateral .ttl { font-size: 15px; }
+    .switch { width: 72px; height: 36px; }
+    .switch .k { width: 28px; height: 28px; }
+    .switch.on .k { left: 40px; }
+    .run { width: 180px; font-size: 14px; }
+  }
 </style>
 </head>
 <body>
-<header>
-  <img class="logo" src="/static/logosign_white.png" alt="NAVISLab logo">
-  <div class="titlerow">
-    <span id="dot" class="dot"></span>
-    <h1>NAVISLab Controls</h1>
-  </div>
-  {% if library_url %}
-  <a class="liblink" href="{{ library_url }}" target="_blank" rel="noopener">Session Library &#8599;</a>
-  {% endif %}
-</header>
-<main>
-  <div class="stage" id="stage">
-    <div class="preview"><img id="feed" src="/video_feed" alt="live preview"></div>
-    <p class="warn" id="camwarn" hidden>No camera connected &mdash; the simulator is
-      running without video. Plug one in and it is picked up automatically.</p>
+<div class="app" id="stage">
+  <section class="view">
+    <div class="field" id="field">
+      <img class="feed" id="feed" src="/video_feed" alt="live picture">
+      <img class="logo" src="/static/logosign_white.png" alt="ReSuture">
+      <span class="rec" id="recnote">REC</span>
+      <span class="live" id="dot"></span>
+      <span class="note pedal" id="pedalnote">PEDAL MODE</span>
+      <span class="note zoom" id="zoomnote">1.00x</span>
+    </div>
+    <p class="warn" id="camwarn" hidden>No camera connected &mdash; the simulator is running
+      without video. Plug one in and it is picked up automatically.</p>
+  </section>
 
-    <div class="panel">
-      <button class="toggle viewbtn" data-toggle="lateral" id="lateralbtn">Lateral
-        view<span class="st">&mdash;</span></button>
-      <p class="hint" id="lateralhint">&nbsp;</p>
+  <aside class="panel">
+    <nav class="tabs">
+      <span class="tab on">FLUORO</span>
+      {% if library_url %}
+      <a class="tab" href="{{ library_url }}" target="_blank" rel="noopener">LIBRARY <small>&#8599;</small></a>
+      {% endif %}
+    </nav>
 
-      <div class="grid" id="toggles">
-        <button class="toggle" data-toggle="overlay">Overlay<span class="st">—</span></button>
-        <button class="toggle" data-toggle="equalize">Equalize<span class="st">—</span></button>
-        <button class="toggle" data-toggle="hud">HUD<span class="st">—</span></button>
-        <button class="toggle" data-toggle="pedal_mode">Pedal mode<span class="st">—</span></button>
-        <button class="toggle rec" data-toggle="recording">Record<span class="st">—</span></button>
+    <div class="card toggles">
+      <div class="tg"><button class="knob sm gloss" data-toggle="overlay">OVERLAY</button><span class="cap">OFF</span></div>
+      <div class="tg"><button class="knob sm gloss" data-toggle="equalize">EQUALIZE</button><span class="cap">OFF</span></div>
+      <div class="tg"><button class="knob gloss" data-toggle="hud">HUD</button><span class="cap">OFF</span></div>
+      <div class="tg"><button class="knob gloss" data-toggle="pedal_mode">PEDAL</button><span class="cap">OFF</span></div>
+      <div class="tg"><button class="knob red gloss" data-toggle="recording">REC</button><span class="cap">OFF</span></div>
+    </div>
+
+    <div class="readout">
+      <div class="ax"><span class="lbl">X  cm</span><span class="val" id="vx">0</span></div>
+      <div class="ax"><span class="lbl">Y  cm</span><span class="val" id="vy">0</span></div>
+      <div class="ax"><span class="lbl">Z  cm</span><span class="val" id="vz">0</span></div>
+      <div class="clock"><b id="clock">00:00</b><small>mm:ss</small></div>
+      <button class="pill reset gloss" id="reset">RESET</button>
+    </div>
+
+    <div class="card move">
+      <svg class="dpad" viewBox="-84 -84 168 168" aria-label="pan">
+        <defs>
+          <radialGradient id="dpg" cx="38%" cy="30%" r="85%">
+            <stop offset="0" stop-color="#96e2f0"/><stop offset=".5" stop-color="#28a8ce"/>
+            <stop offset="1" stop-color="#085e8c"/></radialGradient>
+          <radialGradient id="hubg" cx="38%" cy="30%" r="85%">
+            <stop offset="0" stop-color="#5abad6"/><stop offset=".5" stop-color="#1888b0"/>
+            <stop offset="1" stop-color="#064c74"/></radialGradient>
+          <radialGradient id="sheen"><stop offset="0" stop-color="#fff" stop-opacity=".3"/>
+            <stop offset=".7" stop-color="#fff" stop-opacity="0"/></radialGradient>
+          <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="14"/></filter>
+        </defs>
+        <circle r="84" fill="#6edcff" opacity=".6" filter="url(#glow)"/>
+        <circle r="84" fill="url(#dpg)"/>
+        <circle r="83" fill="none" stroke="#96e2f0" stroke-opacity=".55" stroke-width="1.5"/>
+        <ellipse cy="-37" rx="35" ry="18.5" fill="url(#sheen)"/>
+        <g stroke="#146e96" stroke-width="3" stroke-linecap="round">
+          <line x1="21.4" y1="21.4" x2="57.6" y2="57.6"/><line x1="-21.4" y1="21.4" x2="-57.6" y2="57.6"/>
+          <line x1="-21.4" y1="-21.4" x2="-57.6" y2="-57.6"/><line x1="21.4" y1="-21.4" x2="57.6" y2="-57.6"/>
+        </g>
+        <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <g stroke="#0a466e" stroke-width="5">
+            <polyline points="-7.8,-53.7 0,-63 7.8,-53.7"/><polyline points="53.7,-7.8 63,0 53.7,7.8"/>
+            <polyline points="-7.8,53.7 0,63 7.8,53.7"/><polyline points="-53.7,-7.8 -63,0 -53.7,7.8"/></g>
+          <g stroke="#fff" stroke-width="3">
+            <polyline points="-7.8,-53.7 0,-63 7.8,-53.7"/><polyline points="53.7,-7.8 63,0 53.7,7.8"/>
+            <polyline points="-7.8,53.7 0,63 7.8,53.7"/><polyline points="-53.7,-7.8 -63,0 -53.7,7.8"/></g>
+        </g>
+        <circle r="28" fill="url(#hubg)"/>
+        <circle r="27.3" fill="none" stroke="#5abad6" stroke-opacity=".55" stroke-width="1.2"/>
+        <text y="5" text-anchor="middle">PAN</text>
+        <path class="sec" data-pan="ym" d="M-19.8 -19.8L-59.4 -59.4A84 84 0 0 1 59.4 -59.4L19.8 -19.8A28 28 0 0 0 -19.8 -19.8Z"/>
+        <path class="sec" data-pan="xp" d="M19.8 -19.8L59.4 -59.4A84 84 0 0 1 59.4 59.4L19.8 19.8A28 28 0 0 0 19.8 -19.8Z"/>
+        <path class="sec" data-pan="yp" d="M19.8 19.8L59.4 59.4A84 84 0 0 1 -59.4 59.4L-19.8 19.8A28 28 0 0 0 19.8 19.8Z"/>
+        <path class="sec" data-pan="xm" d="M-19.8 19.8L-59.4 59.4A84 84 0 0 1 -59.4 -59.4L-19.8 -19.8A28 28 0 0 0 -19.8 19.8Z"/>
+      </svg>
+
+      <div class="rocker gloss">
+        <button class="zp" data-pan="zp" aria-label="Z+ (raise the camera)">
+          <svg class="chev" viewBox="-9 -9 18 18"><polyline points="-8,4 0,-5 8,4"/></svg><span>Z+</span></button>
+        <i class="rule"></i>
+        <button class="zm" data-pan="zm" aria-label="Z- (lower the camera)">
+          <svg class="chev" viewBox="-9 -9 18 18"><polyline points="-8,-4 0,5 8,-4"/></svg><span>Z-</span></button>
       </div>
 
-      <div class="actions">
-        <button class="fsbtn" data-action="fullscreen" data-fs="1">Fullscreen</button>
-        <button class="fsbtn" data-action="windowed" data-fs="0">Windowed</button>
-        <button class="runbtn" data-action="start" data-run="1">Start simulator</button>
-        <button class="quit runbtn" data-action="stop" data-run="0">Stop simulator</button>
+      <div class="lateral na" id="latplate">
+        <div class="ttl">LATERAL<br>VIEW</div>
+        <button class="switch" id="lateral" data-toggle="lateral" disabled aria-label="Lateral view"><i class="k"></i></button>
+        <span class="lcap" id="latcap">connect 2nd camera</span>
       </div>
     </div>
-  </div>
 
-  <div class="posctl">
-    <label>X <input id="xin" type="number" step="0.5" value="0"> cm</label>
-    <label>Y <input id="yin" type="number" step="0.5" value="0"> cm</label>
-    <label>Z <input id="zin" type="number" step="0.5" value="0"> cm</label>
-    <button id="gopos" type="button">Pan</button>
-  </div>
-  <p class="hint" id="pos">Camera: —</p>
-  <p class="hint">Overlay off shows the full raw video. In Pedal mode the picture only updates while the foot pedal is held.</p>
-</main>
+    <div class="card bottom">
+      <div class="radio">
+        <button id="fs">FULLSCREEN</button>
+        <button id="win">WINDOWED</button>
+      </div>
+      <button class="pill run gloss" id="run">STOP SIMULATOR</button>
+    </div>
+
+    <details class="adv">
+      <summary>Set the camera position</summary>
+      <div class="row">
+        <label>X <input id="xin" type="number" step="0.5" value="0"></label>
+        <label>Y <input id="yin" type="number" step="0.5" value="0"></label>
+        <label>Z <input id="zin" type="number" step="0.5" value="0"></label>
+        <span>cm</span>
+        <button class="pill" id="gopos" type="button">GO</button>
+      </div>
+    </details>
+  </aside>
+</div>
 
 <script>
+var ZOOM_REF = {{ zoom_ref }}, FLIP_Z = {{ flip_z }};
+var state = {};
+function $(id) { return document.getElementById(id); }
+function post(url, body) {
+  var opt = { method: 'POST' };
+  if (body) { opt.headers = { 'Content-Type': 'application/json' }; opt.body = JSON.stringify(body); }
+  return fetch(url, opt).then(function (r) { return r.json(); }).then(applyState).catch(function () {});
+}
+// The readout rounds as the Pi's does (Python's round: halves to even).
+function pyRound(v) {
+  v = +v || 0;
+  var r = Math.round(v);
+  if (Math.abs(v % 1) === 0.5) r = 2 * Math.round(v / 2);
+  return r === 0 ? 0 : r;
+}
+function mmss(sec) {
+  sec = Math.floor(+sec || 0);
+  var m = Math.floor(sec / 60), s = sec % 60;
+  return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+}
 function applyState(s) {
-  document.querySelectorAll('[data-toggle]').forEach(function (b) {
-    var on = !!s[b.dataset.toggle];
+  if (!s || s.error) return;
+  state = s;
+  document.querySelectorAll('.knob[data-toggle]').forEach(function (b) {
+    var on = !!s[b.getAttribute('data-toggle')];
     b.classList.toggle('on', on);
-    b.querySelector('.st').textContent = on ? 'ON' : 'OFF';
+    var cap = b.parentNode.querySelector('.cap');
+    cap.textContent = on ? 'ON' : 'OFF';
+    cap.classList.toggle('on', on);
   });
-  document.querySelectorAll('.fsbtn').forEach(function (b) {
-    b.classList.toggle('on', (b.dataset.fs === '1') === !!s.fullscreen);
-  });
-  document.querySelectorAll('.runbtn').forEach(function (b) {
-    b.classList.toggle('on', (b.dataset.run === '1') === !!s.running);
-  });
-  var warn = document.getElementById('camwarn');
-  if (warn) {
-    warn.hidden = !(s.running && !s.camera);
-    warn.textContent = 'No camera connected \u2014 the simulator is'
-      + ' running without video. Plug one in and it is picked up automatically.';
-  }
-  var lat = document.getElementById('lateralbtn');
-  if (lat) lat.disabled = !s.lateral_available;
-  var lathint = document.getElementById('lateralhint');
-  if (lathint) lathint.textContent = s.lateral_available
-    ? 'Two cameras attached \u2014 Lateral view shows both projections side by side.'
-    : (+s.cameras || 0) + ' camera(s) attached \u2014 Lateral view needs two.';
-  var pos = document.getElementById('pos');
-  if (pos) pos.textContent = 'Camera: x=' + (+s.pos_x_cm || 0).toFixed(1) +
-                             '  y=' + (+s.pos_y_cm || 0).toFixed(1) +
-                             '  z=' + (+s.pos_z_cm || 0).toFixed(1) + ' cm';
+  var ok = !!s.lateral_available, sw = $('lateral'), lcap = $('latcap');
+  sw.disabled = !ok;
+  sw.classList.toggle('on', ok && !!s.lateral);
+  $('latplate').classList.toggle('na', !ok);
+  lcap.textContent = !ok ? 'connect 2nd camera' : (s.lateral ? 'ON' : 'OFF');
+  lcap.className = 'lcap' + (!ok ? '' : (s.lateral ? ' on' : ' off'));
+  $('vx').textContent = pyRound(s.pos_x_cm);
+  $('vy').textContent = pyRound(s.pos_y_cm);
+  $('vz').textContent = pyRound(s.pos_z_cm);
+  $('clock').textContent = mmss(s.fluoro_sec);
+  $('fs').classList.toggle('on', !!s.fullscreen);
+  $('win').classList.toggle('on', !s.fullscreen);
+  var run = $('run');
+  run.classList.toggle('start', !s.running);
+  run.textContent = s.running ? 'STOP SIMULATOR' : 'START SIMULATOR';
+  var z = +s.pos_z_cm || 0;
+  var zoom = ZOOM_REF / Math.max(0.05 * ZOOM_REF, ZOOM_REF + FLIP_Z * z);
+  $('zoomnote').textContent = zoom.toFixed(2) + 'x';
+  $('zoomnote').classList.toggle('on', !!s.hud);
+  $('pedalnote').classList.toggle('on', !!(s.hud && s.pedal_mode));
+  $('recnote').classList.toggle('on', !!s.recording);
+  if ('rec_elapsed' in s) $('recnote').textContent = 'REC' + (s.rec_elapsed ? ' ' + s.rec_elapsed : '');
+  $('field').classList.toggle('wide', !!s.lateral || !s.camera);
+  $('camwarn').hidden = !(s.running && !s.camera);
 }
 function refresh() {
   fetch('/api/state').then(function (r) { return r.json(); }).then(applyState).catch(function () {});
 }
 document.querySelectorAll('[data-toggle]').forEach(function (b) {
   b.addEventListener('click', function () {
-    fetch('/api/toggle/' + b.dataset.toggle, { method: 'POST' })
-      .then(function (r) { return r.json(); }).then(applyState);
+    if (!b.disabled) post('/api/toggle/' + b.getAttribute('data-toggle'));
   });
 });
+document.querySelectorAll('[data-pan]').forEach(function (b) {
+  b.addEventListener('click', function () { post('/api/pan/' + b.getAttribute('data-pan')); });
+});
+$('reset').addEventListener('click', function () { post('/api/action/fluoro_reset'); });
 function browserFullscreen(on) {
-  // Fullscreen the whole stage (preview + overlaid controls) in THIS browser
+  // Fullscreen/Windowed also fullscreen THIS browser's view of the controls
   // (must run inside a click handler).
-  var el = document.getElementById('stage');
+  var el = $('stage');
   try {
     if (on) {
       var req = el.requestFullscreen || el.webkitRequestFullscreen;
@@ -811,38 +1015,26 @@ function browserFullscreen(on) {
     }
   } catch (e) {}
 }
-document.querySelectorAll('[data-action]').forEach(function (b) {
-  b.addEventListener('click', function () {
-    if (b.dataset.action === 'stop' && !confirm('Stop the simulator?')) return;
-    // Fullscreen/Windowed also control this browser's preview, not just the
-    // popup window on the computer running the simulator.
-    if (b.dataset.action === 'fullscreen') browserFullscreen(true);
-    if (b.dataset.action === 'windowed') browserFullscreen(false);
-    fetch('/api/action/' + b.dataset.action, { method: 'POST' })
-      .then(function (r) { return r.json(); }).then(applyState);
-  });
+$('fs').addEventListener('click', function () { browserFullscreen(true); post('/api/action/fullscreen'); });
+$('win').addEventListener('click', function () { browserFullscreen(false); post('/api/action/windowed'); });
+$('run').addEventListener('click', function () {
+  if (!state.running) { post('/api/action/start'); return; }
+  if (confirm('Stop the simulator?')) post('/api/action/stop');
 });
 function sendPos() {
-  var x = parseFloat(document.getElementById('xin').value) || 0;
-  var y = parseFloat(document.getElementById('yin').value) || 0;
-  var z = parseFloat(document.getElementById('zin').value) || 0;
-  fetch('/api/position', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ x: x, y: y, z: z }) })
-    .then(function (r) { return r.json(); }).then(applyState).catch(function () {});
+  post('/api/position', { x: parseFloat($('xin').value) || 0, y: parseFloat($('yin').value) || 0,
+                          z: parseFloat($('zin').value) || 0 });
 }
-document.getElementById('gopos').addEventListener('click', sendPos);
+$('gopos').addEventListener('click', sendPos);
 ['xin', 'yin', 'zin'].forEach(function (id) {
-  var el = document.getElementById(id);
-  el.addEventListener('change', sendPos);                 // fires on blur / stepper arrows
-  el.addEventListener('keydown', function (e) { if (e.key === 'Enter') sendPos(); });
+  $(id).addEventListener('keydown', function (e) { if (e.key === 'Enter') sendPos(); });
 });
-var feed = document.getElementById('feed');
-feed.addEventListener('load', function () { document.getElementById('dot').classList.add('live'); });
-feed.addEventListener('error', function () { document.getElementById('dot').classList.remove('live'); });
+var feed = $('feed');
+feed.addEventListener('load', function () { $('dot').classList.add('on'); });
+feed.addEventListener('error', function () { $('dot').classList.remove('on'); });
 // Tablets suspend a backgrounded tab's timers and its MJPEG connection, so the
-// toggle chips go stale (showing e.g. ON for a state that has since changed)
-// and the preview freezes. Re-sync and restart the stream the moment the page
-// is visible again instead of waiting for the next poll.
+// controls go stale and the picture freezes. Re-sync and restart the stream
+// the moment the page is visible again instead of waiting for the next poll.
 function resume() {
   refresh();
   feed.src = '/video_feed?t=' + Date.now();
@@ -850,7 +1042,7 @@ function resume() {
 document.addEventListener('visibilitychange', function () { if (!document.hidden) resume(); });
 window.addEventListener('pageshow', resume);
 refresh();
-setInterval(refresh, 1500);
+setInterval(refresh, 1000);
 </script>
 </body>
 </html>
@@ -864,13 +1056,27 @@ def index():
     # panel has no other path to it); bench boxes with no portal hide it.
     portal_url = device_setup.read_identity()["portal_url"]
     return render_template_string(
-        PAGE, library_url=portal_url + "/library" if portal_url else None)
+        PAGE, library_url=portal_url + "/library" if portal_url else None,
+        zoom_ref=ZOOM_REF_CM, flip_z=FLIP_Z)
+
+
+@app.route("/ui-font.ttf")
+def ui_font():
+    '''The touch screen's font (Nunito Sans, Raspberry Pi OS's own) for the
+    panel page, so it matches the device without fetching anything from
+    outside it. Absent on other systems: the page falls back to system fonts.'''
+    if not os.path.exists(_NUNITO):
+        return ("", 404)
+    return send_file(_NUNITO, mimetype="font/ttf", max_age=7 * 86400)
 
 
 @app.route("/api/state")
 def api_state():
-    '''Return the current toggle states as JSON (polled by the page to stay in sync).'''
-    return jsonify(get_state_snapshot())
+    '''Return the current toggle states as JSON (polled by the page to stay in
+    sync), plus the running recording's length, as the Pi's screen shows it.'''
+    snap = get_state_snapshot()
+    snap["rec_elapsed"] = recorder.elapsed_str() if recorder.active else None
+    return jsonify(snap)
 
 
 @app.route("/api/toggle/<name>", methods=["POST"])
@@ -944,6 +1150,19 @@ def api_position():
     with state_lock:
         state["pos_x_cm"], state["pos_y_cm"], state["pos_z_cm"] = clamp_position(
             x, y, state["pos_z_cm"] if z is None else z)
+        snap = dict(state)
+    return jsonify(snap)
+
+
+@app.route("/api/pan/<name>", methods=["POST"])
+def api_pan(name):
+    '''One step of the direction pad or the Z rocker (xm, xp, ym, yp, zm, zp):
+    the same 5 cm grid and edge stops as the device's own controls (pan_step).
+    Returns the full updated state.'''
+    if name not in PAN_BUTTONS:
+        return jsonify({"error": "no such pan button: %s" % name}), 404
+    with state_lock:
+        _pan_locked(*PAN_BUTTONS[name])
         snap = dict(state)
     return jsonify(snap)
 
@@ -3342,11 +3561,13 @@ def run_simulation(cam_index, show_window):
             # re-encoding the same image on every iteration.
             publish_preview(jpeg=no_camera_buf[placeholder_key])
         elif res is not None and new_frame:
-            # The web MJPEG preview always streams the clean frame (the browser has
-            # its own HTML buttons), so publish `res`, not the composited view.
-            # Only a newly made frame is published: it is never drawn on
-            # again after this, so the web thread can encode it unlocked.
-            publish_preview(frame=res)
+            # The web MJPEG preview streams the picture as the screen shows it -
+            # without the HUD text, whose notes the page draws over it the way
+            # the screen does (recordings keep the text) - and not the composited
+            # view, as the page has its own controls. Only a newly made frame is
+            # published: it is never drawn on again after this, so the web
+            # thread can encode it unlocked.
+            publish_preview(frame=res if res_plain is None else res_plain)
 
     recorder.stop(wait=True)  # finalize the .avi before os._exit
     library.stop_playback()

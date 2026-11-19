@@ -204,6 +204,28 @@ body = client.post("/api/toggle/lateral").get_json()
 check("POST again returns to the main view", body["lateral"] is False)
 check("the panel page carries the Lateral view button",
       'data-toggle="lateral"' in client.get("/").get_data(as_text=True))
+page = client.get("/").get_data(as_text=True)
+check("the panel page draws the Pi's controls: pad, rocker, readout, reset",
+      all(('data-pan="%s"' % n) in page for n in ("xm", "xp", "ym", "yp", "zm", "zp"))
+      and 'id="clock"' in page and 'id="reset"' in page and "{{" not in page,
+      "a control or an unrendered template tag")
+with f.state_lock:
+    f.state.update({"pos_x_cm": 0.0, "pos_y_cm": 0.0, "pos_z_cm": 0.0})
+body = client.post("/api/pan/xp").get_json()
+check("POST /api/pan/xp steps X by one 5 cm step", body["pos_x_cm"] == 5.0, body["pos_x_cm"])
+body = client.post("/api/pan/zm").get_json()
+check("POST /api/pan/zm steps Z down", body["pos_z_cm"] == -5.0, body["pos_z_cm"])
+check("POST /api/pan with an unknown button is refused",
+      client.post("/api/pan/up").status_code == 404)
+with f.state_lock:
+    f.state.update({"pos_x_cm": 0.0, "pos_y_cm": 0.0, "pos_z_cm": 0.0})
+check("/api/state says how long the recording runs (none now)",
+      client.get("/api/state").get_json().get("rec_elapsed", "missing") is None)
+font = client.get("/ui-font.ttf")
+check("/ui-font.ttf serves the screen's font where it is installed",
+      (font.status_code == 200 and font.mimetype == "font/ttf" and len(font.data) > 100000)
+      or (font.status_code == 404 and not os.path.exists(f._NUNITO)),
+      "%s %s" % (font.status_code, font.mimetype))
 
 
 print("\n7. Masters and the attenuation composite")
