@@ -40,6 +40,10 @@ DEVICE_ID_FILE = "/etc/fluorosim/device-id"
 PORTAL_URL_FILE = "/etc/fluorosim/portal-url"
 CLAIM_SECRET_FILE = "/etc/fluorosim/claim-secret"
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Cloudflare's Browser Integrity Check answers Python-urllib's default
+# User-Agent with 403 (error 1010) - the portal and the device hostname alike -
+# so every request this script makes identifies itself as the bench tool.
+USER_AGENT = "resuture-provision-pi/1.0"
 
 
 def log(msg):
@@ -109,9 +113,7 @@ def register_with_portal(args, device_id):
         data=json.dumps({"device_id": device_id, "notes": args.notes}).encode(),
         headers={
             "Content-Type": "application/json",
-            # Cloudflare's Browser Integrity Check rejects Python-urllib's
-            # default signature with error 1010, so identify as the bench tool.
-            "User-Agent": "resuture-provision-pi/1.0",
+            "User-Agent": USER_AGENT,
             "Authorization": "Bearer %s" % args.provision_token,
             "CF-Access-Client-Id": args.cf_client_id,
             "CF-Access-Client-Secret": args.cf_client_secret,
@@ -205,7 +207,8 @@ def verify(hostname):
     deadline = time.time() + 120
     while time.time() < deadline:
         try:
-            req = urllib.request.Request(url, method="GET")
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT},
+                                         method="GET")
             opener = urllib.request.build_opener(_NoRedirect())
             resp = opener.open(req, timeout=10)
             code = resp.getcode()
