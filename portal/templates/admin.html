@@ -4,7 +4,12 @@
 {% block heading %}Device Administration{% endblock %}
 {% block content %}
 
-<p class="hint"><a href="{{ url_for('home') }}">&larr; back to my devices</a></p>
+<nav class="pagenav">
+  <a class="backbtn" href="{{ url_for('home') }}">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+    Back to my simulators
+  </a>
+</nav>
 
 {% if devices %}
 <div class="tablewrap">

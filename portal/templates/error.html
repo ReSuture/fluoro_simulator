@@ -4,6 +4,11 @@
 {% block content %}
 <div class="card empty">
   <p>{{ error.description }}</p>
-  <p class="hint"><a href="{{ url_for('home') }}">&larr; back to the portal</a></p>
+  <p>
+    <a class="backbtn" href="{{ url_for('home') }}">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>
+      Back to the portal
+    </a>
+  </p>
 </div>
 {% endblock %}
